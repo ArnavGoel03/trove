@@ -84,6 +84,11 @@ final class CutPasteController: ObservableObject {
 
     @objc private func onTerminate() { clearAllVisualHints() }
 
+    // CutPasteController is a singleton so deinit is unreachable in production,
+    // but pairing addObserver with removeObserver is required for correctness
+    // and test-harness safety (tests may instantiate multiple instances).
+    deinit { NotificationCenter.default.removeObserver(self) }
+
     // -----------------------------------------------------------------------
     // Enable / disable the global event tap.
     // -----------------------------------------------------------------------
@@ -150,6 +155,7 @@ final class CutPasteController: ObservableObject {
     private func stopTap() {
         if let port = tap {
             CGEvent.tapEnable(tap: port, enable: false)
+            CFMachPortInvalidate(port)  // release WindowServer's Mach send right
         }
         if let source = runLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)

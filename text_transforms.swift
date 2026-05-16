@@ -388,7 +388,14 @@ enum XformEngine {
                 throw XformError("invalid regex: \(error.localizedDescription)")
             }
             let range = NSRange(s.startIndex..<s.endIndex, in: s)
-            return regex.stringByReplacingMatches(in: s, range: range, withTemplate: step.param2)
+            let output = regex.stringByReplacingMatches(in: s, range: range, withTemplate: step.param2)
+            // red-team: a replace-all with a large template can balloon output
+            // beyond the 50 MB input refuse threshold. Cap here so downstream
+            // pipeline steps don't choke on pathological expansion.
+            if output.utf8.count > XformModel.refuseBytes {
+                throw XformError("regex replacement output exceeds 50 MB — refusing to return result")
+            }
+            return output
         }
     }
 }
@@ -399,17 +406,33 @@ enum XformEngine {
 
 /// Restore base64url → base64 and pad to a multiple of four. Tolerant decoder.
 // red-team: catastrophic-backtracking guard. NSRegularExpression has no
-// timeout, so on inputs over ~256 KB we reject patterns that nest unbounded
-// quantifiers (`(.*)+`, `(a+)+`, `(.+)*`) which can take exponential time.
+// timeout, so we unconditionally reject patterns that nest unbounded
+// quantifiers (`(.*)+`, `(a+)+`, `(.+)*`, `(\w+\s?)+`, `(a*b*)+`, `([a-z]+)+`)
+// which can take exponential time. Threshold lowered to 0 so even tiny inputs
+// are protected — hung UI on any size input is unacceptable.
 // This is a heuristic — false positives are acceptable because the user can
-// rewrite the pattern; false negatives (hung UI on 50 MB) are not.
+// rewrite the pattern; false negatives (hung UI) are not.
 private func rejectCatastrophicRegex(_ pattern: String, inputBytes: Int) throws {
-    guard inputBytes >= 256_000 else { return }
-    // Look for `(...)<quant>` where the inner group itself ends in a quantifier.
+    // Always check, regardless of input size.
+    _ = inputBytes
+    // Category 1: group ending in a quantifier that is itself quantified.
     // Cheap textual check: detect "*)+", "+)+", "*)*", "+)*", "*)?+", etc.
-    let danger = ["*)+", "+)+", "*)*", "+)*", "*)?", "+)?"]
+    let danger = ["*)+", "+)+", "*)*", "+)*", "*)?", "+)?",
+                  // Additional: groups with a nested quantifier followed by outer *
+                  "*)+" , "+)+", "?)+",
+                  // Outer * variants
+                  "*)*", "+)*", "?)*"]
     for d in danger where pattern.contains(d) {
-        throw XformError("pattern looks catastrophic (\(d) on >256 KB input) — refusing to run")
+        throw XformError("pattern looks catastrophic (\(d)) — refusing to run")
+    }
+    // Category 2: two or more * or + quantifiers where one is inside a group
+    // that itself carries a * or + quantifier. Heuristic: count total `*` and `+`
+    // chars; if there are 2+, and the pattern also contains `)+` or `)*` or
+    // `)?` patterns (outer quantifier on a group), reject it.
+    let quantCount = pattern.filter { $0 == "*" || $0 == "+" }.count
+    let hasOuterGroupQuant = pattern.contains(")+") || pattern.contains(")*") || pattern.contains(")?")
+    if quantCount >= 2 && hasOuterGroupQuant {
+        throw XformError("pattern contains nested quantifiers inside a quantified group — refusing to run")
     }
 }
 

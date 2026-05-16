@@ -441,7 +441,7 @@ final class NetModel: ObservableObject {
         csvBuffer.removeAll(keepingCapacity: true)
     }
 
-    func tick() async {
+    @MainActor func tick() async {
         if paused { return }
         // red-team: hard single-in-flight guard. The previous "cancel & launch"
         // dance didn't actually stop the underlying synchronous nettop
@@ -718,9 +718,16 @@ func netBundlePath(for row: NetRow) -> String? {
 final class NetIconCache {
     static let shared = NetIconCache()
     private var cache: [String: NSImage] = [:]
+    private var order: [String] = []           // LRU order; last = most-recently used
+    private let cap = 200
     func icon(forBundle bundle: String?) -> NSImage {
         let key = bundle ?? "_generic_"
-        if let hit = cache[key] { return hit }
+        if let hit = cache[key] {
+            // Move to end (most-recently used).
+            order.removeAll { $0 == key }
+            order.append(key)
+            return hit
+        }
         let img: NSImage
         if let b = bundle, FileManager.default.fileExists(atPath: b) {
             img = NSWorkspace.shared.icon(forFile: b)
@@ -728,6 +735,11 @@ final class NetIconCache {
             img = NSWorkspace.shared.icon(for: .executable)
         }
         cache[key] = img
+        order.append(key)
+        if order.count > cap {
+            let evict = order.removeFirst()
+            cache.removeValue(forKey: evict)
+        }
         return img
     }
 }
@@ -992,6 +1004,7 @@ public struct NetworkMonitorView: View {
         .navigationSubtitle(subtitle)
         .toolbar { toolbar() }
         .onAppear {
+            guard terminateObserver == nil else { return }
             m.start()
             // Red-team #2: even if onDisappear is missed (window force-closed
             // mid-tick), the terminate hook guarantees we drop the sampler.

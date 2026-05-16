@@ -65,6 +65,7 @@ struct NotePersisted: Codable {
 // MARK: - Store (load / debounced save / atomic write)
 // ===========================================================================
 
+@MainActor
 final class NoteStore: ObservableObject {
     @Published var tabs: [NoteTab]
     @Published var selected: NoteColor = .red

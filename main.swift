@@ -82,6 +82,16 @@ struct TroveApp: App {
                 Button("Notes")    { switchToPane(.notes) }
                     .keyboardShortcut("4", modifiers: .command)
                 Divider()
+                Button(SharedStore.stage.floating ? "Unpin Window" : "Pin Window on Top") {
+                    SharedStore.stage.floating.toggle()
+                }
+                .keyboardShortcut("p", modifiers: [.command, .option])
+                Button("Quick Switcher…") {
+                    // Posts a notification; RootView listens and shows the sheet.
+                    NotificationCenter.default.post(name: .troveOpenQuickSwitcher, object: nil)
+                }
+                .keyboardShortcut("k", modifiers: .command)
+                Divider()
                 Button("Customize Sidebar…") { openSettingsWindow() }
                     .keyboardShortcut(",", modifiers: [.command, .shift])
             }
@@ -294,6 +304,9 @@ extension Notification.Name {
     // *other* store listens and bumps its `lastChangeCount` so the next
     // watcher tick doesn't echo-ingest our own write.
     static let troveDidWritePasteboard = Notification.Name("TroveDidWritePasteboard")
+    /// Posted when the View → Quick Switcher menu item (⌘K) fires. RootView
+    /// listens and presents the QuickSwitcherView sheet.
+    static let troveOpenQuickSwitcher = Notification.Name("TroveOpenQuickSwitcher")
 }
 
 // red-team: epoch-bumped formatter source so locale/dark-mode-related caches
@@ -1873,13 +1886,12 @@ struct RootView: View {
         // flipping the swatch in Settings re-tints every control live. Do
         // NOT re-tint per-pane; see the coherence rules above.
         .tint(TroveAccentChoice(rawValue: accentRaw)?.color ?? .troveAccentAlt)
-        // ⌘K — quick switcher. Hidden button so the keyboard shortcut binds
-        // to the window without an on-screen control. Sheet renders the
-        // palette over the main view.
-        .background {
-            Button("") { quickSwitcherOpen = true }
-                .keyboardShortcut("k", modifiers: .command)
-                .hidden()
+        // ⌘K — quick switcher. The keyboard shortcut is bound on the View
+        // menu's "Quick Switcher…" command, which posts a notification we
+        // listen to here. This keeps the binding in exactly one place (the
+        // menu) — no duplicate hidden Button + Command Group entry.
+        .onReceive(NotificationCenter.default.publisher(for: .troveOpenQuickSwitcher)) { _ in
+            quickSwitcherOpen = true
         }
         .sheet(isPresented: $quickSwitcherOpen) {
             QuickSwitcherView(isOpen: $quickSwitcherOpen)
@@ -2300,6 +2312,11 @@ enum ClipboardReader {
 
         if let urls = pb.readObjects(forClasses: [NSURL.self]) as? [URL], !urls.isEmpty {
             return .files(urls)
+        }
+        // Pre-decode size guard: probe raw bytes before allocating NSImage (defense-in-depth below).
+        if strict {
+            let rawBytes = Int64(pb.data(forType: .tiff)?.count ?? pb.data(forType: .png)?.count ?? 0)
+            if rawBytes > maxAutoBytes { return nil }
         }
         if let img = NSImage(pasteboard: pb) {
             let bytes = Int64(img.tiffRepresentation?.count ?? 0)
@@ -2729,7 +2746,13 @@ struct StageView: View {
                 }
             } else if p.canLoadObject(ofClass: NSImage.self) {
                 _ = p.loadObject(ofClass: NSImage.self) { obj, _ in
-                    if let img = obj as? NSImage { DispatchQueue.main.async { stage.addImage(img) } }
+                    guard let img = obj as? NSImage else { return }
+                    let maxBytes = 100 * 1024 * 1024
+                    if let bytes = img.tiffRepresentation?.count, bytes > maxBytes {
+                        NSLog("Trove: dropped dropped image (%.1f MB) — exceeds 100 MB limit", Double(bytes) / 1_048_576)
+                        return
+                    }
+                    DispatchQueue.main.async { stage.addImage(img) }
                 }
             } else if p.canLoadObject(ofClass: NSString.self) {
                 _ = p.loadObject(ofClass: NSString.self) { obj, _ in

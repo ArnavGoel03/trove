@@ -619,6 +619,8 @@ enum GPUPower {
         do { try p.run() } catch { return Reading(onAC: false, batteryPercent: nil, acWatts: nil, raw: "") }
         p.waitUntilExitOffMain()
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        pipe.fileHandleForReading.closeFile()
+        (p.standardError as? Pipe)?.fileHandleForReading.closeFile()
         let raw = String(data: data, encoding: .utf8) ?? ""
 
         let onAC = raw.contains("AC Power") || raw.contains("'AC Power'")
@@ -1622,6 +1624,7 @@ public struct GPUMonitorView: View {
         .overlay(alignment: .bottom) { toastView }
         .navigationTitle("GPU & Thermals")
         .onAppear { model.start(); if model.experimentalSensors { model.startHID() } }
+        .onDisappear { model.stop(); if model.experimentalSensors { model.stopHID() } }
     }
 
     @ViewBuilder

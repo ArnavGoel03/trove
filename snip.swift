@@ -846,7 +846,7 @@ private struct SnipRecentThumb: View {
         VStack(alignment: .leading, spacing: 4) {
             Button(action: onSelect) {
                 Group {
-                    if let img = NSImage(contentsOf: recent.url) {
+                    if let img = OCREngine.fastThumbnail(url: recent.url, maxPixel: 256) {
                         Image(nsImage: img)
                             .resizable()
                             .interpolation(.medium)
@@ -1011,12 +1011,18 @@ enum SnipRecentSaver {
             guard resp == .OK, let dest = panel.url else { return }
             setLastSaveDir(dest.deletingLastPathComponent())
             do {
-                // NSSavePanel itself confirmed overwrite consent; remove the
-                // existing file because copyItem refuses to overwrite.
-                if FileManager.default.fileExists(atPath: dest.path) {
-                    try FileManager.default.removeItem(at: dest)
+                // NSSavePanel itself confirmed overwrite consent. Use an
+                // atomic write pattern: copy to a sibling tmp, then replace
+                // atomically so a crash mid-copy never leaves a partial file.
+                let tmp = dest.deletingLastPathComponent()
+                    .appendingPathComponent(".\(dest.lastPathComponent).tmp")
+                if FileManager.default.fileExists(atPath: tmp.path) {
+                    try FileManager.default.removeItem(at: tmp)
                 }
-                try FileManager.default.copyItem(at: recent.url, to: dest)
+                try FileManager.default.copyItem(at: recent.url, to: tmp)
+                _ = try FileManager.default.replaceItemAt(dest, withItemAt: tmp,
+                                                          backupItemName: nil,
+                                                          options: .usingNewMetadataOnly)
                 NSWorkspace.shared.activateFileViewerSelecting([dest])
                 SharedStore.stage.flash("Saved to \(dest.deletingLastPathComponent().lastPathComponent)")
             } catch {

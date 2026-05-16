@@ -172,8 +172,11 @@ final class ClipHistory: ObservableObject {
         evictIfNeeded()
     }
 
-    /// Drop oldest non-pinned entries past `nonPinnedCap`. Pinned are never
-    /// evicted (red-team #5).
+    /// Cap on pinned entries before oldest-first eviction kicks in.
+    static let maxPinnedEntries = 200
+
+    /// Drop oldest non-pinned entries past `nonPinnedCap`. Pinned entries are
+    /// also capped at `maxPinnedEntries` (oldest by capturedAt evicted first).
     private func evictIfNeeded() {
         var nonPinnedCount = 0
         var keep: [ClipEntry] = []
@@ -189,6 +192,17 @@ final class ClipHistory: ObservableObject {
                 // dropped — clean up its temp PNG if it owns one
                 cleanupTempFile(for: e)
             }
+        }
+        // Cap pinned entries at maxPinnedEntries; evict oldest by capturedAt.
+        var pinned = keep.filter { $0.pinned }
+        if pinned.count > Self.maxPinnedEntries {
+            pinned.sort { $0.capturedAt < $1.capturedAt }
+            let evictCount = pinned.count - Self.maxPinnedEntries
+            let toEvict = pinned.prefix(evictCount)
+            let evictIDs = Set(toEvict.map { $0.id })
+            for e in toEvict { cleanupTempFile(for: e) }
+            keep.removeAll { evictIDs.contains($0.id) }
+            SharedStore.stage.flash("Pinned history capped at 200 — evicted \(evictCount) oldest")
         }
         if keep.count != entries.count {
             entries = keep

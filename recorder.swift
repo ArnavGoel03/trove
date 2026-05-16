@@ -417,10 +417,13 @@ final class RecEngine: NSObject, ObservableObject {
     override init() {
         super.init()
         let terminate = NotificationCenter.default.addObserver(
-            forName: .troveWillTerminate, object: nil, queue: .main
+            forName: .troveWillTerminate, object: nil, queue: nil
         ) { [weak self] _ in
             guard let self = self, self.isRecording else { return }
             // 3s synchronous ceiling so a stuck writer can't block quit forever.
+            // queue: nil means the block runs on a background thread, so
+            // sem.wait() does NOT block the main actor — freeing it to execute
+            // the @MainActor stop() call below.
             let sem = DispatchSemaphore(value: 0)
             Task { @MainActor in
                 await self.stop()
@@ -478,6 +481,10 @@ final class RecEngine: NSObject, ObservableObject {
                microphone: Bool,
                showsCursor: Bool,
                excludeBundleID: String?) async throws {
+
+        // red-team: reentry guard — rapid double-clicks or hotkey bursts would
+        // otherwise race two concurrent recordings to the same .tmp.mp4 path.
+        guard !isRecording, !isFinalizing else { return }
 
         // Red-team #2: SCK audio capture (capturesAudio) only exists on 13+.
         guard #available(macOS 13.0, *) else {

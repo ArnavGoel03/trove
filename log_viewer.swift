@@ -1630,20 +1630,18 @@ enum LogSaveHelpers {
     private static func body(entries: [LogEntry],
                              predicate: String,
                              rangeLabel: String) -> String {
-        var out = ""
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd HH:mm:ss"
         f.locale = Locale(identifier: "en_US_POSIX")
-        out += "# Trove — Console export\n"
-        out += "# Exported: \(f.string(from: Date()))\n"
-        if !predicate.isEmpty { out += "# Filter: \(predicate)\n" }
-        if !rangeLabel.isEmpty { out += "# Range: \(rangeLabel)\n" }
-        out += "# Rows: \(entries.count)\n"
-        for e in entries {
-            out += e.plainText()
-            out += "\n"
-        }
-        return out
+        var parts: [String] = []
+        parts.reserveCapacity(entries.count + 5)
+        parts.append("# Trove — Console export")
+        parts.append("# Exported: \(f.string(from: Date()))")
+        if !predicate.isEmpty { parts.append("# Filter: \(predicate)") }
+        if !rangeLabel.isEmpty { parts.append("# Range: \(rangeLabel)") }
+        parts.append("# Rows: \(entries.count)")
+        for e in entries { parts.append(e.plainText()) }
+        return parts.joined(separator: "\n")
     }
 
     /// "Console export YYYY-MM-DD.log" — the file the user sees in NSSavePanel.
@@ -1668,10 +1666,7 @@ enum LogSaveHelpers {
             guard resp == .OK, let dest = panel.url else { return }
             setLastSaveDir(dest.deletingLastPathComponent())
             do {
-                if FileManager.default.fileExists(atPath: dest.path) {
-                    try FileManager.default.removeItem(at: dest)
-                }
-                try blob.data(using: .utf8)?.write(to: dest)
+                try blob.data(using: .utf8)?.write(to: dest, options: .atomic)
                 NSWorkspace.shared.activateFileViewerSelecting([dest])
                 SharedStore.stage.flash("Saved \(dest.lastPathComponent)")
             } catch {
@@ -1785,10 +1780,7 @@ enum LogSaveHelpers {
                                 predicate: predicateLabel,
                                 rangeLabel: rangeLabel)
                 do {
-                    if FileManager.default.fileExists(atPath: dest.path) {
-                        try FileManager.default.removeItem(at: dest)
-                    }
-                    try blob.data(using: .utf8)?.write(to: dest)
+                    try blob.data(using: .utf8)?.write(to: dest, options: .atomic)
                     DispatchQueue.main.async {
                         NSWorkspace.shared.activateFileViewerSelecting([dest])
                         SharedStore.stage.flash("Saved \(rows.count) line\(rows.count == 1 ? "" : "s") to \(dest.lastPathComponent)")

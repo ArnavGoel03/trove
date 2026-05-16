@@ -81,7 +81,7 @@ enum ProcSampler {
             while idx < line.endIndex, line[idx] == " " { idx = line.index(after: idx) }
             let argsS = line[idx..<line.endIndex]
 
-            guard let pid = Int32(pidS), pid != Int32(self_pid),
+            guard let pid = Int32(pidS), pid > 0, pid != Int32(self_pid),
                   let ppid = Int32(ppidS),
                   let cpu = Double(cpuS),
                   let rss = Int64(rssS) else { continue }

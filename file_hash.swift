@@ -765,10 +765,7 @@ private enum HashSaveHelpers {
             guard resp == .OK, let dest = panel.url else { return }
             setLastSaveDir(dest.deletingLastPathComponent())
             do {
-                if FileManager.default.fileExists(atPath: dest.path) {
-                    try FileManager.default.removeItem(at: dest)
-                }
-                try body.data(using: .utf8)?.write(to: dest)
+                try body.data(using: .utf8)?.write(to: dest, options: .atomic)
                 NSWorkspace.shared.activateFileViewerSelecting([dest])
                 stage.flash("Saved \(dest.lastPathComponent)")
             } catch {

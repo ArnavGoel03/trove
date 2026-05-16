@@ -254,6 +254,26 @@ enum RenamePlanError: LocalizedError {
 /// the new filename? Returns the planned name OR a per-row error string.
 /// Never throws to the caller; surfaces errors via `RenameRow.rowError`.
 enum RenamePlanner {
+    /// Validate a DateFormatter format string against a safe-character allowlist.
+    ///
+    /// Why: DateFormatter interprets Unicode locale-aware tokens (e.g. `EEEE`,
+    /// `QQQQ`, `AAAA`) that can produce arbitrarily long strings when repeated,
+    /// and pathological strings like `"AAAA…"×5000` blow up filename length or
+    /// freeze the main thread on a 1000-file batch rename. Only allow the minimal
+    /// set of tokens needed for date/time filenames. If the string fails
+    /// validation we fall back to `"yyyy-MM-dd"`.
+    ///
+    /// Allowed characters: ASCII digits, `y M d H m s _ - . : space ' < >`
+    static func sanitizeDateFormat(_ format: String) -> String {
+        let allowed = Set<Character>(
+            "yMdHms_-.: '<>0123456789 "
+        )
+        guard format.allSatisfy({ allowed.contains($0) }) else {
+            return "yyyy-MM-dd"
+        }
+        return format
+    }
+
     static func planName(for url: URL,
                          index: Int,
                          settings: RenameSettings) -> (name: String, error: String?) {
@@ -326,7 +346,7 @@ enum RenamePlanner {
             }
             let df = DateFormatter()
             df.locale = Locale(identifier: "en_US_POSIX")
-            df.dateFormat = settings.dateFormat
+            df.dateFormat = RenamePlanner.sanitizeDateFormat(settings.dateFormat)
             let prefix = df.string(from: d)
             let sep = RenameSanitize.clean(settings.dateSeparator)
             let cleanedStem = RenameSanitize.clean(prefix) + sep + (original as NSString).deletingPathExtension
@@ -346,7 +366,7 @@ enum RenamePlanner {
             }
             let df = DateFormatter()
             df.locale = Locale(identifier: "en_US_POSIX")
-            df.dateFormat = settings.dateFormat
+            df.dateFormat = RenamePlanner.sanitizeDateFormat(settings.dateFormat)
             let prefix = df.string(from: d)
             let sep = RenameSanitize.clean(settings.dateSeparator)
             let cleanedStem = RenameSanitize.clean(prefix) + sep + (original as NSString).deletingPathExtension
