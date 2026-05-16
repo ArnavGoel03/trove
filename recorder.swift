@@ -415,6 +415,30 @@ final class RecEngine: NSObject, ObservableObject {
     // ---- IOPMAssertion (prevent system sleep during recording) --------------
     private var pmAssertionID: IOPMAssertionID = IOPMAssertionID(0)
 
+    // Fix 24: atexit shadow so a graceful exit(0) path (outside willTerminate)
+    // releases the assertion without leaking it. Pattern mirrors KeepAwakeAssertion.
+    nonisolated(unsafe) private static var exitLock = os_unfair_lock_s()
+    nonisolated(unsafe) private static var exitAssertionID: IOPMAssertionID = IOPMAssertionID(0)
+    nonisolated(unsafe) private static var exitHookRegistered = false
+
+    private static func registerExitHookOnce() {
+        os_unfair_lock_lock(&exitLock); defer { os_unfair_lock_unlock(&exitLock) }
+        if exitHookRegistered { return }
+        exitHookRegistered = true
+        atexit {
+            os_unfair_lock_lock(&RecEngine.exitLock)
+            let id = RecEngine.exitAssertionID
+            RecEngine.exitAssertionID = IOPMAssertionID(0)
+            os_unfair_lock_unlock(&RecEngine.exitLock)
+            if id != IOPMAssertionID(0) { IOPMAssertionRelease(id) }
+        }
+    }
+
+    nonisolated private func writePMShadow(id: IOPMAssertionID) {
+        os_unfair_lock_lock(&RecEngine.exitLock); defer { os_unfair_lock_unlock(&RecEngine.exitLock) }
+        RecEngine.exitAssertionID = id
+    }
+
     // red-team: tokens for willTerminate / willSleep / screens-changed.
     // willTerminate: finalize a recording in progress so the user gets a
     //   playable mp4 instead of an orphaned .tmp.mp4.
@@ -426,6 +450,7 @@ final class RecEngine: NSObject, ObservableObject {
 
     override init() {
         super.init()
+        Self.registerExitHookOnce()
         let terminate = NotificationCenter.default.addObserver(
             forName: .troveWillTerminate, object: nil, queue: nil
         ) { [weak self] _ in
@@ -476,11 +501,9 @@ final class RecEngine: NSObject, ObservableObject {
         micOutput  = nil
         stream?.stopCapture(completionHandler: { _ in })
         stream = nil
-        // Release any lingering IOPMAssertion on dealloc (should already be
-        // released in stop(), but guard double-release here too).
-        if pmAssertionID != IOPMAssertionID(0) {
-            IOPMAssertionRelease(pmAssertionID)
-        }
+        // IOPMAssertion is released in stop() before we reach deinit under
+        // normal operation; the atexit shadow covers the edge case where stop()
+        // didn't run. Avoid accessing main-actor property pmAssertionID from deinit.
     }
 
     // =========================================================================
@@ -718,6 +741,7 @@ final class RecEngine: NSObject, ObservableObject {
         self.isRecording = true
         self.isPaused    = false
         self.startWall   = Date()
+        RecEngineActivityTracker.setActive(true)
         startTickTimer()
         // Prevent system sleep during recording — SCStream and AVAssetWriter
         // don't survive a multi-hour suspend reliably (red-team #8).
@@ -727,6 +751,7 @@ final class RecEngine: NSObject, ObservableObject {
                 IOPMAssertionLevel(kIOPMAssertionLevelOn),
                 "Trove recording in progress" as CFString,
                 &pmAssertionID)
+            writePMShadow(id: pmAssertionID)
         }
     }
 
@@ -826,6 +851,12 @@ final class RecEngine: NSObject, ObservableObject {
         if pmAssertionID != IOPMAssertionID(0) {
             IOPMAssertionRelease(pmAssertionID)
             pmAssertionID = IOPMAssertionID(0)
+            writePMShadow(id: IOPMAssertionID(0))
+        }
+        RecEngineActivityTracker.setActive(false)
+        // If applicationShouldTerminate returned .terminateLater, now signal.
+        if !RecEngineActivityTracker.isActive {
+            NSApp.reply(toApplicationShouldTerminate: true)
         }
     }
 

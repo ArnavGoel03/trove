@@ -309,11 +309,11 @@ final class ProcModel: ObservableObject {
     /// match, we pick the PPID-shared parent itself, otherwise the
     /// highest-CPU member.
     private func regroup() {
-        let q = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let q = search.trimmingCharacters(in: .whitespacesAndNewlines)
         let filtered: [ProcRow] = rows.values.filter { row in
             if q.isEmpty { return true }
-            return row.comm.lowercased().contains(q)
-                || row.args.lowercased().contains(q)
+            return row.comm.localizedCaseInsensitiveContains(q)
+                || row.args.localizedCaseInsensitiveContains(q)
                 || String(row.pid).contains(q)
         }
 

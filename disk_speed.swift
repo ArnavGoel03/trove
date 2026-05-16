@@ -557,7 +557,31 @@ final class DiskSpeedViewModel: ObservableObject {
     // IOPMAssertion: prevent system sleep during a benchmark run.
     private var pmAssertionID: IOPMAssertionID = IOPMAssertionID(0)
 
+    // Fix 24: atexit shadow so graceful exit(0) paths release the assertion.
+    nonisolated(unsafe) private static var exitLock = os_unfair_lock_s()
+    nonisolated(unsafe) private static var exitAssertionID: IOPMAssertionID = IOPMAssertionID(0)
+    nonisolated(unsafe) private static var exitHookRegistered = false
+
+    private static func registerExitHookOnce() {
+        os_unfair_lock_lock(&exitLock); defer { os_unfair_lock_unlock(&exitLock) }
+        if exitHookRegistered { return }
+        exitHookRegistered = true
+        atexit {
+            os_unfair_lock_lock(&DiskSpeedViewModel.exitLock)
+            let id = DiskSpeedViewModel.exitAssertionID
+            DiskSpeedViewModel.exitAssertionID = IOPMAssertionID(0)
+            os_unfair_lock_unlock(&DiskSpeedViewModel.exitLock)
+            if id != IOPMAssertionID(0) { IOPMAssertionRelease(id) }
+        }
+    }
+
+    nonisolated private func writePMShadow(id: IOPMAssertionID) {
+        os_unfair_lock_lock(&DiskSpeedViewModel.exitLock); defer { os_unfair_lock_unlock(&DiskSpeedViewModel.exitLock) }
+        DiskSpeedViewModel.exitAssertionID = id
+    }
+
     init() {
+        Self.registerExitHookOnce()
         // Both `purgeOrphanedScratchOnLaunch` and `refreshVolumes` iterate
         // mounted volumes via `FileManager.mountedVolumeURLs` + per-volume
         // `resourceValues` lookups. Local disks return in microseconds, but
@@ -599,6 +623,7 @@ final class DiskSpeedViewModel: ObservableObject {
         if pmAssertionID != IOPMAssertionID(0) {
             IOPMAssertionRelease(pmAssertionID)
             pmAssertionID = IOPMAssertionID(0)
+            writePMShadow(id: IOPMAssertionID(0))
         }
     }
 
@@ -662,6 +687,7 @@ final class DiskSpeedViewModel: ObservableObject {
                 IOPMAssertionLevel(kIOPMAssertionLevelOn),
                 "Trove disk benchmark in progress" as CFString,
                 &pmAssertionID)
+            writePMShadow(id: pmAssertionID)
         }
         let mib = clampedBlobMiB()
         // red-team: race fix — install the new cancelFlagBox BEFORE launching
@@ -715,6 +741,7 @@ final class DiskSpeedViewModel: ObservableObject {
                 if self.pmAssertionID != IOPMAssertionID(0) {
                     IOPMAssertionRelease(self.pmAssertionID)
                     self.pmAssertionID = IOPMAssertionID(0)
+                    self.writePMShadow(id: IOPMAssertionID(0))
                 }
             }
         }

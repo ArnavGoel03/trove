@@ -46,9 +46,9 @@ struct ClipEntry: Identifiable, Hashable {
     /// are filtered out unless the search is empty.
     var searchHaystack: String {
         switch kind {
-        case .text(let s): return s.lowercased()
+        case .text(let s): return s
         case .image:       return ""
-        case .file(let u): return u.lastPathComponent.lowercased()
+        case .file(let u): return u.lastPathComponent
         }
     }
 
@@ -83,12 +83,12 @@ final class ClipHistory: ObservableObject {
     @Published private(set) var pinnedCount: Int = 0
 
     private func recomputeVisible() {
-        let q = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let q = search.trimmingCharacters(in: .whitespacesAndNewlines)
         if q.isEmpty {
             visible = entries
         } else {
             visible = entries.filter { entry in
-                entry.searchHaystack.contains(q)
+                entry.searchHaystack.localizedCaseInsensitiveContains(q)
             }
         }
         pinnedCount = entries.filter { $0.pinned }.count
@@ -338,6 +338,7 @@ final class ClipHistory: ObservableObject {
 struct HistoryView: View {
     @StateObject private var store = ClipHistory()
     @EnvironmentObject var stage: Stage
+    @State private var confirmClearHistory = false
 
     var body: some View {
         Group {
@@ -352,6 +353,14 @@ struct HistoryView: View {
         .navigationTitle("History")
         .navigationSubtitle(subtitle)
         .toolbar { historyToolbar }
+        .confirmationDialog("Clear unpinned clipboard history?",
+                            isPresented: $confirmClearHistory,
+                            titleVisibility: .visible) {
+            Button("Clear Unpinned", role: .destructive) { store.clearUnpinned() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Pinned items will remain. Unpinned items aren't persisted to disk.")
+        }
     }
 
     private var subtitle: String {
@@ -373,7 +382,7 @@ struct HistoryView: View {
             .help("Watch the clipboard and capture every change. Honors password-manager privacy markers.")
 
             Button(role: .destructive) {
-                store.clearUnpinned()
+                confirmClearHistory = true
             } label: {
                 Label("Clear unpinned", systemImage: "trash")
             }

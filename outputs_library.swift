@@ -275,12 +275,12 @@ final class OutputsLibrary: ObservableObject {
         // Self.group(visible) on every render pass.
         Publishers.CombineLatest($entries, $search)
             .map { entries, query -> [(producer: String, items: [OutputEntry])] in
-                let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
                 let vis: [OutputEntry] = q.isEmpty ? entries : entries.filter { e in
-                    let name = (e.urlPath as NSString).lastPathComponent.lowercased()
-                    return name.contains(q)
-                        || e.producer.lowercased().contains(q)
-                        || e.sourceLabel.lowercased().contains(q)
+                    let name = (e.urlPath as NSString).lastPathComponent
+                    return name.localizedCaseInsensitiveContains(q)
+                        || e.producer.localizedCaseInsensitiveContains(q)
+                        || e.sourceLabel.localizedCaseInsensitiveContains(q)
                 }
                 return Self.groupByProducer(vis)
             }

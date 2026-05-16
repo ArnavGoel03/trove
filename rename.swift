@@ -950,6 +950,7 @@ public struct RenameView: View {
     @StateObject private var vm = RenameViewModel()
     @EnvironmentObject var stage: Stage
     @State private var dropTargeted = false
+    @State private var confirmApply = false
 
     public init() {}
 
@@ -972,10 +973,18 @@ public struct RenameView: View {
         }
         .navigationTitle("Rename")
         .navigationSubtitle("\(vm.rows.count) file\(vm.rows.count == 1 ? "" : "s") · mode: \(vm.settings.mode.rawValue)")
+        .confirmationDialog("Rename \(vm.rows.count) file\(vm.rows.count == 1 ? "" : "s")?",
+                            isPresented: $confirmApply,
+                            titleVisibility: .visible) {
+            Button("Rename", role: .destructive) { vm.apply() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This will rename the files on disk. The operation can be undone via the Undo toolbar button.")
+        }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
-                    vm.apply()
+                    confirmApply = true
                 } label: {
                     Label("Apply", systemImage: "checkmark.circle.fill")
                 }

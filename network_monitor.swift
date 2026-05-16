@@ -537,10 +537,10 @@ final class NetModel: ObservableObject {
     }
 
     private func regroup() {
-        let q = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let q = search.trimmingCharacters(in: .whitespacesAndNewlines)
         let filteredRows = rows.values.filter { r in
             if !q.isEmpty {
-                if !r.name.lowercased().contains(q) && !String(r.pid).contains(q) {
+                if !r.name.localizedCaseInsensitiveContains(q) && !String(r.pid).contains(q) {
                     return false
                 }
             }

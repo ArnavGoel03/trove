@@ -362,6 +362,8 @@ final class SnipEngine: ObservableObject {
                 DispatchQueue.main.async {
                     NSApp.unhide(nil)
                     NSApp.activate(ignoringOtherApps: true)
+                    // Fix 20: switch to Snip pane after capture returns focus.
+                    UserDefaults.standard.set(Pane.snip.rawValue, forKey: "trove.selectedPane")
                     InteractiveCaptureGate.release()
                     self?.isCapturing = false
                 }

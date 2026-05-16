@@ -757,6 +757,7 @@ final class BigScanCache {
     private var root: BigScanCacheRoot
     private let fileURL: URL
     private let dirURL: URL
+    private var terminateObserver: NSObjectProtocol?
 
     private init() {
         let appSup = FileManager.default.urls(for: .applicationSupportDirectory,
@@ -769,6 +770,22 @@ final class BigScanCache {
         self.root = BigScanCacheRoot(version: schemaVersion, byRoot: [:])
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         loadOrQuarantine()
+        // Fix 6: force-flush the cache on app quit — same pattern as NoteStore.
+        terminateObserver = NotificationCenter.default.addObserver(
+            forName: .troveWillTerminate, object: nil, queue: nil
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            self.lock.lock()
+            self.pendingWrite?.cancel()
+            self.pendingWrite = nil
+            let snap = self.root
+            self.lock.unlock()
+            self.ioQueue.sync { self.writeAtomically(snap) }
+        }
+    }
+
+    deinit {
+        if let o = terminateObserver { NotificationCenter.default.removeObserver(o) }
     }
 
     func loaded(rootPath: String) -> BigScanResult? {

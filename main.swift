@@ -62,7 +62,7 @@ struct TroveApp: App {
                     .keyboardShortcut("c", modifiers: [.command, .shift])
                 Button("Capture Screenshot")  { SharedStore.stage.captureScreenshot() }
                     .keyboardShortcut("n", modifiers: [.command, .shift])
-                Button("Clear Stage")         { SharedStore.stage.clear() }
+                Button("Clear Stage")         { confirmClearStageViaAlert(SharedStore.stage) }
                     .keyboardShortcut(.delete, modifiers: [.command, .shift])
             }
 
@@ -73,13 +73,25 @@ struct TroveApp: App {
             // sidebar. Order matches the Clipboard section in the sidebar.
             CommandGroup(after: .sidebar) {
                 Divider()
-                Button("Stage")    { switchToPane(.stage) }
+                Button("Stage")    {
+                    if PaneVisibilityStore.shared.isVisible(.stage) { switchToPane(.stage) }
+                    else { SharedStore.stage.flash("Stage is hidden — show it in Settings") }
+                }
                     .keyboardShortcut("1", modifiers: .command)
-                Button("History")  { switchToPane(.history) }
+                Button("History")  {
+                    if PaneVisibilityStore.shared.isVisible(.history) { switchToPane(.history) }
+                    else { SharedStore.stage.flash("History is hidden — show it in Settings") }
+                }
                     .keyboardShortcut("2", modifiers: .command)
-                Button("Snippets") { switchToPane(.snippets) }
+                Button("Snippets") {
+                    if PaneVisibilityStore.shared.isVisible(.snippets) { switchToPane(.snippets) }
+                    else { SharedStore.stage.flash("Snippets is hidden — show it in Settings") }
+                }
                     .keyboardShortcut("3", modifiers: .command)
-                Button("Notes")    { switchToPane(.notes) }
+                Button("Notes")    {
+                    if PaneVisibilityStore.shared.isVisible(.notes) { switchToPane(.notes) }
+                    else { SharedStore.stage.flash("Notes is hidden — show it in Settings") }
+                }
                     .keyboardShortcut("4", modifiers: .command)
                 Divider()
                 Button(SharedStore.stage.floating ? "Unpin Window" : "Pin Window on Top") {
@@ -210,6 +222,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // source (toolbar button in Keep Awake pane, auto-release on battery, etc.).
     private var keepAwakeItem: NSMenuItem?
     private var keepAwakeCancellable: AnyCancellable?
+    private var pendingTerminate = false
+    // Fix 17: status item right-click menu stored separately so left-click toggles
+    // the main window without also opening the menu.
+    private var statusMenu: NSMenu?
 
     func applicationDidFinishLaunching(_ note: Notification) {
         #if !TROVE_TESTING
@@ -247,7 +263,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         m.addItem(NSMenuItem(title: "Quit Trove",
                              action: #selector(NSApplication.terminate(_:)),
                              keyEquivalent: "q"))
-        s.menu = m
+        // Fix 17: left-click → toggle window; right-click (or ctrl+click) → menu.
+        // Don't assign s.menu — that would make left-click open the menu.
+        statusMenu = m
+        s.button?.action = #selector(statusItemClicked)
+        s.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         statusItem = s
         // Reflect Keep Awake state on the status item — when active, swap the
         // tray glyph for a "filled" variant so the user can see at a glance
@@ -285,6 +305,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                        name: NSLocale.currentLocaleDidChangeNotification, object: nil)
         nc.addObserver(self, selector: #selector(willTerminateHook(_:)),
                        name: NSApplication.willTerminateNotification, object: nil)
+
+        // Launch sweeps — all fire off-main to avoid blocking startup.
+        Task.detached(priority: .utility) {
+            // Fix 4: sweep orphaned recorder .tmp.mp4 files from prior crashes.
+            _ = RecPaths.sweepStaleTmp(RecPaths.defaultFolder)
+
+            // Fix 7: remove trove-* tmp dirs older than 24h (Stage screenshot temp dirs).
+            let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            let cutoff: TimeInterval = 24 * 60 * 60
+            let fm = FileManager.default
+            if let contents = try? fm.contentsOfDirectory(at: tmpDir,
+                                                           includingPropertiesForKeys: [.creationDateKey],
+                                                           options: []) {
+                for url in contents where url.lastPathComponent.hasPrefix("trove-") {
+                    if let created = try? url.resourceValues(forKeys: [.creationDateKey]).creationDate,
+                       Date().timeIntervalSince(created) > cutoff {
+                        try? fm.removeItem(at: url)
+                    }
+                }
+            }
+
+            // Fix 8: remove stale .snippets-*.tmp files older than 60s.
+            let appSup = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+                ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
+            let troveDir = appSup.appendingPathComponent("Trove")
+            if let contents = try? fm.contentsOfDirectory(at: troveDir,
+                                                           includingPropertiesForKeys: [.creationDateKey],
+                                                           options: []) {
+                for url in contents where url.lastPathComponent.hasPrefix(".snippets-") && url.pathExtension == "tmp" {
+                    if let created = try? url.resourceValues(forKeys: [.creationDateKey]).creationDate,
+                       Date().timeIntervalSince(created) > 60 {
+                        try? fm.removeItem(at: url)
+                    }
+                }
+            }
+
+            // Fix 9: DiskSpeed orphan scratch sweep (unconditional at launch).
+            DiskSpeedVolumes.purgeOrphanedScratchOnLaunch()
+        }
         #endif
     }
 
@@ -362,10 +421,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         if let w = NSApp.windows.first { w.makeKeyAndOrderFront(nil) }
     }
+
+    // Fix 17: left-click toggles main window; right-click / ctrl+click shows menu.
+    @objc func statusItemClicked() {
+        let event = NSApp.currentEvent
+        let isRightClick = event?.type == .rightMouseUp
+            || event?.modifierFlags.contains(.control) == true
+        if isRightClick {
+            // Temporarily assign the menu so performClick() pops it,
+            // then clear immediately so left-clicks don't inherit it.
+            statusItem?.menu = statusMenu
+            statusItem?.button?.performClick(nil)
+            statusItem?.menu = nil
+        } else {
+            let hasVisible = NSApp.windows.contains { $0.isVisible && !$0.title.isEmpty }
+            if hasVisible {
+                NSApp.hide(nil)
+            } else {
+                showWin()
+            }
+        }
+    }
     @objc func cap() { SharedStore.stage.captureScreenshot() }
     @objc func pst() { SharedStore.stage.pasteFromClipboard() }
     @objc func cpy() { SharedStore.stage.copyAllAsFiles() }
-    @objc func clr() { SharedStore.stage.clear() }
+    @objc func clr() { MainActor.assumeIsolated { confirmClearStageViaAlert(SharedStore.stage) } }
+
+    // Fix 10: hold the door open if recorder is mid-write on quit.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if RecEngineActivityTracker.isActive {
+            pendingTerminate = true
+            NotificationCenter.default.post(name: .troveTerminateRequested, object: nil)
+            return .terminateLater
+        }
+        return .terminateNow
+    }
 
     // red-team: re-open from Dock / Finder while running activates the existing
     // window instead of spawning a second instance. macOS already does the
@@ -379,6 +469,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     deinit {
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         NotificationCenter.default.removeObserver(self)
+    }
+}
+
+/// NSAlert confirmation before calling stage.clear() — used from menu commands
+/// and AppDelegate selectors where SwiftUI confirmationDialog isn't available.
+@MainActor
+func confirmClearStageViaAlert(_ stage: Stage) {
+    guard stage.items.count > 0 else { stage.clear(); return }
+    let count = stage.items.count
+    let plural = count == 1 ? "" : "s"
+    let alert = NSAlert()
+    alert.messageText = "Clear Stage?"
+    alert.informativeText = "Clear all \(count) Stage item\(plural)? This can't be undone."
+    alert.addButton(withTitle: "Clear")
+    alert.addButton(withTitle: "Cancel")
+    alert.buttons[0].hasDestructiveAction = true
+    if alert.runModal() == .alertFirstButtonReturn {
+        stage.clear()
     }
 }
 
@@ -396,6 +504,28 @@ extension Notification.Name {
     static let troveOpenQuickSwitcher = Notification.Name("TroveOpenQuickSwitcher")
     /// Posted from the Help menu "Keyboard Shortcuts" item. RootView listens.
     static let troveOpenKeyboardShortcuts = Notification.Name("TroveOpenKeyboardShortcuts")
+    /// Posted by AppDelegate.applicationShouldTerminate when a graceful hold
+    /// is active. RecEngine listens and calls NSApp.replyToApplicationShouldTerminate(true)
+    /// once its in-flight work completes.
+    static let troveTerminateRequested = Notification.Name("TroveTerminateRequested")
+}
+
+/// Fix 10: lightweight cross-file flag so AppDelegate can gate quit on
+/// recorder activity without requiring a RecEngine singleton. RecEngine
+/// sets this true on start and false on stop/deinit.
+enum RecEngineActivityTracker {
+    nonisolated(unsafe) private static var lock = os_unfair_lock_s()
+    nonisolated(unsafe) private static var count: Int = 0
+
+    static func setActive(_ on: Bool) {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        count = on ? max(count + 1, 1) : max(count - 1, 0)
+    }
+
+    static var isActive: Bool {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        return count > 0
+    }
 }
 
 // Fix 11: shared pasteboard poller that replaces the twin 0.5s timers that
@@ -909,6 +1039,22 @@ final class PaneVisibilityStore: ObservableObject {
         hidden = Set(Pane.allCases.filter { $0.userHideable }.map { $0.rawValue })
         save()
     }
+
+    /// Reload from the persisted sidebar.json — same logic as init's detached load.
+    /// Called after ProfileSync.apply() writes a new sidebar.json.
+    func reload() {
+        let url = Self.fileURL
+        Task.detached(priority: .utility) { [weak self] in
+            guard FileManager.default.fileExists(atPath: url.path) else { return }
+            do {
+                guard let data = boundedRead(url) else { return }
+                let arr = try JSONDecoder().decode([String].self, from: data)
+                let valid = Set(Pane.allCases.map(\.rawValue))
+                let loaded = Set(arr).intersection(valid)
+                await MainActor.run { self?.hidden = loaded }
+            } catch {}
+        }
+    }
 }
 
 // ===========================================================================
@@ -1070,6 +1216,9 @@ final class ProfileSync: ObservableObject {
                 }
             }
             lastError = skipMessages.isEmpty ? nil : skipMessages.joined(separator: "; ")
+            // Fix 15: after writing sidebar.json, reload PaneVisibilityStore so
+            // the running sidebar reflects the profile immediately.
+            PaneVisibilityStore.shared.reload()
             return true
         } catch {
             lastError = error.localizedDescription
@@ -1401,7 +1550,8 @@ final class LaunchAtLogin: ObservableObject {
 
     func refresh() {
         if #available(macOS 13, *) {
-            enabled = SMAppService.mainApp.status == .enabled
+            let s = SMAppService.mainApp.status
+            enabled = s == .enabled || s == .requiresApproval
         } else {
             enabled = false
         }
@@ -1411,15 +1561,18 @@ final class LaunchAtLogin: ObservableObject {
         guard #available(macOS 13, *) else { return }
         do {
             if on {
-                if SMAppService.mainApp.status != .enabled {
+                let s = SMAppService.mainApp.status
+                if s != .enabled && s != .requiresApproval {
                     try SMAppService.mainApp.register()
                 }
             } else {
-                if SMAppService.mainApp.status == .enabled {
+                let s = SMAppService.mainApp.status
+                if s == .enabled || s == .requiresApproval {
                     try SMAppService.mainApp.unregister()
                 }
             }
-            enabled = (SMAppService.mainApp.status == .enabled)
+            let s = SMAppService.mainApp.status
+            enabled = s == .enabled || s == .requiresApproval
         } catch {
             NSLog("LaunchAtLogin: %@", "\(error)")
             // Re-read whatever the system thinks the state actually is so
@@ -1460,7 +1613,24 @@ struct TroveSettingsScene: View {
             .frame(minWidth: 640, minHeight: 520)
             .tint(TroveAccentChoice(rawValue: accentRaw)?.color ?? .troveAccentAlt)
             .background(TroveAppBackground())
+            // Fix 18: persist settings window position via autosave name.
+            .background(SettingsWindowAutosave())
     }
+}
+
+/// NSViewRepresentable that hooks `setFrameAutosaveName` on the hosting
+/// NSWindow so the Settings window remembers its position across launches.
+private struct SettingsWindowAutosave: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView()
+        DispatchQueue.main.async {
+            if let w = v.window, w.frameAutosaveName.isEmpty {
+                w.setFrameAutosaveName("trove.settingsWindow")
+            }
+        }
+        return v
+    }
+    func updateNSView(_ v: NSView, context: Context) {}
 }
 
 /// Big, hard-to-miss version banner at the top of Settings. Shows the
@@ -1590,7 +1760,7 @@ struct QuickSwitcherView: View {
             label: "Clear Stage",
             detail: "Remove all staged items",
             icon: "tray",
-            action: .run { SharedStore.stage.clear() }
+            action: .run { confirmClearStageViaAlert(SharedStore.stage) }
         ))
         items.append(QuickSwitcherItem(
             label: "Paste into Stage",
@@ -1736,7 +1906,7 @@ struct QuickSwitcherView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
-        .background(isSelected ? Color.troveAccentSky.opacity(0.85) : Color.clear)
+        .background(isSelected ? Color.accentColor.opacity(0.85) : Color.clear)
     }
 
     @ViewBuilder
@@ -1856,6 +2026,11 @@ struct DiagnosticsCard: View {
                         let url = URL(string: "https://github.com/\(UpdateChecker.repoOwner)/\(UpdateChecker.repoName)/issues/new?title=\(reportTitle)&body=\(reportBody)")
                         if let url { NSWorkspace.shared.open(url) }
                     } label: { Label("Report Issue", systemImage: "ladybug") }
+                    Button {
+                        UserDefaults.standard.removeObject(forKey: "trove.mainWindow")
+                        NSApp.mainWindow?.center()
+                    } label: { Label("Reset Window Position", systemImage: "rectangle.center.inset.filled") }
+                        .help("Re-center the main Trove window")
                     Spacer()
                     Button(role: .destructive) {
                         resetConfirm = true
@@ -1955,6 +2130,9 @@ struct DiagnosticsCard: View {
         // Reload to defaults: write a sane selected pane so next launch
         // doesn't pick a stale one that crashes.
         UserDefaults.standard.set(Pane.stage.rawValue, forKey: "trove.selectedPane")
+        // Fix 16: clear in-memory PaneVisibilityStore so the running sidebar
+        // immediately reflects the reset state without requiring a relaunch.
+        PaneVisibilityStore.shared.showAll()
         NSLog("Trove: preferences reset by user")
     }
 }
@@ -2268,8 +2446,7 @@ struct RootView: View {
                 stage.flash("Clear refused — Trove must be frontmost")
                 return
             }
-            stage.clear()
-            stage.flash("Stage cleared")
+            confirmClearStageViaAlert(stage)
         case "add":
             paneRaw = Pane.stage.rawValue
             let type = q["type"] ?? "file"
@@ -2360,6 +2537,7 @@ struct RootView: View {
 
 struct WelcomeSheet: View {
     let onDismiss: () -> Void
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         VStack(spacing: 0) {
@@ -2389,6 +2567,7 @@ struct WelcomeSheet: View {
 
             Button {
                 onDismiss()
+                dismiss()
             } label: {
                 Text("Got it")
                     .font(.headline)
@@ -2397,6 +2576,7 @@ struct WelcomeSheet: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
+            .keyboardShortcut(.escape, modifiers: [])
             .padding(.horizontal, 24)
             .padding(.top, 20)
             .padding(.bottom, 28)
@@ -2467,6 +2647,7 @@ struct KeyboardShortcutsSheet: View {
             Button("Done") { dismiss() }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
+                .keyboardShortcut(.escape, modifiers: [])
                 .padding(.top, 20)
                 .padding(.bottom, 28)
         }
@@ -2652,18 +2833,20 @@ enum TroveAccentChoice: String, CaseIterable, Identifiable {
 // never reads as visual noise for vestibular-sensitive users.
 struct TroveAppBackground: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @AppStorage("trove.accent") private var accentRaw: String = TroveAccentChoice.white.rawValue
+    private var accentColor: Color {
+        TroveAccentChoice(rawValue: accentRaw)?.color ?? .troveAccentAlt
+    }
     var body: some View {
         if reduceTransparency {
             Color.troveBg.ignoresSafeArea()
         } else {
             ZStack {
                 Color.troveBg
-                // Mirrors the trove-site hero gradient
-                // (`radial-gradient(120% 80% at 50% 0%, rgba(255,122,69,0.10),
-                // transparent 60%)`). LinearGradient top→center reads close
-                // enough at NavigationSplitView aspect ratios.
+                // Mirrors the trove-site hero gradient — uses the user's accent
+                // choice so swapping the accent swatch re-tints the background live.
                 LinearGradient(
-                    colors: [Color.troveAccent.opacity(0.08), .clear],
+                    colors: [accentColor.opacity(0.08), .clear],
                     startPoint: .top,
                     endPoint: .center
                 )
@@ -3047,6 +3230,8 @@ final class Stage: ObservableObject {
             DispatchQueue.main.async {
                 NSApp.unhide(nil)
                 NSApp.activate(ignoringOtherApps: true)
+                // Fix 20: switch to Stage pane after screenshot completes.
+                UserDefaults.standard.set(Pane.stage.rawValue, forKey: "trove.selectedPane")
                 if FileManager.default.fileExists(atPath: url.path) {
                     self.items.append(StagedItem(kind: .image(url)))
                 } else if !CGPreflightScreenCaptureAccess() {
@@ -3075,7 +3260,8 @@ final class Stage: ObservableObject {
         let allURLs = exportAllToURLs()
         let fm = FileManager.default
         let urls = allURLs.filter { fm.fileExists(atPath: $0.path) }
-        let dropped = allURLs.count - urls.count
+        let skippedURLs = allURLs.filter { !fm.fileExists(atPath: $0.path) }
+        let dropped = skippedURLs.count
         guard !urls.isEmpty else {
             flash(dropped > 0
                   ? "All staged files have moved or been deleted — nothing to copy"
@@ -3089,7 +3275,14 @@ final class Stage: ObservableObject {
         // Stage no longer tracks lastChangeCount itself.
         NotificationCenter.default.post(name: .troveDidWritePasteboard, object: nil)
         let base = "Copied \(urls.count) item\(urls.count == 1 ? "" : "s") · ⌘V to paste them anywhere"
-        flash(dropped > 0 ? "\(base) (\(dropped) missing skipped)" : base)
+        if dropped > 0 {
+            // Fix 23: include the skipped filenames so the user knows which items were missing.
+            let names = skippedURLs.prefix(3).map { "'\($0.lastPathComponent)'" }.joined(separator: ", ")
+            let suffix = dropped > 3 ? " and \(dropped - 3) more" : ""
+            flash("\(base) — skipped: \(names)\(suffix) (moved or deleted)")
+        } else {
+            flash(base)
+        }
     }
 
     func copyAllAsText() {
@@ -3216,7 +3409,7 @@ struct StageView: View {
             .help("Keep window above other apps")
 
             Button(role: .destructive) {
-                stage.clear()
+                confirmClearStageViaAlert(stage)
             } label: {
                 Label("Clear", systemImage: "trash")
             }

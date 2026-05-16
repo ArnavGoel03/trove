@@ -113,13 +113,13 @@ final class SnippetStore: ObservableObject {
     }
 
     private func recomputeVisible() {
-        let q = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let q = search.trimmingCharacters(in: .whitespacesAndNewlines)
         let filtered: [Snippet] = q.isEmpty
             ? snippets
             : snippets.filter { s in
-                if s.name.lowercased().contains(q) { return true }
-                if s.body.lowercased().contains(q) { return true }
-                if s.tags.contains(where: { $0.lowercased().contains(q) }) { return true }
+                if s.name.localizedCaseInsensitiveContains(q) { return true }
+                if s.body.localizedCaseInsensitiveContains(q) { return true }
+                if s.tags.contains(where: { $0.localizedCaseInsensitiveContains(q) }) { return true }
                 return false
             }
         visible = filtered.sorted { a, b in
@@ -138,6 +138,7 @@ final class SnippetStore: ObservableObject {
     private let ioQueue = DispatchQueue(label: "trove.snippets.io", qos: .utility)
     /// Debounce token; cancelled and replaced on each save() call within 200 ms.
     private var pendingSave: DispatchWorkItem?
+    private var terminateObserver: NSObjectProtocol?
 
     init(fileURL: URL? = nil) {
         if let u = fileURL {
@@ -152,6 +153,22 @@ final class SnippetStore: ObservableObject {
                 .appendingPathComponent("snippets.json")
         }
         load()
+        // Fix 5: force-flush on quit within the 200ms debounce window.
+        let url = self.fileURL
+        let queue = self.ioQueue
+        terminateObserver = NotificationCenter.default.addObserver(
+            forName: .troveWillTerminate, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            self.pendingSave?.cancel()
+            self.pendingSave = nil
+            let snapshot = self.snippets
+            queue.sync { _ = Self.writeSnapshot(snapshot, to: url) }
+        }
+    }
+
+    deinit {
+        if let o = terminateObserver { NotificationCenter.default.removeObserver(o) }
     }
 
     // MARK: filtered + sorted view
