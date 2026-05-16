@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- =========================================================
+       Trove — Direct Distribution entitlements.
+       Use this when shipping outside the Mac App Store (signed
+       with Developer ID Application + notarized via Apple).
+       Hardened Runtime is required for notarization; we don't
+       disable any of its protections. The OS-level TCC dialogs
+       (Accessibility, Screen Recording, Microphone, Files) take
+       care of consent at first use.
+       ========================================================= -->
+
+  <!-- Hardened Runtime: keep all protections on. -->
+  <key>com.apple.security.cs.allow-jit</key><false/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key><false/>
+  <key>com.apple.security.cs.allow-dyld-environment-variables</key><false/>
+  <key>com.apple.security.cs.disable-library-validation</key><false/>
+  <key>com.apple.security.cs.disable-executable-page-protection</key><false/>
+
+  <!-- Microphone access for the Recorder pane (when the user opts to capture mic). -->
+  <key>com.apple.security.device.audio-input</key><true/>
+
+  <!-- Network client for fetching ECB daily exchange rates. -->
+  <key>com.apple.security.network.client</key><true/>
+
+  <!-- AppleScript automation of Finder (Cut-Paste-Files + Finder Tweaks panes). -->
+  <key>com.apple.security.automation.apple-events</key><true/>
+</dict>
+</plist>

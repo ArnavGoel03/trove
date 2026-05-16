@@ -1,0 +1,15 @@
+# Build artifacts (regenerable from source)
+dist/
+Toolbox.iconset/
+icon-1024.png
+
+# Editor / OS junk
+.DS_Store
+*.swiftmodule
+*.swiftdoc
+*.dSYM
+
+# Apple Developer keys / private signing material — never commit
+sparkle_ed_private_key
+*.p12
+*.p8

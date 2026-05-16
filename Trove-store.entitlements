@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- =========================================================
+       Trove — Mac App Store entitlements (sandboxed).
+       App Sandbox is required for the Mac App Store. In this
+       configuration, several Trove features WILL NOT WORK
+       and should be conditionally compiled out (see SHIPPING.md).
+
+       Features that won't work in a sandboxed build:
+         • Move Files (Cut-Paste in Finder)   — needs CGEventTap (no sandbox API)
+         • Switcher (AltTab)                  — needs global Carbon hotkey + cross-app AX
+         • Snap (window tiling)               — needs AX on other apps
+         • Processes                          — needs kill() on arbitrary PIDs
+         • Finder Tweaks                      — needs Apple-Events automation to com.apple.finder
+         • OCR / Recorder full screen capture — needs cross-app screen access
+         • Storage Scan/Clean/Sweep           — needs broad filesystem access
+
+       Recommendation: ship via Direct Distribution. The MAS
+       version would be roughly half the surface area.
+       ========================================================= -->
+
+  <key>com.apple.security.app-sandbox</key><true/>
+  <key>com.apple.security.files.user-selected.read-write</key><true/>
+  <key>com.apple.security.files.downloads.read-write</key><true/>
+  <key>com.apple.security.assets.pictures.read-only</key><true/>
+  <key>com.apple.security.device.audio-input</key><true/>
+  <key>com.apple.security.network.client</key><true/>
+
+  <!-- Temporary exception: limited Apple-Events to Finder only. -->
+  <key>com.apple.security.temporary-exception.apple-events</key>
+  <array>
+    <string>com.apple.finder</string>
+  </array>
+</dict>
+</plist>
