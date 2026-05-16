@@ -7,6 +7,7 @@
 import SwiftUI
 import AppKit
 import Combine
+import ServiceManagement
 import UniformTypeIdentifiers
 
 // ===========================================================================
@@ -1006,6 +1007,7 @@ struct CustomizeView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 VersionBannerCard()
+                LaunchAtLoginCard()
                 AccentPickerCard()
 
                 Card {
@@ -1070,11 +1072,64 @@ struct CustomizeView: View {
 
                 // Backup & sync (iCloud Drive + file export/import).
                 ProfileSyncCard()
+
+                DiagnosticsCard()
             }
             .padding(24)
         }
         .navigationTitle("Customize")
         .navigationSubtitle("\(Pane.allCases.filter { $0.userHideable }.count - store.hidden.count) of \(Pane.allCases.filter { $0.userHideable }.count) optional tools visible")
+    }
+}
+
+// ===========================================================================
+// MARK: - Launch at Login
+// ===========================================================================
+
+/// Wraps `SMAppService.mainApp` so the rest of the app can drive a SwiftUI
+/// toggle without touching ServiceManagement directly. Every public method
+/// degrades silently (NSLog + no-op) on macOS 12 (where `SMAppService` is
+/// unavailable) — we don't want a missing API to crash a release build.
+///
+/// `status` is `@Published` so the toggle in Settings reflects external
+/// changes (user disabled the login item via System Settings → General →
+/// Login Items, etc.) the next time the Settings window opens.
+@MainActor
+final class LaunchAtLogin: ObservableObject {
+    static let shared = LaunchAtLogin()
+    @Published var enabled: Bool = false
+
+    private init() {
+        refresh()
+    }
+
+    func refresh() {
+        if #available(macOS 13, *) {
+            enabled = SMAppService.mainApp.status == .enabled
+        } else {
+            enabled = false
+        }
+    }
+
+    func set(_ on: Bool) {
+        guard #available(macOS 13, *) else { return }
+        do {
+            if on {
+                if SMAppService.mainApp.status != .enabled {
+                    try SMAppService.mainApp.register()
+                }
+            } else {
+                if SMAppService.mainApp.status == .enabled {
+                    try SMAppService.mainApp.unregister()
+                }
+            }
+            enabled = (SMAppService.mainApp.status == .enabled)
+        } catch {
+            NSLog("LaunchAtLogin: %@", "\(error)")
+            // Re-read whatever the system thinks the state actually is so
+            // the toggle doesn't lie to the user about the success/failure.
+            refresh()
+        }
     }
 }
 
@@ -1159,6 +1214,194 @@ struct VersionBannerCard: View {
                 }
             }
         }
+    }
+}
+
+/// Launch-at-login toggle for Settings.
+struct LaunchAtLoginCard: View {
+    @ObservedObject private var lal = LaunchAtLogin.shared
+    var body: some View {
+        Card {
+            HStack(spacing: 12) {
+                Image(systemName: "power.circle")
+                    .font(.system(size: 22)).foregroundStyle(.tint)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Launch at Login").font(.headline)
+                    Text("Start Trove automatically when you log in. Toggle off any time; you can also manage this from System Settings → General → Login Items.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 12)
+                Toggle("", isOn: Binding(get: { lal.enabled }, set: { lal.set($0) }))
+                    .labelsHidden()
+            }
+        }
+        .onAppear { lal.refresh() }
+    }
+}
+
+/// Diagnostics: surface recent crash reports so the user doesn't have to
+/// dig through Console.app, plus a hard-reset action (clears UserDefaults
+/// for the bundle so a corrupt pref state can't keep crash-looping) and a
+/// "Report Issue" link that opens a pre-filled GitHub issue with the
+/// installed version + macOS info.
+struct DiagnosticsCard: View {
+    @State private var recent: [RecentCrash] = []
+    @State private var resetConfirm = false
+
+    struct RecentCrash: Identifiable {
+        let id = UUID()
+        let path: URL
+        let date: Date
+        let symbol: String
+    }
+
+    var body: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Image(systemName: "stethoscope").foregroundStyle(.tint)
+                    Text("Diagnostics").font(.headline)
+                    Spacer()
+                    if recent.isEmpty {
+                        Text("No recent crashes").font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Text("\(recent.count) recent").font(.caption).foregroundStyle(.orange)
+                    }
+                }
+
+                if !recent.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(recent.prefix(5)) { c in
+                            HStack(spacing: 8) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundStyle(.orange).font(.caption)
+                                Text(c.date.formatted(date: .abbreviated, time: .shortened))
+                                    .font(.caption.monospaced())
+                                Text(c.symbol)
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                Spacer()
+                                Button("Reveal") {
+                                    NSWorkspace.shared.activateFileViewerSelecting([c.path])
+                                }
+                                .controlSize(.small)
+                            }
+                        }
+                    }
+                    .padding(8)
+                    .background(.orange.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+                }
+
+                HStack(spacing: 8) {
+                    Button {
+                        loadRecent()
+                    } label: { Label("Refresh", systemImage: "arrow.clockwise") }
+                    Button {
+                        let url = URL(string: "https://github.com/\(UpdateChecker.repoOwner)/\(UpdateChecker.repoName)/issues/new?title=\(reportTitle)&body=\(reportBody)")
+                        if let url { NSWorkspace.shared.open(url) }
+                    } label: { Label("Report Issue", systemImage: "ladybug") }
+                    Spacer()
+                    Button(role: .destructive) {
+                        resetConfirm = true
+                    } label: { Label("Reset Trove…", systemImage: "trash") }
+                        .help("Clear all Trove preferences. Notes, snippets, and outputs library are preserved.")
+                }
+            }
+        }
+        .onAppear { loadRecent() }
+        .confirmationDialog("Reset Trove?",
+                             isPresented: $resetConfirm,
+                             titleVisibility: .visible) {
+            Button("Reset preferences", role: .destructive) { performReset() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Clears Trove's UserDefaults — selected pane, accent, sidebar visibility, hotkey bindings, and the auto-update cache. Notes, snippets, and outputs library on disk are not touched.")
+        }
+    }
+
+    private var reportTitle: String {
+        let v = UpdateChecker.currentVersion() ?? "dev"
+        return "Issue%20in%20Trove%20v\(v)".replacingOccurrences(of: " ", with: "%20")
+    }
+
+    private var reportBody: String {
+        let v = UpdateChecker.currentVersion() ?? "dev"
+        let os = ProcessInfo.processInfo.operatingSystemVersionString
+        let machine = AccountSystemInfo.snapshot().chip
+        let body = """
+        **Version**: Trove \(v)
+        **macOS**: \(os)
+        **Machine**: \(machine)
+
+        **What happened**:
+
+
+        **What I expected**:
+
+
+        **Steps to reproduce**:
+
+        """
+        return body.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+    }
+
+    private func loadRecent() {
+        let dir = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Library/Logs/DiagnosticReports", isDirectory: true)
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+        let cutoff = Date().addingTimeInterval(-7 * 86400) // last 7 days
+        let crashes: [RecentCrash] = entries
+            .filter { $0.lastPathComponent.hasPrefix("Trove-") && $0.lastPathComponent.hasSuffix(".ips") }
+            .compactMap { url -> RecentCrash? in
+                let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey])
+                    .contentModificationDate) ?? .distantPast
+                guard date >= cutoff else { return nil }
+                let symbol = Self.extractTopSymbol(from: url) ?? "unknown"
+                return RecentCrash(path: url, date: date, symbol: symbol)
+            }
+            .sorted { $0.date > $1.date }
+        recent = Array(crashes.prefix(10))
+    }
+
+    /// Parse just the first symbol of the triggered thread out of an .ips
+    /// file. Defensive — any parse failure returns nil; we never crash
+    /// trying to render a crash log.
+    private static func extractTopSymbol(from url: URL) -> String? {
+        guard let data = boundedRead(url, maxBytes: 2 * 1024 * 1024),
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        // .ips files: first line is a header JSON, rest is the body JSON.
+        let parts = text.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: true)
+        guard parts.count == 2 else { return nil }
+        // The triggered thread's top frame's symbol — find the first
+        // `"symbol" : "X"` after `"triggered": true`. Cheap string search.
+        let body = String(parts[1])
+        guard let triggerRange = body.range(of: "\"triggered\":true") ??
+              body.range(of: "\"triggered\" : true") else { return nil }
+        let after = body[triggerRange.upperBound...]
+        guard let symRange = after.range(of: "\"symbol\"") else { return nil }
+        let sym = after[symRange.upperBound...]
+        guard let openQuote = sym.range(of: "\"") else { return nil }
+        let symStart = sym[openQuote.upperBound...]
+        guard let closeQuote = symStart.range(of: "\"") else { return nil }
+        return String(symStart[..<closeQuote.lowerBound])
+    }
+
+    private func performReset() {
+        let bundleID = Bundle.main.bundleIdentifier ?? "com.arnavgoel.trove"
+        // Persist files (Notes, Snippets, Outputs Library) are in
+        // Application Support; we intentionally do NOT touch those.
+        // Reset just the UserDefaults domain.
+        UserDefaults.standard.removePersistentDomain(forName: bundleID)
+        UserDefaults.standard.synchronize()
+        // Reload to defaults: write a sane selected pane so next launch
+        // doesn't pick a stale one that crashes.
+        UserDefaults.standard.set(Pane.stage.rawValue, forKey: "trove.selectedPane")
+        NSLog("Trove: preferences reset by user")
     }
 }
 
