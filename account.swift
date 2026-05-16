@@ -132,7 +132,7 @@ final class AccountStore: ObservableObject {
         let url = fileURL
         guard FileManager.default.fileExists(atPath: url.path) else { return }
         do {
-            let data = try Data(contentsOf: url)
+            guard let data = boundedRead(url) else { throw CocoaError(.fileReadNoSuchFile) }
             let parsed = try JSONDecoder().decode(AccountFile.self, from: data)
             self.prefs = parsed.prefs
             self.identity = parsed.identity
@@ -322,34 +322,28 @@ struct AccountSystemInfo {
         )
     }
 
+    /// Read the CPU architecture via `sysctlbyname("hw.machine", …)`. Pure
+    /// in-process syscall (microseconds, no fork), so this is safe to call
+    /// from anywhere — including SwiftUI view init on the main thread, which
+    /// is exactly where the old `Process()` + `uname -m` chain crashed Trove
+    /// on 2026-05-16 06:03 (`@State` default expression evaluated during
+    /// `AccountView.init`).
     private static func uname() -> String {
-        // red-team: process boundary cost is irrelevant per-snapshot, but the
-        // result is invariant for the life of the process — caching it
-        // eliminates a fork+exec on every Refresh click and avoids any
-        // theoretical PATH-injection surface (we already pin /usr/bin/uname).
         if let cached = cachedUname { return cached }
-        let p = Process()
-        p.launchPath = "/usr/bin/uname"
-        p.arguments = ["-m"]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        // red-team-sec: explicitly null out stderr so a hostile `uname`
-        // earlier on PATH (we pin /usr/bin so this is defensive) couldn't
-        // spam our process's stderr. launchPath bypasses PATH but keep the
-        // belt-and-suspenders here for future code changes.
-        p.standardError = Pipe()
-        do {
-            try p.run()
-            p.waitUntilExitOffMain()
-            let d = pipe.fileHandleForReading.readDataToEndOfFile()
-            let out = String(data: d, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? "unknown"
-            cachedUname = out
-            return out
-        } catch {
+        var size = 0
+        if sysctlbyname("hw.machine", nil, &size, nil, 0) != 0 || size == 0 {
             cachedUname = "unknown"
             return "unknown"
         }
+        var bytes = [CChar](repeating: 0, count: size)
+        if sysctlbyname("hw.machine", &bytes, &size, nil, 0) != 0 {
+            cachedUname = "unknown"
+            return "unknown"
+        }
+        let out = String(cString: bytes).trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolved = out.isEmpty ? "unknown" : out
+        cachedUname = resolved
+        return resolved
     }
     private static var cachedUname: String?
 }

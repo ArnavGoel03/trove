@@ -224,7 +224,7 @@ final class SnippetStore: ObservableObject {
         // Run synchronously on init to avoid a flash-of-empty-list, but defensive
         // about every failure mode: missing file, bad JSON, weird permissions.
         do {
-            let data = try Data(contentsOf: url)
+            guard let data = boundedRead(url) else { return }
             // Empty file → treat as fresh install, not a crash.
             guard !data.isEmpty else {
                 self.snippets = []

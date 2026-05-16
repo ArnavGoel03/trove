@@ -730,10 +730,15 @@ final class ProfileSync: ObservableObject {
     }
 
     private init() {
-        let url = iCloudDir.appendingPathComponent("profile.json")
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-           let mod = attrs[.modificationDate] as? Date {
-            lastBackup = mod
+        // iCloud Drive paths route through the `bird` daemon — an
+        // attributesOfItem call on a CloudDocs mount can block until the
+        // daemon responds (200ms–∞ during a sync). Defer the probe off
+        // main; `lastBackup` starts nil and patches in when ready.
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            let path = await MainActor.run { self.iCloudDir.appendingPathComponent("profile.json").path }
+            let mod = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+            await MainActor.run { self.lastBackup = mod }
         }
     }
 
@@ -1000,6 +1005,7 @@ struct CustomizeView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
+                VersionBannerCard()
                 AccentPickerCard()
 
                 Card {
@@ -1072,6 +1078,27 @@ struct CustomizeView: View {
     }
 }
 
+/// Bounded local file read. Returns nil if:
+///   • the file doesn't exist,
+///   • the file is larger than `maxBytes` (defaults to 16 MB — generous
+///     for any prefs JSON Trove writes; refuses to load anything bigger
+///     so a corrupt or hostile blob can't OOM the app),
+///   • the read or stat throws for any reason.
+/// Pair with the existing per-store "quarantine corrupt JSON" pattern —
+/// callers should still try-decode and quarantine on decode failure;
+/// this just adds an upstream memory safety net.
+func boundedRead(_ url: URL, maxBytes: Int = 16 * 1024 * 1024) -> Data? {
+    let fm = FileManager.default
+    guard fm.fileExists(atPath: url.path) else { return nil }
+    if let attrs = try? fm.attributesOfItem(atPath: url.path),
+       let size = (attrs[.size] as? NSNumber)?.intValue,
+       size > maxBytes {
+        NSLog("boundedRead: refusing %@ — %d bytes > %d cap", url.lastPathComponent, size, maxBytes)
+        return nil
+    }
+    return try? Data(contentsOf: url)
+}
+
 /// Hosts the Settings window content. Reads the accent choice from
 /// `@AppStorage` so flipping the swatch picker re-tints both the Settings
 /// window *and* (via the same key) the main window — a single source of truth.
@@ -1082,6 +1109,56 @@ struct TroveSettingsScene: View {
             .frame(minWidth: 640, minHeight: 520)
             .tint(TroveAccentChoice(rawValue: accentRaw)?.color ?? .troveAccentAlt)
             .background(TroveAppBackground())
+    }
+}
+
+/// Big, hard-to-miss version banner at the top of Settings. Shows the
+/// installed version, bundle id, and a direct link to the GitHub release
+/// page so the user can always confirm which build they're running and
+/// where to grab the next one. Also: tappable to copy the version string
+/// (handy when the user is filing an issue).
+struct VersionBannerCard: View {
+    @State private var copied = false
+    var version: String { UpdateChecker.currentVersion() ?? "dev" }
+    var bundleID: String { Bundle.main.bundleIdentifier ?? "com.arnavgoel.trove" }
+    var body: some View {
+        Card {
+            HStack(spacing: 14) {
+                Image(systemName: "circle.hexagongrid.fill")
+                    .font(.system(size: 28))
+                    .foregroundStyle(.tint)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 8) {
+                        Text("Trove")
+                            .font(.system(.title2, design: .rounded).weight(.semibold))
+                        Text("v\(version)")
+                            .font(.system(.body, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 8).padding(.vertical, 2)
+                            .background(Color.troveCardFill, in: Capsule())
+                            .onTapGesture {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString("Trove \(version)", forType: .string)
+                                copied = true
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
+                            }
+                            .help("Click to copy")
+                        if copied {
+                            Text("Copied").font(.caption).foregroundStyle(.secondary).transition(.opacity)
+                        }
+                    }
+                    Text(bundleID).font(.caption).foregroundStyle(.tertiary)
+                }
+                Spacer()
+                Button {
+                    if let url = URL(string: "https://github.com/\(UpdateChecker.repoOwner)/\(UpdateChecker.repoName)/releases") {
+                        NSWorkspace.shared.open(url)
+                    }
+                } label: {
+                    Label("Releases", systemImage: "arrow.up.right.square")
+                }
+            }
+        }
     }
 }
 
@@ -1198,6 +1275,7 @@ struct RootView: View {
 
     var body: some View {
         NavigationSplitView(columnVisibility: sidebarVisibilityBinding) {
+          VStack(spacing: 0) {
             List(selection: paneBinding) {
                 ForEach(Self.sectionOrder, id: \.self) { section in
                     let panesInSection = Pane.allCases.filter {
@@ -1230,7 +1308,37 @@ struct RootView: View {
             }
             .listStyle(.sidebar)
             .scrollContentBackground(.hidden)
-            .navigationSplitViewColumnWidth(min: 180, ideal: 220)
+
+            // Sidebar footer — always-visible version + quick Settings.
+            // Pinned to the bottom of the sidebar column so the user can
+            // see at a glance which build they're on, without having to
+            // open the About dialog or Settings.
+            Divider().opacity(0.4)
+            HStack(spacing: 8) {
+                Image(systemName: "circle.hexagongrid.fill")
+                    .foregroundStyle(.tint)
+                    .font(.system(size: 11))
+                Text("Trove")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Text(UpdateChecker.currentVersion().map { "v\($0)" } ?? "dev")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                Spacer()
+                Button {
+                    openSettingsWindow()
+                } label: {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Open Settings (⌘,)")
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+          }
+          .navigationSplitViewColumnWidth(min: 180, ideal: 220)
         } detail: {
             Group {
                 switch Pane(rawValue: paneRaw) ?? .stage {

@@ -727,8 +727,11 @@ final class GPUMonitorModel: ObservableObject {
                 self.thermal = ProcessInfo.processInfo.thermalState
                 self.refreshAlertIcon()
         }
-        start()
-        if experimentalSensors { startHID() }
+        // NOTE: `start()` used to fire here, which triggered an immediate
+        // synchronous `tick()` — and `tick()` does IOKit / IORegistry
+        // traversal + `MTLCopyAllDevices()`, all of which is OK off-main but
+        // accumulates main-thread time during @StateObject init. The view
+        // now triggers `start()` from `.onAppear` so init returns instantly.
     }
 
     deinit {
@@ -1618,6 +1621,7 @@ public struct GPUMonitorView: View {
         .background(keyboardCatcher)
         .overlay(alignment: .bottom) { toastView }
         .navigationTitle("GPU & Thermals")
+        .onAppear { model.start(); if model.experimentalSensors { model.startHID() } }
     }
 
     @ViewBuilder

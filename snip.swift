@@ -216,19 +216,21 @@ final class SnipEngine: ObservableObject {
                                     isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         tempDir = dir
-        // red-team: every previous app launch created a fresh `trove-snip-*`
-        // tmp dir and nothing reaped them — /tmp would grow without bound on
-        // long-running systems. Sweep sibling dirs older than 24h on init;
-        // they can never be referenced by *this* engine (different UUID), so
-        // deletion is safe. Skip our own dir explicitly.
-        let parent = FileManager.default.temporaryDirectory
-        if let items = try? FileManager.default.contentsOfDirectory(
-            at: parent,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles]) {
+        // Sweep stale `trove-snip-*` siblings older than 24h in the
+        // background. The original sync scan could iterate thousands of
+        // `/tmp` entries on a busy machine — that's a sync directory scan
+        // on the main thread during `@StateObject` init, the same shape
+        // that produced the 2026-05-16 crash loop.
+        let ownPath = dir.path
+        Task.detached(priority: .utility) {
+            let parent = FileManager.default.temporaryDirectory
+            guard let items = try? FileManager.default.contentsOfDirectory(
+                at: parent,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: [.skipsHiddenFiles]) else { return }
             let cutoff = Date().addingTimeInterval(-24 * 3600)
             for url in items where url.lastPathComponent.hasPrefix("trove-snip-")
-                                && url.path != dir.path {
+                                && url.path != ownPath {
                 let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey])
                     .contentModificationDate) ?? .distantFuture
                 if mtime < cutoff {

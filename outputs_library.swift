@@ -168,7 +168,7 @@ final class OutputsLibrary: ObservableObject {
 
         if FileManager.default.fileExists(atPath: Self.storeURL.path) {
             do {
-                let data = try Data(contentsOf: Self.storeURL)
+                guard let data = boundedRead(Self.storeURL) else { throw CocoaError(.fileReadNoSuchFile) }
                 loaded = try JSONDecoder().decode([OutputEntry].self, from: data)
             } catch {
                 // Red-team #1: corrupt JSON → quarantine, fresh empty array, flash.

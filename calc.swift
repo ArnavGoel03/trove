@@ -226,7 +226,7 @@ final class CalcRateStore: ObservableObject {
     /// caller keeps the old cache. ECB serves a tiny XML feed; we parse it
     /// inline with NSXMLParser to avoid pulling in a dependency.
     nonisolated static func fetchECB() async -> CalcRateCache? {
-        let url = URL(string: "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml")!
+        guard let url = URL(string: "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml") else { return nil }
         var req = URLRequest(url: url, timeoutInterval: 12)
         req.cachePolicy = .reloadIgnoringLocalCacheData
         do {

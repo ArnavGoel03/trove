@@ -554,14 +554,22 @@ final class DiskSpeedViewModel: ObservableObject {
     private var willTerminateObserver: NSObjectProtocol?
 
     init() {
-        // red-team: sweep blobs left behind by a previous SIGKILL/crash before
-        // we list volumes — keeps the cache dir tidy and avoids "Disk full"
-        // surprises on the next run when an orphan 8 GiB blob is still sitting
-        // there from yesterday.
-        DiskSpeedVolumes.purgeOrphanedScratchOnLaunch()
-        refreshVolumes()
-        // Default to `/`.
-        selected = volumes.first { $0.url.path == "/" } ?? volumes.first
+        // Both `purgeOrphanedScratchOnLaunch` and `refreshVolumes` iterate
+        // mounted volumes via `FileManager.mountedVolumeURLs` + per-volume
+        // `resourceValues` lookups. Local disks return in microseconds, but
+        // an attached network volume can stall the call indefinitely — and
+        // doing it synchronously in `@StateObject` init is the exact main-
+        // thread pattern that crashed the app on Clean / Finder / Account.
+        // Move both off-main; volumes patch in when ready.
+        Task.detached(priority: .utility) { [weak self] in
+            DiskSpeedVolumes.purgeOrphanedScratchOnLaunch()
+            let vols = DiskSpeedVolumes.list()
+            await MainActor.run {
+                guard let self else { return }
+                self.volumes = vols
+                self.selected = vols.first { $0.url.path == "/" } ?? vols.first
+            }
+        }
         // red-team #1: scratch cleanup on app termination.
         willTerminateObserver = NotificationCenter.default.addObserver(
             forName: .troveWillTerminate, object: nil, queue: .main

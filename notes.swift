@@ -112,7 +112,7 @@ final class NoteStore: ObservableObject {
 
         if FileManager.default.fileExists(atPath: Self.storeURL.path) {
             do {
-                let data = try Data(contentsOf: Self.storeURL)
+                guard let data = boundedRead(Self.storeURL) else { throw CocoaError(.fileReadNoSuchFile) }
                 let decoded = try JSONDecoder().decode(NotePersisted.self, from: data)
                 // Replace defaults with any colors we recognize from disk.
                 for t in decoded.tabs {
