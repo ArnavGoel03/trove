@@ -2002,6 +2002,11 @@ struct PDFOpsDetailView: View {
     @ObservedObject var recents: PDFOpsRecents
     let back: () -> Void
     @State private var dropTargeted = false
+    /// Output the user is currently previewing. Sheet renders the file via
+    /// PDFKit / NSImage so the user can inspect the result BEFORE committing
+    /// to a save. Outputs already live in a temp location; this is the
+    /// preview-before-commit gate the user asked for.
+    @State private var previewingOutput: PDFOpsOutput? = nil
 
     var body: some View {
         ScrollView {
@@ -2017,6 +2022,18 @@ struct PDFOpsDetailView: View {
                 if !model.failures.isEmpty { failuresCard }
             }
             .padding(24)
+        }
+        // Preview-before-save sheet. PDFOpsOutput conforms to Identifiable
+        // (id: UUID) so `sheet(item:)` correctly drives presentation off the
+        // optional binding.
+        .sheet(item: $previewingOutput) { o in
+            PDFOutputPreviewSheet(
+                output: o,
+                onSave:            { saveOutput(o); previewingOutput = nil },
+                onSaveToDownloads: { quickSaveToDownloads(o); previewingOutput = nil },
+                onRevealInFinder:  { NSWorkspace.shared.activateFileViewerSelecting([o.url]) },
+                onClose:           { previewingOutput = nil }
+            )
         }
     }
 
@@ -2522,6 +2539,13 @@ struct PDFOpsDetailView: View {
                 .font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer()
+            Button { previewingOutput = o } label: {
+                Label("Preview", systemImage: "eye")
+            }
+            .modifier(PDFPrimaryShortcut(isPrimary: isPrimary, key: "p"))
+            .help(isPrimary ? "Preview (⌘P) — inspect before saving" : "Preview this output before saving.")
+            .accessibilityLabel("Preview \(o.url.lastPathComponent) before saving")
+
             Button { saveOutput(o) } label: {
                 Label("Save…", systemImage: "square.and.arrow.down")
             }
@@ -2561,6 +2585,8 @@ struct PDFOpsDetailView: View {
             NSItemProvider(contentsOf: o.url) ?? NSItemProvider()
         }
         .contextMenu {
+            Button { previewingOutput = o } label: { Label("Preview", systemImage: "eye") }
+            Divider()
             Button { saveOutput(o) } label: { Label("Save…", systemImage: "square.and.arrow.down") }
             Button { quickSaveToDownloads(o) } label: { Label("Save to Downloads", systemImage: "arrow.down.circle") }
             Button { NSWorkspace.shared.activateFileViewerSelecting([o.url]) } label: { Label("Reveal in Finder", systemImage: "magnifyingglass") }
@@ -2909,5 +2935,204 @@ struct ReorderDropDelegate: DropDelegate {
             }
         }
         return true
+    }
+}
+
+// ===========================================================================
+// MARK: - PDF output preview sheet
+// ===========================================================================
+
+/// Preview-before-save modal. Renders a PDF via `PDFView` (PDFKit) or an
+/// image via `Image(nsImage:)` so the user can inspect the operation's
+/// output BEFORE committing to a destination. Outputs already live in a
+/// temp location at this point — the sheet's "Save…" / "Save to Downloads"
+/// buttons forward to the existing handlers in `PDFOpsDetailView`.
+///
+/// Non-PDF non-image outputs (extremely unusual — Trove's PDF Tools always
+/// produce one of these) fall through to a minimal "Open externally" hint.
+struct PDFOutputPreviewSheet: View {
+    let output: PDFOpsOutput
+    let onSave: () -> Void
+    let onSaveToDownloads: () -> Void
+    let onRevealInFinder: () -> Void
+    let onClose: () -> Void
+
+    private var kind: PreviewKind {
+        let ext = output.url.pathExtension.lowercased()
+        if ext == "pdf" { return .pdf }
+        if ["png", "jpg", "jpeg", "tiff", "heic", "gif", "webp"].contains(ext) { return .image }
+        return .other
+    }
+
+    enum PreviewKind { case pdf, image, other }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // ---- Header ----
+            HStack(spacing: 12) {
+                Image(systemName: "eye.fill").foregroundStyle(.tint)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(output.url.lastPathComponent)
+                        .font(.body.weight(.medium)).lineLimit(1)
+                    HStack(spacing: 6) {
+                        Text("Preview · before save")
+                        Text("·")
+                        Text(output.bytes.human)
+                        if !output.note.isEmpty { Text("·"); Text(output.note).lineLimit(1) }
+                    }
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer()
+                Button { onClose() } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                        .font(.system(size: 18))
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.escape, modifiers: [])
+                .accessibilityLabel("Close preview")
+            }
+            .padding(.horizontal, 16).padding(.vertical, 12)
+
+            Divider()
+
+            // ---- Body ----
+            Group {
+                switch kind {
+                case .pdf:   PDFOutputPreviewPDFView(url: output.url)
+                case .image: PDFOutputPreviewImageView(url: output.url)
+                case .other: PDFOutputPreviewFallbackView(url: output.url)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.troveBg)
+
+            Divider()
+
+            // ---- Action bar ----
+            HStack(spacing: 10) {
+                Button(role: .cancel) { onClose() } label: {
+                    Text("Discard").frame(minWidth: 70)
+                }
+                .help("Close the preview without saving. The temp file stays in ~/Downloads/Trove until the next run.")
+
+                Spacer()
+
+                Button { onRevealInFinder() } label: {
+                    Label("Reveal in Finder", systemImage: "magnifyingglass")
+                }
+                .help("Open the temp file's folder in Finder.")
+
+                Button { onSaveToDownloads() } label: {
+                    Label("Save to Downloads", systemImage: "arrow.down.circle")
+                }
+                .keyboardShortcut("d", modifiers: .command)
+                .help("Save into ~/Downloads with a collision-safe name (⌘D).")
+
+                Button { onSave() } label: {
+                    Label("Save…", systemImage: "square.and.arrow.down")
+                }
+                .keyboardShortcut("s", modifiers: .command)
+                .buttonStyle(.borderedProminent)
+                .help("Pick where to save (⌘S).")
+            }
+            .padding(.horizontal, 16).padding(.vertical, 10)
+        }
+        .frame(minWidth: 720, idealWidth: 880, minHeight: 520, idealHeight: 720)
+        .background(TroveAppBackground())
+    }
+}
+
+/// PDFKit-backed preview. `PDFView` is an NSView, so wrap it via
+/// `NSViewRepresentable`. Document loaded asynchronously on a background
+/// thread to avoid blocking sheet presentation on a large file.
+private struct PDFOutputPreviewPDFView: NSViewRepresentable {
+    let url: URL
+
+    func makeNSView(context: Context) -> PDFView {
+        let v = PDFView()
+        v.autoScales = true
+        v.displayMode = .singlePageContinuous
+        v.displayDirection = .vertical
+        v.backgroundColor = NSColor.clear
+        // Load off-main; PDFDocument(url:) maps the file synchronously and
+        // can take >1s for big files. Hop back on completion.
+        let captured = url
+        DispatchQueue.global(qos: .userInitiated).async {
+            let doc = PDFDocument(url: captured)
+            DispatchQueue.main.async { v.document = doc }
+        }
+        return v
+    }
+
+    func updateNSView(_ v: PDFView, context: Context) {
+        // Document is loaded once via the async path in makeNSView; nothing
+        // dynamic to update here.
+    }
+}
+
+/// Image preview for PDF→JPG / PDF→PNG outputs (and any other image
+/// extension we might add). Uses `CGImageSourceCreateThumbnailAtIndex` to
+/// cap the decode at 2048 pixels — full-resolution decode of a multi-MP
+/// image would briefly allocate hundreds of MB just to draw the preview.
+private struct PDFOutputPreviewImageView: View {
+    let url: URL
+    @State private var image: NSImage? = nil
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.medium)
+                    .scaledToFit()
+                    .padding(16)
+            } else {
+                ProgressView().controlSize(.small)
+            }
+        }
+        .onAppear {
+            let u = url
+            DispatchQueue.global(qos: .userInitiated).async {
+                let img = Self.thumbnail(at: u, maxPixel: 2048)
+                DispatchQueue.main.async { self.image = img }
+            }
+        }
+    }
+
+    private static func thumbnail(at url: URL, maxPixel: CGFloat) -> NSImage? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else {
+            return nil
+        }
+        return NSImage(cgImage: cg, size: .zero)
+    }
+}
+
+/// Final fallback for non-PDF non-image outputs. Should be rare since the
+/// PDF Tools pane only produces PDFs, JPGs, and PNGs.
+private struct PDFOutputPreviewFallbackView: View {
+    let url: URL
+    var body: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "doc")
+                .font(.system(size: 56))
+                .foregroundStyle(.secondary)
+            Text(url.lastPathComponent).font(.callout.weight(.medium))
+            Text("This file type can't be previewed inline.")
+                .font(.caption).foregroundStyle(.secondary)
+            Button {
+                NSWorkspace.shared.open(url)
+            } label: { Label("Open externally", systemImage: "arrow.up.right.square") }
+            .buttonStyle(.bordered)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(40)
     }
 }

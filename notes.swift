@@ -717,10 +717,8 @@ private struct NoteSearchOverlay: View {
                 debounceTask = Task {
                     try? await Task.sleep(nanoseconds: 80_000_000) // 80ms
                     guard !Task.isCancelled else { return }
-                    let result = await Task.detached(priority: .userInitiated) {
-                        store.search(newValue)
-                    }.value
-                    await MainActor.run { hits = result }
+                    let result = store.search(newValue)
+                    hits = result
                 }
             }
 

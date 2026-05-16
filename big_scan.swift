@@ -961,6 +961,8 @@ public struct BigScanView: View {
 
     // ---- By-type expansion ----
     @State private var expandedCategory: BigScanCategory?
+    // Memoized sorted category list, recomputed only when result changes.
+    @State private var sortedCategories: [(BigScanCategory, Int64)] = []
 
     // ---- Snapshots (Time Machine) ----
     @State private var snapshots: [BigScanSnapshot] = []
@@ -987,6 +989,12 @@ public struct BigScanView: View {
         // EXPLICITLY no .onAppear { scan() } — spec forbids auto-scan.
         // Reseed from cache on root change, but never start a scan.
         .onChange(of: path) { _ in reseedFromCache(); crumbs = [] }
+        .onChange(of: result?.computedAt) { _ in
+            let totals = result?.categoryTotals ?? [:]
+            sortedCategories = BigScanCategory.allCases
+                .map { ($0, totals[$0] ?? 0) }
+                .sorted { $0.1 > $1.1 }
+        }
         // red-team: cancel an in-flight scan if the Mac is about to sleep so
         // an 8h suspend doesn't leave a stale walker running across wake.
         .onReceive(NotificationCenter.default.publisher(for: .troveSystemWillSleep)) { _ in
@@ -1336,10 +1344,7 @@ public struct BigScanView: View {
     // ---- By-type lens -------------------------------------------------------
 
     private var byTypeLens: some View {
-        let totals = result?.categoryTotals ?? [:]
-        let cats = BigScanCategory.allCases
-            .map { ($0, totals[$0] ?? 0) }
-            .sorted { $0.1 > $1.1 }
+        let cats = sortedCategories
         let maxSize = cats.first?.1 ?? 1
         return VStack(alignment: .leading, spacing: 4) {
             ForEach(cats, id: \.0) { pair in

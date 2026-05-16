@@ -907,12 +907,16 @@ final class RecEngine: NSObject, ObservableObject {
                     self.elapsed = self.accumulated
                 }
                 // File-size estimate from the writer's current output. We
-                // stat the file rather than guessing from bitrate * time so
-                // pauses + variable-bitrate encoding stay honest.
-                if let url = self.tempURL,
-                   let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-                   let size = attrs[.size] as? Int64 {
-                    self.estimatedBytes = size
+                // stat the file on a background task rather than blocking the
+                // main thread with attributesOfItem at 4 Hz.
+                if let url = self.tempURL {
+                    let filePath = url.path
+                    Task.detached(priority: .utility) { [weak self] in
+                        if let attrs = try? FileManager.default.attributesOfItem(atPath: filePath),
+                           let size = attrs[.size] as? Int64 {
+                            await MainActor.run { self?.estimatedBytes = size }
+                        }
+                    }
                 }
                 // Decay audio meters so peaks don't stick forever.
                 self.systemAudioLevel *= 0.85

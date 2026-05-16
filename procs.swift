@@ -391,17 +391,21 @@ func procDisplayName(_ row: ProcRow) -> String {
 @MainActor
 final class ProcIconCache {
     static let shared = ProcIconCache()
-    private var cache: [String: NSImage] = [:]
+    private let cache: NSCache<NSString, NSImage> = {
+        let c = NSCache<NSString, NSImage>()
+        c.countLimit = 200
+        return c
+    }()
     func icon(forBundle bundle: String?) -> NSImage {
-        let key = bundle ?? "_generic_"
-        if let hit = cache[key] { return hit }
+        let key = (bundle ?? "_generic_") as NSString
+        if let hit = cache.object(forKey: key) { return hit }
         let img: NSImage
         if let b = bundle, FileManager.default.fileExists(atPath: b) {
             img = NSWorkspace.shared.icon(forFile: b)
         } else {
             img = NSWorkspace.shared.icon(for: .executable)
         }
-        cache[key] = img
+        cache.setObject(img, forKey: key)
         return img
     }
 }

@@ -23,6 +23,7 @@
 
 import SwiftUI
 import AppKit
+import Combine
 import Foundation
 import UniformTypeIdentifiers
 
@@ -129,6 +130,9 @@ final class OutputsLibrary: ObservableObject {
 
     @Published private(set) var entries: [OutputEntry] = []
     @Published var search: String = ""
+    @Published private(set) var groupedVisible: [(producer: String, items: [OutputEntry])] = []
+
+    private var cancellables: Set<AnyCancellable> = []
 
     // red-team: keep manifest small. 500 entries × ~250 bytes JSON ≈ 125 KB —
     // small enough to load synchronously on launch, big enough to outlast a
@@ -266,6 +270,37 @@ final class OutputsLibrary: ObservableObject {
                 self?.flushSynchronously()
             }
         }
+
+        // Memoize grouped-visible so OutputsLibraryView.body doesn't call
+        // Self.group(visible) on every render pass.
+        Publishers.CombineLatest($entries, $search)
+            .map { entries, query -> [(producer: String, items: [OutputEntry])] in
+                let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                let vis: [OutputEntry] = q.isEmpty ? entries : entries.filter { e in
+                    let name = (e.urlPath as NSString).lastPathComponent.lowercased()
+                    return name.contains(q)
+                        || e.producer.lowercased().contains(q)
+                        || e.sourceLabel.lowercased().contains(q)
+                }
+                return Self.groupByProducer(vis)
+            }
+            .receive(on: RunLoop.main)
+            .assign(to: \.groupedVisible, on: self)
+            .store(in: &cancellables)
+    }
+
+    /// Mirror of `OutputsLibraryView.group(_:)` so the store can drive
+    /// `groupedVisible` via Combine without reaching into the view. R2
+    /// hoisted the grouping into the store; this is the helper it needed.
+    nonisolated private static func groupByProducer(_ entries: [OutputEntry])
+        -> [(producer: String, items: [OutputEntry])] {
+        var order: [String] = []
+        var bucket: [String: [OutputEntry]] = [:]
+        for e in entries {
+            if bucket[e.producer] == nil { order.append(e.producer) }
+            bucket[e.producer, default: []].append(e)
+        }
+        return order.map { p in (producer: p, items: bucket[p] ?? []) }
     }
 
     deinit {
@@ -539,7 +574,7 @@ public struct OutputsLibraryView: View {
 
     public var body: some View {
         let visible = store.visible
-        let groups: [(producer: String, items: [OutputEntry])] = Self.group(visible)
+        let groups = store.groupedVisible
 
         Group {
             if store.entries.isEmpty {
@@ -660,7 +695,7 @@ public struct OutputsLibraryView: View {
     // ---------------------------------------------------------------------
     // MARK: Grouping (stable producer order, newest within each section)
     // ---------------------------------------------------------------------
-    private static func group(_ entries: [OutputEntry]) -> [(producer: String, items: [OutputEntry])] {
+    static func group(_ entries: [OutputEntry]) -> [(producer: String, items: [OutputEntry])] {
         // Preserve first-seen producer order (entries are newest-first, so
         // sections appear in the order the user most-recently used them).
         var order: [String] = []

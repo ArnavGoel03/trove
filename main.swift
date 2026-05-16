@@ -345,6 +345,13 @@ final class PasteboardWatcher {
         }
     }
 
+    deinit {
+        if let obs = writeObserver {
+            NotificationCenter.default.removeObserver(obs)
+        }
+        stopTimer()
+    }
+
     /// Register a handler.  The `key` is any object (use `self`).
     /// While at least one handler is registered the 0.5s timer runs.
     /// Must be called on the main thread.
@@ -744,7 +751,7 @@ final class PaneVisibilityStore: ObservableObject {
         let url = Self.fileURL
         guard FileManager.default.fileExists(atPath: url.path) else { return }
         do {
-            let data = try Data(contentsOf: url)
+            guard let data = boundedRead(url) else { return }
             let arr = try JSONDecoder().decode([String].self, from: data)
             // Fix 1: filter stale rawValues so removed panes don't persist.
             let valid = Set(Pane.allCases.map(\.rawValue))

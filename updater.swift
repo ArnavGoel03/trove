@@ -182,21 +182,22 @@ final class UpdateChecker: ObservableObject {
 
         // Resolve endpoint. If a user-supplied URL is malformed or fails the
         // allowlist check, fall back to the default rather than crashing.
-        // Fix 27: validate that TROVE_UPDATE_URL begins with the expected GitHub API
-        // prefix to prevent pointing at arbitrary servers.
-        let allowedPrefix = "https://api.github.com/repos/"
+        // Fix: parse the URL and check scheme, host (exact), and path prefix to
+        // prevent SSRF via userinfo bypass (e.g. https://api.github.com/repos/@evil.com).
         let overrideRaw = ProcessInfo.processInfo.environment["TROVE_UPDATE_URL"].flatMap {
             $0.isEmpty ? nil : $0
         }
         let endpoint: String
-        if let raw = overrideRaw {
-            if raw.hasPrefix(allowedPrefix) {
-                endpoint = raw
-            } else {
-                // Override present but doesn't pass the allowlist — fall back silently.
-                endpoint = Self.defaultEndpoint
-            }
+        if let raw = overrideRaw,
+           let overrideURL = URL(string: raw),
+           overrideURL.scheme == "https",
+           overrideURL.host == "api.github.com",
+           overrideURL.path.hasPrefix("/repos/") {
+            endpoint = raw
         } else {
+            if overrideRaw != nil {
+                // Override present but doesn't pass the strict allowlist — fall back silently.
+            }
             endpoint = Self.defaultEndpoint
         }
         guard let baseURL = URL(string: endpoint) else {

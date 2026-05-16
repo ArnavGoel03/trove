@@ -191,7 +191,13 @@ final class CalcRateStore: ObservableObject {
     /// conversions.
     var ratesAreStale: Bool { cache.fetched.timeIntervalSince1970 == 0 || cache.isStale }
 
-    private var lifecycleObservers: [NSObjectProtocol] = []
+    private var defaultCenterTokens: [NSObjectProtocol] = []
+    private var workspaceCenterTokens: [NSObjectProtocol] = []
+
+    deinit {
+        defaultCenterTokens.forEach { NotificationCenter.default.removeObserver($0) }
+        workspaceCenterTokens.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
+    }
 
     private init() {
         // Load from disk on init. If anything goes wrong, fall back gracefully.
@@ -223,7 +229,8 @@ final class CalcRateStore: ObservableObject {
         ) { [weak self] _ in
             self?.refreshIfStale()
         }
-        lifecycleObservers = [becomeActive, wake]
+        defaultCenterTokens.append(becomeActive)
+        workspaceCenterTokens.append(wake)
     }
 
     func refreshOnce() {

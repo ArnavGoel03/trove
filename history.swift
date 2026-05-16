@@ -80,6 +80,7 @@ final class ClipHistory: ObservableObject {
         didSet  { recomputeVisible() }
     }
     @Published private(set) var visible: [ClipEntry] = []
+    @Published private(set) var pinnedCount: Int = 0
 
     private func recomputeVisible() {
         let q = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -90,6 +91,7 @@ final class ClipHistory: ObservableObject {
                 entry.searchHaystack.contains(q)
             }
         }
+        pinnedCount = entries.filter { $0.pinned }.count
     }
 
     /// Per-instance scratch dir for image PNGs we capture from the pasteboard.
@@ -352,7 +354,7 @@ struct HistoryView: View {
 
     private var subtitle: String {
         let count = store.entries.count
-        let pinned = store.entries.filter { $0.pinned }.count
+        let pinned = store.pinnedCount
         let watch = store.watching ? "Watching" : "Paused"
         let countStr = "\(count) item\(count == 1 ? "" : "s")"
         let pinnedStr = pinned > 0 ? " · \(pinned) pinned" : ""
