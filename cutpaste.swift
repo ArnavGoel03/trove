@@ -101,6 +101,11 @@ final class CutPasteController: ObservableObject {
         // Permission probe first (red-team #1). Do NOT auto-prompt — the user
         // taps "Grant" explicitly.
         guard AXIsProcessTrusted() else {
+            // Fix 21: set enabled = false synchronously (not just in the async block)
+            // so the toggle UI reflects the disabled state immediately even when
+            // this is called from a direct assignment to `enabled` (e.g. the
+            // "Enable cut-paste" button that sets ctl.enabled = true directly).
+            enabled = false
             DispatchQueue.main.async {
                 self.permissionMissing = true
                 self.enabled = false
@@ -569,7 +574,7 @@ public struct CutPasteView: View {
                         .font(.system(size: 36, weight: .light))
                         .foregroundStyle(.tertiary)
                     Text("Nothing on the stage")
-                        .font(.headline)
+                        .headerText()
                     Text("With this enabled, ⌘X on files in Finder stages them here. They stay in place on disk until you press ⌘V at the destination — then Trove moves them in one atomic step.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
@@ -577,7 +582,8 @@ public struct CutPasteView: View {
                         .multilineTextAlignment(.center)
                     if !ctl.enabled {
                         Button {
-                            ctl.enabled = true
+                            // Fix 21: use setEnabled so startTap() checks AX trust.
+                            ctl.setEnabled(true)
                         } label: {
                             Label("Enable cut-paste", systemImage: "power")
                         }
@@ -600,7 +606,7 @@ public struct CutPasteView: View {
                             .foregroundStyle(.tint)
                         VStack(alignment: .leading, spacing: 2) {
                             Text("\(ctl.cut.count) file\(ctl.cut.count == 1 ? "" : "s") cut, ready to paste")
-                                .font(.headline)
+                                .headerText()
                             Text("\(ctl.cut.count) files · \(ctl.totalCutBytes.human)")
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
@@ -650,7 +656,7 @@ public struct CutPasteView: View {
                     .foregroundStyle(.orange)
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Accessibility permission required")
-                        .font(.headline)
+                        .headerText()
                     Text("Trove needs Accessibility access to intercept ⌘X / ⌘V system-wide. Without it, ⌘X / ⌘V will only work inside this window.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
@@ -675,7 +681,7 @@ public struct CutPasteView: View {
                     .foregroundStyle(.orange)
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Finder automation permission denied")
-                        .font(.headline)
+                        .headerText()
                     Text("Trove needs permission to talk to Finder to read the current selection and destination. Grant it in System Settings → Privacy & Security → Automation → Trove → Finder.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
@@ -696,7 +702,7 @@ public struct CutPasteView: View {
     @ViewBuilder private var settingsCard: some View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
-                Text("Settings").font(.headline)
+                Text("Settings").headerText()
                 Toggle(isOn: Binding(
                     get: { ctl.enabled },
                     set: { ctl.setEnabled($0) })
@@ -731,7 +737,7 @@ public struct CutPasteView: View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text("Recent moves").font(.headline)
+                    Text("Recent moves").headerText()
                     Spacer()
                     if !ctl.history.isEmpty {
                         Text("\(ctl.history.count) of last 10")

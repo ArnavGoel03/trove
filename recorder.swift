@@ -220,6 +220,12 @@ final class RecSourceCatalog: ObservableObject {
     /// Pull the latest shareable content. Returns silently — the published
     /// `lastError` is the UI signal.
     func refresh() async {
+        // Fix 9: SCShareableContent.excludingDesktopWindows requires macOS 12.3+
+        // but can crash on load on macOS 12. Gate on macOS 13 to be safe.
+        guard #available(macOS 13, *) else {
+            self.lastError = .unsupportedOS
+            return
+        }
         isLoading = true
         defer { isLoading = false }
         do {
@@ -1761,6 +1767,8 @@ struct RecHUD: View {
 struct RecLevelMeter: View {
     let label: String
     let level: Float   // 0...1
+    // Fix 10: gate animation on reduceMotion accessibility preference.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         HStack(spacing: 10) {
@@ -1777,7 +1785,7 @@ struct RecLevelMeter: View {
                                              startPoint: .leading,
                                              endPoint: .trailing))
                         .frame(width: max(2, CGFloat(level) * geo.size.width))
-                        .animation(.easeOut(duration: 0.15), value: level)
+                        .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: level)
                 }
             }
             .frame(height: 8)

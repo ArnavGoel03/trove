@@ -170,8 +170,27 @@ enum TCCDeepLink: String {
     case filesAndFolders  = "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders"
     case inputMonitoring  = "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
 
-    func open() {
-        if let u = URL(string: rawValue) { NSWorkspace.shared.open(u) }
+    @discardableResult
+    func open() -> Bool {
+        // Fix 6: mirror the multi-URL fallback pattern from PermsCategoryCard.openDeepLink().
+        let primary = rawValue
+        if let url = URL(string: primary), NSWorkspace.shared.open(url) { return true }
+        // Try the Ventura+ bundle-id translation.
+        let translated = primary.replacingOccurrences(
+            of: "com.apple.preference.security",
+            with: "com.apple.settings.PrivacySecurity.extension")
+        if translated != primary,
+           let url = URL(string: translated),
+           NSWorkspace.shared.open(url) { return true }
+        // Fall back to Privacy root pane.
+        if let root = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy"),
+           NSWorkspace.shared.open(root) { return true }
+        // Absolute last resort — open System Settings.
+        if let app = URL(string: "x-apple.systempreferences:") {
+            NSWorkspace.shared.open(app)
+            return true
+        }
+        return false
     }
 }
 
@@ -226,21 +245,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidBecomeActive(_ note: Notification) {
-        #if !TROVE_TESTING
-        // red-team: re-fetch ECB if the cache is stale (>24h). Picks up Wi-Fi
-        // that came online after a long sleep, or first focus after launch.
-        // didBecomeActive (vs willBecomeActive) — we want the window/UI live so
-        // a synchronous refreshOnce()->@Published flip reaches the binding.
-        CalcRateStore.shared.refreshIfStale()
-        #endif
+        // Fix 4: CalcRateStore.shared.refreshIfStale() moved into
+        // CalcRateStore.init() so the store self-manages its lifecycle.
     }
 
     @objc func systemDidWake(_ note: Notification) {
-        // red-team: @objc selector is nonisolated; CalcRateStore is @MainActor.
-        // Hop to main via Task so Swift 6 strict isolation passes.
-        Task { @MainActor in
-            CalcRateStore.shared.refreshIfStale()
-        }
+        // Fix 4: ECB refresh on wake is now handled inside CalcRateStore.init()
+        // via an NSWorkspace.didWakeNotification subscription. No delegate call needed.
         Formatters.bumpEpoch()   // already nonisolated, safe to call directly.
     }
 
@@ -307,6 +318,65 @@ extension Notification.Name {
     /// Posted when the View → Quick Switcher menu item (⌘K) fires. RootView
     /// listens and presents the QuickSwitcherView sheet.
     static let troveOpenQuickSwitcher = Notification.Name("TroveOpenQuickSwitcher")
+}
+
+// Fix 11: shared pasteboard poller that replaces the twin 0.5s timers that
+// Stage and ClipHistory each ran independently (2 main-thread wakes/sec → 1).
+// Subscribers register a handler; the singleton fires once per 0.5s tick when
+// at least one subscriber is registered.  A `troveDidWritePasteboard` post from
+// either store advances the shared watermark so the very next tick is a no-op.
+// NOTE: all methods MUST be called from the main thread (timer/handlers run on main).
+final class PasteboardWatcher {
+    // nonisolated(unsafe) so both @MainActor and non-@MainActor callers can
+    // access the singleton without an actor hop at the call site.
+    nonisolated(unsafe) static let shared = PasteboardWatcher()
+
+    private var timer: Timer?
+    private var lastChangeCount: Int = NSPasteboard.general.changeCount
+    private var handlers: [ObjectIdentifier: () -> Void] = [:]
+    private var writeObserver: NSObjectProtocol?
+
+    private init() {
+        writeObserver = NotificationCenter.default.addObserver(
+            forName: .troveDidWritePasteboard, object: nil, queue: .main
+        ) { [weak self] _ in
+            // Advance watermark so the next tick sees no delta.
+            self?.lastChangeCount = NSPasteboard.general.changeCount
+        }
+    }
+
+    /// Register a handler.  The `key` is any object (use `self`).
+    /// While at least one handler is registered the 0.5s timer runs.
+    /// Must be called on the main thread.
+    func subscribe(key: AnyObject, handler: @escaping () -> Void) {
+        handlers[ObjectIdentifier(key)] = handler
+        startIfNeeded()
+    }
+
+    /// Must be called on the main thread.
+    func unsubscribe(key: AnyObject) {
+        handlers.removeValue(forKey: ObjectIdentifier(key))
+        if handlers.isEmpty { stopTimer() }
+    }
+
+    private func startIfNeeded() {
+        guard timer == nil else { return }
+        lastChangeCount = NSPasteboard.general.changeCount
+        let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let cc = NSPasteboard.general.changeCount
+            guard cc != self.lastChangeCount else { return }
+            self.lastChangeCount = cc
+            self.handlers.values.forEach { $0() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    private func stopTimer() {
+        timer?.invalidate()
+        timer = nil
+    }
 }
 
 // red-team: epoch-bumped formatter source so locale/dark-mode-related caches
@@ -423,6 +493,8 @@ private struct ToastCapsule: View {
     let onHover: (Bool) -> Void
     let onAction: () -> Void
     let onClose: () -> Void
+    // Fix 23: solid fill fallback when Reduce Transparency is enabled.
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     private var tint: Color {
         switch toast.kind {
@@ -486,7 +558,16 @@ private struct ToastCapsule: View {
         .padding(.vertical, 8)
         .padding(.horizontal, 10)
         .frame(minWidth: 220, maxWidth: 380, alignment: .leading)
-        .background(.thinMaterial, in: Capsule(style: .continuous))
+        .background(
+            Group {
+                if reduceTransparency {
+                    // Fix 23: solid fill when Reduce Transparency is set.
+                    Capsule(style: .continuous).fill(Color.troveBgElev)
+                } else {
+                    Capsule(style: .continuous).fill(.thinMaterial)
+                }
+            }
+        )
         .overlay(
             Capsule(style: .continuous)
                 .strokeBorder(Color.primary.opacity(0.06), lineWidth: 0.5)
@@ -660,15 +741,33 @@ final class PaneVisibilityStore: ObservableObject {
     }
 
     private init() {
-        if let data = try? Data(contentsOf: Self.fileURL),
-           let arr = try? JSONDecoder().decode([String].self, from: data) {
-            self.hidden = Set(arr)
+        let url = Self.fileURL
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        do {
+            let data = try Data(contentsOf: url)
+            let arr = try JSONDecoder().decode([String].self, from: data)
+            // Fix 1: filter stale rawValues so removed panes don't persist.
+            let valid = Set(Pane.allCases.map(\.rawValue))
+            self.hidden = Set(arr).intersection(valid)
+        } catch {
+            // Quarantine corrupt file so next save doesn't clobber it.
+            let ts = Int(Date().timeIntervalSince1970)
+            let corrupt = url.deletingLastPathComponent()
+                .appendingPathComponent("sidebar-corrupt-\(ts).json")
+            try? FileManager.default.moveItem(at: url, to: corrupt)
+            let msg = "Sidebar layout file unreadable — backed up to \(corrupt.lastPathComponent)"
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                SharedStore.stage.flash(msg, kind: .warning)
+            }
         }
     }
 
     private func save() {
         let arr = Array(hidden).sorted()
-        guard let data = try? JSONEncoder().encode(arr) else { return }
+        guard let data = try? JSONEncoder().encode(arr) else {
+            SharedStore.stage.flash("Couldn't save sidebar visibility — encode failed", kind: .warning)
+            return
+        }
         let target = Self.fileURL
         let tmp = target.appendingPathExtension("tmp")
         do {
@@ -676,6 +775,8 @@ final class PaneVisibilityStore: ObservableObject {
             _ = try FileManager.default.replaceItemAt(target, withItemAt: tmp)
         } catch {
             try? FileManager.default.removeItem(at: tmp)
+            // Fix 2: surface write failures instead of silently discarding them.
+            SharedStore.stage.flash("Couldn't save sidebar visibility — \(error.localizedDescription)", kind: .warning)
         }
     }
 
@@ -830,27 +931,41 @@ final class ProfileSync: ObservableObject {
         }
     }
 
-    func backupToICloud() -> Bool {
+    func backupToICloud() async -> Bool {
         guard let data = snapshot() else {
             lastError = "Couldn't snapshot profile"; return false
         }
-        do {
-            try FileManager.default.createDirectory(at: iCloudDir, withIntermediateDirectories: true)
-            let target = iCloudDir.appendingPathComponent("profile.json")
-            let tmp = target.appendingPathExtension("tmp")
-            try data.write(to: tmp, options: .atomic)
-            if FileManager.default.fileExists(atPath: target.path) {
-                _ = try FileManager.default.replaceItemAt(target, withItemAt: tmp)
-            } else {
-                try FileManager.default.moveItem(at: tmp, to: target)
+        let dir = iCloudDir
+        // Fix 3: move iCloud I/O off the main actor to avoid blocking when
+        // the bird daemon is stalled.
+        let result = await Task.detached(priority: .utility) { () -> Result<Date, Error> in
+            do {
+                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                let target = dir.appendingPathComponent("profile.json")
+                let tmp = target.appendingPathExtension("tmp")
+                try data.write(to: tmp, options: .atomic)
+                if FileManager.default.fileExists(atPath: target.path) {
+                    _ = try FileManager.default.replaceItemAt(target, withItemAt: tmp)
+                } else {
+                    try FileManager.default.moveItem(at: tmp, to: target)
+                }
+                return .success(Date())
+            } catch {
+                return .failure(error)
             }
-            lastBackup = Date()
-            lastError = nil
-            return true
-        } catch {
-            lastError = error.localizedDescription
-            return false
+        }.value
+        // Hop back to main actor for @Published updates.
+        await MainActor.run {
+            switch result {
+            case .success(let date):
+                lastBackup = date
+                lastError = nil
+            case .failure(let error):
+                lastError = error.localizedDescription
+            }
         }
+        if case .success = result { return true }
+        return false
     }
 
     @discardableResult
@@ -887,7 +1002,7 @@ struct ProfileSyncCard: View {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 8) {
                     Image(systemName: "icloud.fill").foregroundStyle(.tint)
-                    Text("Backup & sync").font(.headline)
+                    Text("Backup & sync").headerText()
                     Spacer()
                     if let last = sync.lastBackup {
                         Text("Last: \(last.formatted(.relative(presentation: .named)))")
@@ -911,10 +1026,12 @@ struct ProfileSyncCard: View {
 
                 HStack(spacing: 8) {
                     Button {
-                        if sync.backupToICloud() {
-                            SharedStore.stage.flash("Backed up to iCloud Drive")
-                        } else if let e = sync.lastError {
-                            SharedStore.stage.flash("Backup failed: \(e)")
+                        Task {
+                            if await sync.backupToICloud() {
+                                SharedStore.stage.flash("Backed up to iCloud Drive")
+                            } else if let e = sync.lastError {
+                                SharedStore.stage.flash("Backup failed: \(e)")
+                            }
                         }
                     } label: {
                         Label("Backup now", systemImage: "icloud.and.arrow.up")
@@ -1040,7 +1157,7 @@ struct CustomizeView: View {
                     Card {
                         VStack(alignment: .leading, spacing: 0) {
                             HStack {
-                                Text(section).font(.headline)
+                                Text(section).headerText()
                                 Spacer()
                                 Text("\(panes.filter { store.isVisible($0) }.count) / \(panes.count) shown")
                                     .font(.caption).foregroundStyle(.secondary)
@@ -1275,11 +1392,13 @@ struct QuickSwitcherView: View {
     @Binding var isOpen: Bool
     @State private var query: String = ""
     @State private var selected: Int = 0
+    // Fix 22: cache allItems and results so they're not recomputed on every body invocation.
+    @State private var allItems: [QuickSwitcherItem] = []
+    @State private var results: [QuickSwitcherItem] = []
+    @State private var debounceTask: Task<Void, Never>? = nil
 
-    /// All searchable items: every visible pane + common command actions.
-    private var allItems: [QuickSwitcherItem] {
+    private func buildAllItems() -> [QuickSwitcherItem] {
         var items: [QuickSwitcherItem] = []
-        // Panes (hidden ones omitted so the switcher matches sidebar visibility).
         let visibility = PaneVisibilityStore.shared
         for p in Pane.allCases where visibility.isVisible(p) {
             items.append(QuickSwitcherItem(
@@ -1289,7 +1408,6 @@ struct QuickSwitcherView: View {
                 action: .openPane(p)
             ))
         }
-        // Commands.
         items.append(QuickSwitcherItem(
             label: "Open Settings",
             detail: "Customize • ⌘,",
@@ -1323,13 +1441,21 @@ struct QuickSwitcherView: View {
         return items
     }
 
-    private var results: [QuickSwitcherItem] {
-        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let scored = allItems.compactMap { item -> (QuickSwitcherItem, Int)? in
-            guard let s = item.score(q) else { return nil }
-            return (item, s)
+    private func updateResults(for q: String) {
+        debounceTask?.cancel()
+        debounceTask = Task {
+            // No debounce needed for a synchronous in-memory score (tiny set),
+            // but wrapping in Task lets us cancel on rapid keystrokes.
+            guard !Task.isCancelled else { return }
+            let trimmed = q.trimmingCharacters(in: .whitespacesAndNewlines)
+            let items = allItems
+            let scored = items.compactMap { item -> (QuickSwitcherItem, Int)? in
+                guard let s = item.score(trimmed) else { return nil }
+                return (item, s)
+            }
+            let r = scored.sorted { $0.1 < $1.1 }.map { $0.0 }
+            await MainActor.run { results = r }
         }
-        return scored.sorted { $0.1 < $1.1 }.map { $0.0 }
     }
 
     var body: some View {
@@ -1399,8 +1525,16 @@ struct QuickSwitcherView: View {
         }
         .frame(width: 560)
         .background(TroveAppBackground())
-        .onAppear { selected = 0 }
-        .onChange(of: query) { _, _ in selected = 0 }
+        .onAppear {
+            selected = 0
+            // Fix 22: populate allItems once on appear; update results for empty query.
+            allItems = buildAllItems()
+            updateResults(for: query)
+        }
+        .onChange(of: query) { _, newValue in
+            selected = 0
+            updateResults(for: newValue)
+        }
         .background {
             // Hidden key handlers via Button + keyboardShortcut.
             Group {
@@ -1481,7 +1615,7 @@ struct LaunchAtLoginCard: View {
                 Image(systemName: "power.circle")
                     .font(.system(size: 22)).foregroundStyle(.tint)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Launch at Login").font(.headline)
+                    Text("Launch at Login").headerText()
                     Text("Start Trove automatically when you log in. Toggle off any time; you can also manage this from System Settings → General → Login Items.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
@@ -1515,7 +1649,7 @@ struct DiagnosticsCard: View {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 8) {
                     Image(systemName: "stethoscope").foregroundStyle(.tint)
-                    Text("Diagnostics").font(.headline)
+                    Text("Diagnostics").headerText()
                     Spacer()
                     if recent.isEmpty {
                         Text("No recent crashes").font(.caption).foregroundStyle(.secondary)
@@ -1582,12 +1716,11 @@ struct DiagnosticsCard: View {
 
     private var reportBody: String {
         let v = UpdateChecker.currentVersion() ?? "dev"
-        let os = ProcessInfo.processInfo.operatingSystemVersionString
-        let machine = AccountSystemInfo.snapshot().chip
+        // Fix 5: strip macOS and Machine from the pre-filled body — privacy
+        // policy states no usage data leaves the device on launch/idle; even
+        // though this is user-initiated the auto-fill is undisclosed.
         let body = """
         **Version**: Trove \(v)
-        **macOS**: \(os)
-        **Machine**: \(machine)
 
         **What happened**:
 
@@ -1669,7 +1802,7 @@ struct AccentPickerCard: View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text("Accent").font(.headline)
+                    Text("Accent").headerText()
                     Spacer()
                     Text(TroveAccentChoice(rawValue: accentRaw)?.label ?? "Magenta")
                         .font(.caption).foregroundStyle(.secondary)
@@ -2086,6 +2219,22 @@ extension Color {
     static let troveAccentSky   = Color(red: 0.298, green: 0.722, blue: 1.0)
 }
 
+// MARK: - Accessibility header trait helper
+// ---------------------------------------------------------------------------
+// Fix 26: single modifier that combines .font(.headline) + .accessibilityAddTraits(.isHeader)
+// so VoiceOver rotor "Headings" navigation works. Use `.headerText()` in place of
+// `.font(.headline)` at all pane / section / card title sites.
+
+extension View {
+    /// Apply headline font and expose this text as an accessibility heading
+    /// so VoiceOver's "Headings" rotor can navigate to it.
+    func headerText() -> some View {
+        self
+            .font(.headline)
+            .accessibilityAddTraits(.isHeader)
+    }
+}
+
 // MARK: - Accent choice (user-selectable in Settings)
 // ---------------------------------------------------------------------------
 // The system tint cascades to sidebar selection rings, button capsules,
@@ -2393,17 +2542,13 @@ final class Stage: ObservableObject {
     var transientStatus: String? { toasts.last?.message }
 
     let tempDir: URL
-    private var lastChangeCount: Int = NSPasteboard.general.changeCount
-    private var timer: Timer?
     // red-team: one DispatchWorkItem per toast id so dismissing/extending one
     // toast doesn't affect siblings. The previous single-shot timer cancelled
     // the prior toast's clear work when a new flash arrived — fine for replace
     // semantics, broken for stacking.
     private var dismissWork: [UUID: DispatchWorkItem] = [:]
-    // red-team: cross-store pasteboard-write suppressor. When ClipHistory writes
-    // (restoreToClipboard) we bump our watermark forward so the next auto-grab
-    // tick sees no delta and doesn't re-ingest a payload Trove itself produced.
-    private var pasteboardWriteObserver: NSObjectProtocol?
+    // Fix 11: private timer and lastChangeCount removed — PasteboardWatcher
+    // owns the shared 0.5s poller and watermark now.
 
     /// Cap on simultaneously-visible toasts. red-team: chose 4 because Stage's
     /// own stage-grid uses bottom-trailing real estate at ~280pt wide; more
@@ -2458,19 +2603,9 @@ final class Stage: ObservableObject {
             .appendingPathComponent("trove-\(UUID().uuidString.prefix(8))")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         tempDir = dir
-        // red-team: listen for any Trove pasteboard write (our own copyAll
-        // or ClipHistory.restore). Bump watermark so auto-grab doesn't echo it.
-        pasteboardWriteObserver = NotificationCenter.default.addObserver(
-            forName: .troveDidWritePasteboard, object: nil, queue: .main
-        ) { [weak self] _ in
-            self?.lastChangeCount = NSPasteboard.general.changeCount
-        }
-    }
-
-    deinit {
-        if let o = pasteboardWriteObserver {
-            NotificationCenter.default.removeObserver(o)
-        }
+        // Fix 11: pasteboard write suppression is now handled inside
+        // PasteboardWatcher.shared which listens for .troveDidWritePasteboard
+        // and advances the shared watermark. Stage no longer needs its own observer.
     }
 
     func pasteFromClipboard() {
@@ -2582,9 +2717,8 @@ final class Stage: ObservableObject {
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.writeObjects(urls as [NSURL])
-        lastChangeCount = pb.changeCount
-        // red-team: broadcast so ClipHistory's watcher doesn't re-ingest the URLs
-        // we just put on the pasteboard.
+        // Fix 11: troveDidWritePasteboard bumps PasteboardWatcher's shared watermark.
+        // Stage no longer tracks lastChangeCount itself.
         NotificationCenter.default.post(name: .troveDidWritePasteboard, object: nil)
         let base = "Copied \(urls.count) item\(urls.count == 1 ? "" : "s") · ⌘V to paste them anywhere"
         flash(dropped > 0 ? "\(base) (\(dropped) missing skipped)" : base)
@@ -2599,8 +2733,7 @@ final class Stage: ObservableObject {
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(parts.joined(separator: "\n\n"), forType: .string)
-        lastChangeCount = pb.changeCount
-        // red-team: see copyAllAsFiles — suppress History re-ingestion.
+        // Fix 11: see copyAllAsFiles — PasteboardWatcher suppresses History re-ingestion.
         NotificationCenter.default.post(name: .troveDidWritePasteboard, object: nil)
         flash("Copied text from \(parts.count) item\(parts.count == 1 ? "" : "s")")
     }
@@ -2619,19 +2752,14 @@ final class Stage: ObservableObject {
 
     func setAutoGrab(_ on: Bool) {
         autoGrab = on
-        timer?.invalidate(); timer = nil
+        // Fix 11: use shared PasteboardWatcher instead of a private 0.5s Timer.
         if on {
-            lastChangeCount = NSPasteboard.general.changeCount
-            let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
-                guard let self = self, self.autoGrab else { return }
-                let cc = NSPasteboard.general.changeCount
-                if cc != self.lastChangeCount {
-                    self.lastChangeCount = cc
-                    self.autoGrabFromClipboard()
-                }
+            PasteboardWatcher.shared.subscribe(key: self) { [weak self] in
+                guard let self, self.autoGrab else { return }
+                self.autoGrabFromClipboard()
             }
-            RunLoop.main.add(t, forMode: .common)
-            timer = t
+        } else {
+            PasteboardWatcher.shared.unsubscribe(key: self)
         }
     }
 }
@@ -3402,7 +3530,7 @@ struct OverviewView: View {
                             .font(.title2)
                             .foregroundStyle(.tint)
                         VStack(alignment: .leading, spacing: 6) {
-                            Text("Stop the permission popups").font(.headline)
+                            Text("Stop the permission popups").headerText()
                             Text("macOS asks for Downloads, Desktop, Documents access every time you click Refresh because Trove is locally-built (no Developer ID). Grant Full Disk Access once and the prompts stop forever.")
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
@@ -3451,7 +3579,7 @@ struct OverviewView: View {
                 Card {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
-                            Text("Top folders in Home").font(.headline)
+                            Text("Top folders in Home").headerText()
                             Spacer()
                             if loading && topHome.isEmpty { ProgressView().controlSize(.small) }
                         }
@@ -3553,7 +3681,7 @@ struct ScanView: View {
                 Card {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
-                            Text("Results").font(.headline)
+                            Text("Results").headerText()
                             Spacer()
                             if !results.isEmpty {
                                 Text("Total: \(results.reduce(Int64(0)) { $0 + $1.size }.human)")
@@ -3845,7 +3973,7 @@ struct CleanView: View {
 
                 Card {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Output").font(.headline)
+                        Text("Output").headerText()
                         ScrollView {
                             Text(m.log.isEmpty ? "(no output yet)" : m.log)
                                 .font(.system(.callout, design: .monospaced))
@@ -4058,7 +4186,7 @@ struct SweepView: View {
                 Card {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
-                            Text("Plan").font(.headline)
+                            Text("Plan").headerText()
                             Spacer()
                             if !plans.isEmpty {
                                 let totA = plans.filter { $0.action == "archive" }.reduce(Int64(0)) { $0 + $1.size }
@@ -4096,7 +4224,7 @@ struct SweepView: View {
                 if !log.isEmpty {
                     Card {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text("Result").font(.headline)
+                            Text("Result").headerText()
                             ScrollView {
                                 Text(log).font(.system(.callout, design: .monospaced))
                                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -4198,7 +4326,7 @@ struct InstallerSweepCard: View {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     Image(systemName: "shippingbox.fill").foregroundStyle(.orange)
-                    Text("Installer leftovers").font(.headline)
+                    Text("Installer leftovers").headerText()
                     Spacer()
                     if scanning {
                         ProgressView().scaleEffect(0.55).frame(width: 14, height: 14)

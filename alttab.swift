@@ -481,7 +481,16 @@ fileprivate final class AltTabOverlayController: NSObject, NSWindowDelegate {
         if AltTabAX.raise(window: item) {
             AltTabRecency.shared.touch(item.id)
         } else {
-            // Race: window gone, or AX denied. Skip silently per red-team #3.
+            // Fix 18: if AX is not trusted, flash a deep-link warning toast.
+            if !AltTabAX.isTrusted() {
+                Task { @MainActor in
+                    SharedStore.stage.flash(
+                        "AltTab needs Accessibility — grant it in System Settings",
+                        kind: .warning
+                    )
+                    _ = TCCDeepLink.accessibility.open()
+                }
+            }
         }
     }
 
@@ -621,6 +630,8 @@ fileprivate final class AltTabOverlayState: ObservableObject {
 fileprivate struct AltTabOverlayHost: View {
     @ObservedObject var state: AltTabOverlayState
     @AppStorage(AltTabKeys.colorCode) private var colorCode: Bool = true
+    // Fix 24: solid fill fallback when Reduce Transparency is enabled.
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
         let items = state.filtered
@@ -687,7 +698,8 @@ fileprivate struct AltTabOverlayHost: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(.ultraThinMaterial)
+                // Fix 24: solid fill when Reduce Transparency is enabled.
+                .fill(reduceTransparency ? AnyShapeStyle(Color.black.opacity(0.9)) : AnyShapeStyle(.ultraThinMaterial))
                 .overlay(
                     RoundedRectangle(cornerRadius: 18, style: .continuous)
                         .strokeBorder(.white.opacity(0.08), lineWidth: 0.5)
@@ -901,6 +913,12 @@ public struct AltTabView: View {
             }
         }
         .onAppear { axTrusted = AltTabAX.isTrusted() }
+        // Fix 18: re-check axTrusted when the user grants AX in System Settings
+        // and returns to Trove — reflects immediately without a manual Refresh.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            axTrusted = AltTabAX.isTrusted()
+            if axTrusted { engine.apply() }
+        }
     }
 
     // ---------- Cards ----------

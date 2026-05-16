@@ -555,7 +555,9 @@ final class KeepAwakeCoordinator: ObservableObject {
     private func startUptimeTicker() {
         uptimeTimer?.cancel()
         let t = DispatchSource.makeTimerSource(queue: .main)
-        t.schedule(deadline: .now(), repeating: .seconds(1))
+        // Fix 8: 60s interval — second granularity is wasted main-thread wakes
+        // for an uptime display that shows HH:MM. Fire immediately then every 60s.
+        t.schedule(deadline: .now(), repeating: .seconds(60))
         t.setEventHandler { [weak self] in
             guard let self, let start = KeepAwakeAssertion.shared.startedAt else { return }
             self.displayUptime = KeepAwakeFormat.uptime(since: start)
@@ -728,7 +730,7 @@ public struct KeepAwakeView: View {
                         get: { coord.masterOn },
                         set: { coord.toggleMaster($0) }
                     )) {
-                        Text("Keep Mac awake").font(.headline)
+                        Text("Keep Mac awake").headerText()
                     }
                     .toggleStyle(.switch)
                     .accessibilityHint(coord.masterOn
@@ -756,7 +758,7 @@ public struct KeepAwakeView: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Image(systemName: "bolt.fill").foregroundStyle(.green)
-                    Text("Holding assertion").font(.headline)
+                    Text("Holding assertion").headerText()
                     Spacer()
                     Text(coord.displayUptime)
                         .font(.system(.body, design: .monospaced))
@@ -789,7 +791,7 @@ public struct KeepAwakeView: View {
     private var quickCard: some View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
-                Text("Caffeinate now").font(.headline)
+                Text("Caffeinate now").headerText()
                 HStack(spacing: 10) {
                     Button("1 hour")          { coord.quickCaffeinate(1) }
                     Button("4 hours")         { coord.quickCaffeinate(4) }
@@ -818,7 +820,7 @@ public struct KeepAwakeView: View {
         Card {
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
-                    Text("Conditional rules").font(.headline)
+                    Text("Conditional rules").headerText()
                     Spacer()
                     Text("First trigger wins").font(.caption).foregroundStyle(.secondary)
                 }

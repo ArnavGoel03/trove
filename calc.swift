@@ -181,22 +181,49 @@ final class CalcRateStore: ObservableObject {
 
     @Published private(set) var cache: CalcRateCache
     @Published private(set) var fetching: Bool = false
+    // Fix 7: opt-out for automatic ECB network fetches.
+    @Published var autoFetch: Bool {
+        didSet { UserDefaults.standard.set(autoFetch, forKey: "trove.calc.autoFetch") }
+    }
 
     /// True if the rates we're using were never confirmed from the network
     /// or are older than 24h. Drives the "stale" badge next to currency
     /// conversions.
     var ratesAreStale: Bool { cache.fetched.timeIntervalSince1970 == 0 || cache.isStale }
 
+    private var lifecycleObservers: [NSObjectProtocol] = []
+
     private init() {
         // Load from disk on init. If anything goes wrong, fall back gracefully.
         self.cache = CalcRateCache.loadFromDisk() ?? CalcRateCache.fallback
+        // Fix 7: load the opt-out preference (default true = auto-fetch enabled).
+        self.autoFetch = UserDefaults.standard.object(forKey: "trove.calc.autoFetch") as? Bool ?? true
 
         // Fire ONE refresh attempt on first launch if the file is missing or
         // the data is older than 24h. No retries, no polling. URLSession's
-        // single attempt is fire-and-forget.
-        if ratesAreStale {
+        // single attempt is fire-and-forget. Gated on autoFetch opt-out.
+        if autoFetch && ratesAreStale {
             refreshOnce()
         }
+
+        // Fix 4: self-manage lifecycle — subscribe to app-active and wake so
+        // the AppDelegate doesn't need to call refreshIfStale() at all.
+        // This also means the store doesn't refresh until the user opens the
+        // Calculator pane (where CalcView holds a reference), avoiding
+        // premature network calls on every app launch.
+        let becomeActive = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.refreshIfStale()
+        }
+        let wake = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.refreshIfStale()
+        }
+        lifecycleObservers = [becomeActive, wake]
     }
 
     func refreshOnce() {
@@ -219,7 +246,8 @@ final class CalcRateStore: ObservableObject {
     // wake: if the user's Mac slept overnight, the daily ECB rates have rolled
     // over and we should grab fresh ones without making the user click "Refresh".
     func refreshIfStale() {
-        if ratesAreStale { refreshOnce() }
+        // Fix 7: respect autoFetch opt-out.
+        if autoFetch && ratesAreStale { refreshOnce() }
     }
 
     /// Fetch the ECB daily reference rates. Returns nil on any failure —
@@ -1650,8 +1678,18 @@ public struct CalcView: View {
             } label: {
                 Label("Refresh rates", systemImage: "arrow.triangle.2.circlepath")
             }
-            .disabled(rates.fetching)
+            .disabled(rates.fetching || !rates.autoFetch)
             .help("Re-fetch exchange rates from the ECB (one attempt, no retry)")
+
+            // Fix 7: opt-out toggle for automatic ECB network fetches.
+            Toggle(isOn: Binding(
+                get: { rates.autoFetch },
+                set: { rates.autoFetch = $0 }
+            )) {
+                Label("Auto-fetch rates", systemImage: "network")
+            }
+            .toggleStyle(.checkbox)
+            .help("When on, Trove automatically fetches the latest ECB exchange rates. Turn off to disable all automatic network calls from the Calculator.")
 
             // Save As… — primary save affordance. Writes the entire transcript
             // (expression = result per line) as a .txt to a user-chosen path.

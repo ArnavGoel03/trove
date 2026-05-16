@@ -592,52 +592,46 @@ enum GPUSMC {
 }
 
 // ===========================================================================
-// MARK: - Power (pmset -g batt)
+// MARK: - Power (IOPSCopyPowerSourcesInfo)
 // ===========================================================================
 //
-//   `pmset -g batt` is sandbox-safe and doesn't require sudo. Output is
-//   stable enough to regex. We avoid `powermetrics` entirely since it
-//   needs root.
+//   Fix 16: replaced fork+exec of /usr/bin/pmset with IOPSCopyPowerSourcesInfo
+//   (pure IPC, no fork). Pattern mirrors KeepAwakePowerWatcher in keep_awake.swift.
+//   This removes a 5s throttle that was needed to amortise Process() cost.
 //
 // ===========================================================================
+import IOKit.ps
 
 enum GPUPower {
     struct Reading {
         var onAC: Bool
         var batteryPercent: Int?
-        var acWatts: Double?   // nil if not exposed
-        var raw: String
+        var acWatts: Double?   // nil if not exposed / not available via IOPS
+        var raw: String        // kept for UI display; now shows source description
     }
 
     static func read() -> Reading {
-        let p = Process()
-        p.launchPath = "/usr/bin/pmset"
-        p.arguments = ["-g", "batt"]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = Pipe()
-        do { try p.run() } catch { return Reading(onAC: false, batteryPercent: nil, acWatts: nil, raw: "") }
-        p.waitUntilExitOffMain()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        pipe.fileHandleForReading.closeFile()
-        (p.standardError as? Pipe)?.fileHandleForReading.closeFile()
-        let raw = String(data: data, encoding: .utf8) ?? ""
-
-        let onAC = raw.contains("AC Power") || raw.contains("'AC Power'")
+        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let sources = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef]
+        else {
+            return Reading(onAC: true, batteryPercent: nil, acWatts: nil, raw: "IOPSCopyPowerSourcesInfo failed")
+        }
+        var onAC = true
         var pct: Int? = nil
-        if let r = raw.range(of: #"(\d{1,3})%"#, options: .regularExpression) {
-            pct = Int(raw[r].dropLast())
+        var rawParts: [String] = []
+        for s in sources {
+            guard let dict = IOPSGetPowerSourceDescription(info, s)?.takeUnretainedValue() as? [String: Any]
+            else { continue }
+            if let state = dict[kIOPSPowerSourceStateKey] as? String {
+                onAC = (state != kIOPSBatteryPowerValue)
+                rawParts.append(state)
+            }
+            if let cur = dict[kIOPSCurrentCapacityKey] as? Int,
+               let max = dict[kIOPSMaxCapacityKey] as? Int, max > 0 {
+                pct = Int((Double(cur) / Double(max)) * 100.0)
+            }
         }
-        // Some firmwares include "AC attached; not charging; Wattage = 96W"
-        var watts: Double? = nil
-        if let r = raw.range(of: #"Wattage\s*=\s*(\d+)W"#, options: .regularExpression) {
-            let s = raw[r].replacingOccurrences(of: "Wattage", with: "")
-                          .replacingOccurrences(of: "=", with: "")
-                          .replacingOccurrences(of: "W", with: "")
-                          .trimmingCharacters(in: .whitespaces)
-            watts = Double(s)
-        }
-        return Reading(onAC: onAC, batteryPercent: pct, acWatts: watts, raw: raw)
+        return Reading(onAC: onAC, batteryPercent: pct, acWatts: nil, raw: rawParts.joined(separator: ", "))
     }
 }
 
@@ -712,7 +706,7 @@ final class GPUMonitorModel: ObservableObject {
     private var thermalObserver: NSObjectProtocol?
     private var statusItem: NSStatusItem?
     private let powerQueue = DispatchQueue(label: "trove.gpu.power")
-    private var pmsetTick: Int = 0   // pmset is fork-heavy; only spawn every 5s
+    // Fix 16: pmsetTick removed — IOPSCopyPowerSourcesInfo is cheap enough to call every tick.
 
     init() {
         // red-team: read the persisted toggle BEFORE the property is observed,
@@ -866,15 +860,14 @@ final class GPUMonitorModel: ObservableObject {
     }
 
     func tick() {
-        // GPU probe + thermal are cheap; pmset is fork+exec → throttle to 5s.
+        // GPU probe + thermal are cheap. Fix 16: IOPSCopyPowerSourcesInfo is
+        // pure IPC (no fork), so power can be read every tick without throttling.
         let probed = GPUProbe.snapshot()
         let rpms: [Int]? = GPUSMC.fanRPMs()
-        pmsetTick += 1
-        if pmsetTick % 5 == 1 {
-            powerQueue.async { [weak self] in
-                let r = GPUPower.read()
-                DispatchQueue.main.async { self?.power = r }
-            }
+        // Power read is cheap now — call directly on background queue.
+        powerQueue.async { [weak self] in
+            let r = GPUPower.read()
+            DispatchQueue.main.async { self?.power = r }
         }
 
         self.gpus = probed
@@ -1182,6 +1175,10 @@ struct GPUSparkline: View {
         }
         .frame(height: 28)
         .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 4))
+        // Fix 17: accessibility for VoiceOver rotor.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Sparkline")
+        .accessibilityValue(values.last.map { String(format: "%.0f%%", $0) } ?? "no data")
     }
 }
 
@@ -1210,7 +1207,7 @@ struct GPUDeviceCard: View {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(alignment: .firstTextBaseline) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(gpu.name).font(.headline)
+                        Text(gpu.name).headerText()
                         Text("\(gpu.vendor) • \(gpu.totalVRAM > 0 ? Int64(gpu.totalVRAM).human : "Unknown VRAM")")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -1324,7 +1321,7 @@ struct GPUSystemCard: View {
                 HStack {
                     Image(systemName: "thermometer.medium")
                         .foregroundStyle(model.thermal.gpuTint)
-                    Text("Thermal Pressure").font(.headline)
+                    Text("Thermal Pressure").headerText()
                     Spacer()
                     Text(model.thermal.gpuLabel)
                         .font(.system(.subheadline, design: .monospaced).weight(.semibold))
@@ -1403,7 +1400,7 @@ struct GPUTempCard: View {
                 HStack {
                     Image(systemName: "thermometer.medium")
                         .foregroundStyle(.pink)
-                    Text("Temperatures").font(.headline)
+                    Text("Temperatures").headerText()
                     Text("β")
                         .font(.caption2.weight(.semibold))
                         .padding(.horizontal, 5).padding(.vertical, 1)
@@ -1455,6 +1452,10 @@ struct GPUTempRow: View {
                 .frame(maxWidth: .infinity)
         }
         .help(tooltip)
+        // Fix 17: VoiceOver label for GPUTempRow so rotor reads "GPU temperature: 65°C".
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(row.role.rawValue) temperature")
+        .accessibilityValue(currentText)
     }
 
     private var currentText: String {
@@ -1608,6 +1609,8 @@ struct GPUWindowPin: NSViewRepresentable {
 public struct GPUMonitorView: View {
     @StateObject private var model = GPUMonitorModel()
     @State private var toast: String? = nil
+    // Fix 15: gate flash animations on reduceMotion.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init() {}
 
@@ -1691,9 +1694,12 @@ public struct GPUMonitorView: View {
     }
 
     private func flash(_ s: String) {
-        withAnimation(.easeInOut(duration: 0.2)) { toast = s }
+        // Fix 15: gate animation on reduceMotion preference.
+        let anim: Animation? = reduceMotion ? nil : .easeInOut(duration: 0.2)
+        let animOut: Animation? = reduceMotion ? nil : .easeInOut(duration: 0.4)
+        withAnimation(anim) { toast = s }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) {
-            withAnimation(.easeInOut(duration: 0.4)) { toast = nil }
+            withAnimation(animOut) { toast = nil }
         }
     }
 }
@@ -1705,7 +1711,7 @@ struct GPUEmptyState: View {
                 .font(.system(size: 36, weight: .light))
                 .foregroundStyle(.secondary)
             Text("No accelerator visible")
-                .font(.headline)
+                .headerText()
             Text("IOKit returned no `IOAccelerator` services on this host. This is normal on Hackintoshes, headless servers, or in heavily sandboxed environments. Thermal pressure and battery state are still polled.")
                 .font(.callout)
                 .foregroundStyle(.secondary)

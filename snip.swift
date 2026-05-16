@@ -737,11 +737,13 @@ private struct SnipCountdownOverlay: View {
     let remaining: Int
     let reduceMotion: Bool
     let onCancel: () -> Void
+    // Fix 24: solid fill fallback when Reduce Transparency is enabled.
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
         ZStack {
             Rectangle()
-                .fill(.ultraThinMaterial)
+                .fill(reduceTransparency ? AnyShapeStyle(Color.black.opacity(0.85)) : AnyShapeStyle(.ultraThinMaterial))
                 .ignoresSafeArea()
 
             VStack(spacing: 18) {

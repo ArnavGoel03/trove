@@ -180,11 +180,25 @@ final class UpdateChecker: ObservableObject {
         defer { checking = false }
         status = "Checking…"
 
-        // Resolve endpoint. If a user-supplied URL is malformed, we treat
-        // it as "no update available" rather than surfacing a parse error.
-        let endpoint = ProcessInfo.processInfo.environment["TROVE_UPDATE_URL"].flatMap {
+        // Resolve endpoint. If a user-supplied URL is malformed or fails the
+        // allowlist check, fall back to the default rather than crashing.
+        // Fix 27: validate that TROVE_UPDATE_URL begins with the expected GitHub API
+        // prefix to prevent pointing at arbitrary servers.
+        let allowedPrefix = "https://api.github.com/repos/"
+        let overrideRaw = ProcessInfo.processInfo.environment["TROVE_UPDATE_URL"].flatMap {
             $0.isEmpty ? nil : $0
-        } ?? Self.defaultEndpoint
+        }
+        let endpoint: String
+        if let raw = overrideRaw {
+            if raw.hasPrefix(allowedPrefix) {
+                endpoint = raw
+            } else {
+                // Override present but doesn't pass the allowlist — fall back silently.
+                endpoint = Self.defaultEndpoint
+            }
+        } else {
+            endpoint = Self.defaultEndpoint
+        }
         guard let baseURL = URL(string: endpoint) else {
             await markUpToDate()
             return

@@ -68,9 +68,29 @@ struct ClipEntry: Identifiable, Hashable {
 /// In-memory clipboard ring buffer. 60 non-pinned entry cap; pinned are sticky.
 /// Polls `NSPasteboard.general.changeCount` every 0.5s when `watching` is on.
 final class ClipHistory: ObservableObject {
-    @Published var entries: [ClipEntry] = []
+    // Fix 12: `visible` is now @Published, populated on entries/search changes.
+    // Use backing stores for entries and search so we can call recomputeVisible().
+    var entries: [ClipEntry] = [] {
+        willSet { objectWillChange.send() }
+        didSet  { recomputeVisible() }
+    }
     @Published var watching: Bool = false
-    @Published var search: String = ""
+    var search: String = "" {
+        willSet { objectWillChange.send() }
+        didSet  { recomputeVisible() }
+    }
+    @Published private(set) var visible: [ClipEntry] = []
+
+    private func recomputeVisible() {
+        let q = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if q.isEmpty {
+            visible = entries
+        } else {
+            visible = entries.filter { entry in
+                entry.searchHaystack.contains(q)
+            }
+        }
+    }
 
     /// Per-instance scratch dir for image PNGs we capture from the pasteboard.
     let tempDir: URL
@@ -78,34 +98,19 @@ final class ClipHistory: ObservableObject {
     /// Cap on non-pinned entries before LRU eviction kicks in.
     static let nonPinnedCap = 60
 
-    /// Set to `pb.changeCount` after our own writes so the watcher tick that
-    /// follows doesn't re-ingest a payload we just produced.
-    private var lastChangeCount: Int = NSPasteboard.general.changeCount
-    private var timer: Timer?
-    // red-team: cross-store pasteboard-write suppressor. Stage.copyAllAs* and
-    // sibling ClipHistory.restoreToClipboard both post `.troveDidWritePasteboard`.
-    // Without listening here, running Stage auto-grab + History auto-watch
-    // simultaneously caused each store's own copy-out / restore to be re-ingested
-    // by the other on the next 0.5s tick — duplicate entries on both sides.
-    private var pasteboardWriteObserver: NSObjectProtocol?
+    // Fix 11: lastChangeCount, timer, and pasteboardWriteObserver removed —
+    // PasteboardWatcher.shared owns the shared 0.5s poller and watermark.
 
     init() {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("trove-history-\(UUID().uuidString.prefix(8))")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         tempDir = dir
-        pasteboardWriteObserver = NotificationCenter.default.addObserver(
-            forName: .troveDidWritePasteboard, object: nil, queue: .main
-        ) { [weak self] _ in
-            self?.lastChangeCount = NSPasteboard.general.changeCount
-        }
     }
 
     deinit {
-        timer?.invalidate()
-        if let o = pasteboardWriteObserver {
-            NotificationCenter.default.removeObserver(o)
-        }
+        // Fix 11: PasteboardWatcher subscription is cleaned up via setWatching(false).
+        // The handler closure captures [weak self] so on deinit it becomes a no-op.
         // red-team: scrub per-instance tempDir so successive view recreates
         // don't leak a fresh `trove-history-XXXX` folder of PNGs each time.
         try? FileManager.default.removeItem(at: tempDir)
@@ -115,23 +120,15 @@ final class ClipHistory: ObservableObject {
 
     func setWatching(_ on: Bool) {
         watching = on
-        timer?.invalidate(); timer = nil
-        guard on else { return }
-        // Snap the baseline on enable so we don't ingest whatever happens to be
-        // sitting on the pasteboard right now.
-        lastChangeCount = NSPasteboard.general.changeCount
-        let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
-            // Red-team #6: if Watch is toggled off mid-tick, drop this firing.
-            // `[weak self]` covers ClipHistory deinit; the `watching` re-check
-            // covers a flip that happened between schedule and fire.
-            guard let self = self, self.watching else { return }
-            let cc = NSPasteboard.general.changeCount
-            guard cc != self.lastChangeCount else { return }
-            self.lastChangeCount = cc
-            self.ingestFromPasteboard()
+        // Fix 11: use shared PasteboardWatcher instead of a private 0.5s Timer.
+        if on {
+            PasteboardWatcher.shared.subscribe(key: self) { [weak self] in
+                guard let self, self.watching else { return }
+                self.ingestFromPasteboard()
+            }
+        } else {
+            PasteboardWatcher.shared.unsubscribe(key: self)
         }
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
     }
 
     /// Pull a strict snapshot (privacy markers honored, 100MB cap honored) and
@@ -271,8 +268,8 @@ final class ClipHistory: ObservableObject {
         entries.removeAll { !$0.pinned }
     }
 
-    /// Put `entry` back on the system pasteboard. Bumps `lastChangeCount` after
-    /// the write so the next watcher tick doesn't re-ingest our own payload.
+    /// Put `entry` back on the system pasteboard. Posts `.troveDidWritePasteboard`
+    /// so PasteboardWatcher bumps its shared watermark and the next tick is a no-op.
     /// Returns `false` when the backing file is gone (image/file entry whose
     /// temp/source URL no longer resolves).
     @discardableResult
@@ -286,39 +283,27 @@ final class ClipHistory: ObservableObject {
             // red-team: image temp file may have been auto-cleared from /tmp; fail loudly instead of writing an empty pasteboard.
             guard FileManager.default.fileExists(atPath: u.path),
                   let img = NSImage(contentsOf: u) else {
-                lastChangeCount = pb.changeCount
+                // Fix 11: post notification so PasteboardWatcher suppresses this write.
+                NotificationCenter.default.post(name: .troveDidWritePasteboard, object: nil)
                 return false
             }
             pb.writeObjects([img])
         case .file(let u):
             // red-team: dropped/moved files leave a dead URL; refuse to "restore" a phantom pasteboard.
             guard FileManager.default.fileExists(atPath: u.path) else {
-                lastChangeCount = pb.changeCount
+                // Fix 11: post notification so PasteboardWatcher suppresses this write.
+                NotificationCenter.default.post(name: .troveDidWritePasteboard, object: nil)
                 return false
             }
             pb.writeObjects([u as NSURL])
         }
-        // Red-team #3: bump our baseline so the next watcher tick sees no delta.
-        lastChangeCount = pb.changeCount
-        // red-team: broadcast cross-store so Stage's auto-grab doesn't ingest
-        // the very entry we just restored (Stage + History both watching at
-        // 0.5s = mutual echo without this).
+        // Fix 11: PasteboardWatcher listens for this and advances the shared watermark
+        // so the next tick is a no-op for both Stage auto-grab and History auto-watch.
         NotificationCenter.default.post(name: .troveDidWritePasteboard, object: nil)
         return true
     }
 
     // -------- Filtering -----------------------------------------------------
-
-    var visible: [ClipEntry] {
-        let q = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !q.isEmpty else { return entries }
-        return entries.filter { entry in
-            // Image entries have empty haystacks — they only show when search
-            // is empty. That matches user expectation: searching "foo" should
-            // not surface unrelated screenshots.
-            entry.searchHaystack.contains(q)
-        }
-    }
 
     // red-team: respond to memory pressure proactively. macOS will start
     // killing background apps when system memory is tight, and the clipboard

@@ -449,7 +449,7 @@ struct PermsHeaderCard: View {
                     .font(.title2)
                     .foregroundStyle(.tint)
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("macOS Privacy & Security, all in one place").font(.headline)
+                    Text("macOS Privacy & Security, all in one place").headerText()
                     Text("System Settings splits TCC categories across a dozen sub-panes. This view inventories every one, explains what it grants, and deep-links you straight to the right sub-pane.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
@@ -501,7 +501,7 @@ struct PermsCategoryCard: View {
 
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 10) {
-                        Text(category.name).font(.headline)
+                        Text(category.name).headerText()
                         badge
                     }
                     Text(category.explanation)
@@ -611,7 +611,7 @@ struct PermsCaveatCard: View {
                     .font(.title2)
                     .foregroundStyle(.secondary)
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Why can't Trove list every app's permissions?").font(.headline)
+                    Text("Why can't Trove list every app's permissions?").headerText()
                     Text("The macOS TCC database (`~/Library/Application Support/com.apple.TCC/TCC.db` and `/Library/Application Support/com.apple.TCC/TCC.db`) is owned by root and protected by SIP. Reading it requires Full Disk Access AND elevated privileges — neither is appropriate for a regular app. This pane shows what Trove itself has been granted (where the OS exposes a query) and gives you one-click access to every Privacy sub-pane so you can audit per-app grants there.")
                         .font(.callout)
                         .foregroundStyle(.secondary)

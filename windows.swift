@@ -723,6 +723,11 @@ public struct WinSnapView: View {
             m.refreshFrontmost()
             m.refreshOpenWindows()
         }
+        // Fix 19: re-check AX trust when app becomes active so granting AX in
+        // System Settings reflects without requiring a manual Refresh.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            m.refreshFrontmost()
+        }
         .background(keyboardShortcutSink)
     }
 

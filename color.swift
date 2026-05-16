@@ -580,9 +580,17 @@ public struct ColorToolView: View {
                             // Red-team #1: hop back to main; nil means cancel/denied.
                             DispatchQueue.main.async {
                                 guard let value = value else {
-                                    store.pickerError = "Screen Recording permission required or pick cancelled — System Settings → Privacy & Security → Screen Recording → Trove"
+                                    // Fix 20: disambiguate "denied" vs "user cancelled"
+                                    // using CGPreflightScreenCaptureAccess.
+                                    if CGPreflightScreenCaptureAccess() {
+                                        // Access is granted — user simply cancelled the picker.
+                                        store.pickerError = nil
+                                    } else {
+                                        store.pickerError = "denied"
+                                    }
                                     return
                                 }
+                                store.pickerError = nil
                                 store.record(value, source: "Picker")
                                 SharedStore.stage.flash("Picked \(value.hex)")
                             }
@@ -611,7 +619,21 @@ public struct ColorToolView: View {
                     }
                     .controlSize(.large)
                 }
-                if let err = store.pickerError {
+                if store.pickerError == "denied" {
+                    // Fix 20: render an actionable button instead of a static path string.
+                    HStack(spacing: 8) {
+                        Label("Screen Recording permission required", systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                        Button("Open System Settings") {
+                            _ = TCCDeepLink.screenRecording.open()
+                        }
+                        .font(.caption)
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(.tint)
+                    }
+                    .padding(.top, 2)
+                } else if let err = store.pickerError {
                     Text(err)
                         .font(.caption)
                         .foregroundStyle(.orange)

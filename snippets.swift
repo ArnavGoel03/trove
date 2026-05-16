@@ -87,10 +87,35 @@ enum SnippetError: LocalizedError {
 
 @MainActor
 final class SnippetStore: ObservableObject {
-    @Published var snippets: [Snippet] = []
-    @Published var search: String = ""
+    // Fix 13: `visible` is now @Published, populated on snippets/search changes.
+    var snippets: [Snippet] = [] {
+        willSet { objectWillChange.send() }
+        didSet  { recomputeVisible() }
+    }
+    var search: String = "" {
+        willSet { objectWillChange.send() }
+        didSet  { recomputeVisible() }
+    }
     /// Surface load errors visually without blocking startup.
     @Published var lastErrorMessage: String? = nil
+    @Published private(set) var visible: [Snippet] = []
+
+    private func recomputeVisible() {
+        let q = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let filtered: [Snippet] = q.isEmpty
+            ? snippets
+            : snippets.filter { s in
+                if s.name.lowercased().contains(q) { return true }
+                if s.body.lowercased().contains(q) { return true }
+                if s.tags.contains(where: { $0.lowercased().contains(q) }) { return true }
+                return false
+            }
+        visible = filtered.sorted { a, b in
+            if a.pinned != b.pinned { return a.pinned && !b.pinned }
+            if a.useCount != b.useCount { return a.useCount > b.useCount }
+            return a.createdAt > b.createdAt
+        }
+    }
 
     /// 1 MB soft warn, 10 MB hard refuse — stored as bytes for utf8 cost.
     static let warnBytes: Int = 1 * 1024 * 1024
@@ -118,23 +143,7 @@ final class SnippetStore: ObservableObject {
     }
 
     // MARK: filtered + sorted view
-
-    var visible: [Snippet] {
-        let q = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let filtered: [Snippet] = q.isEmpty
-            ? snippets
-            : snippets.filter { s in
-                if s.name.lowercased().contains(q) { return true }
-                if s.body.lowercased().contains(q) { return true }
-                if s.tags.contains(where: { $0.lowercased().contains(q) }) { return true }
-                return false
-            }
-        return filtered.sorted { a, b in
-            if a.pinned != b.pinned { return a.pinned && !b.pinned }
-            if a.useCount != b.useCount { return a.useCount > b.useCount }
-            return a.createdAt > b.createdAt
-        }
-    }
+    // Fix 13: visible is now @Published (see above). Computed inline removed.
 
     // MARK: CRUD
 
@@ -390,7 +399,7 @@ struct SnippetsView: View {
                     .font(.system(size: 36, weight: .light))
                     .foregroundStyle(.tertiary)
                 Text("No matches for \"\(store.search)\"")
-                    .font(.headline)
+                    .headerText()
                 Text("Try a different query, or clear the search to see all \(store.snippets.count) snippet\(store.snippets.count == 1 ? "" : "s").")
                     .font(.callout)
                     .foregroundStyle(.secondary)

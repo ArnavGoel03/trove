@@ -1236,7 +1236,7 @@ struct LogFilterCard: View {
                 HStack(spacing: 8) {
                     Image(systemName: "line.3.horizontal.decrease.circle.fill")
                         .foregroundStyle(.tint)
-                    Text("Filters").font(.headline)
+                    Text("Filters").headerText()
                     Spacer()
                     Picker("", selection: $mode) {
                         ForEach(LogMode.allCases) { Text($0.rawValue).tag($0) }
@@ -1336,7 +1336,7 @@ struct LogPresetsCard: View {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 8) {
                     Image(systemName: "bookmark.fill").foregroundStyle(.tint)
-                    Text("Saved presets").font(.headline)
+                    Text("Saved presets").headerText()
                     Spacer()
                     Text("Click to apply + run").font(.caption).foregroundStyle(.secondary)
                 }
@@ -1382,13 +1382,15 @@ struct LogResultsCard: View {
     @Binding var expanded: Set<UUID>
     @Binding var autoScroll: Bool
     let isStreaming: Bool
+    // Fix 25: gate auto-scroll animation on reduceMotion.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         Card {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
                     Image(systemName: "list.bullet.rectangle").foregroundStyle(.tint)
-                    Text("Results").font(.headline)
+                    Text("Results").headerText()
                     Spacer()
                     if runner.isRunning {
                         ProgressView().controlSize(.small)
@@ -1424,8 +1426,13 @@ struct LogResultsCard: View {
                         .onChange(of: runner.entries.count) { _ in
                             if isStreaming && autoScroll,
                                let last = runner.entries.last?.id {
-                                withAnimation(.linear(duration: 0.08)) {
+                                // Fix 25: skip animation when reduceMotion is set.
+                                if reduceMotion {
                                     proxy.scrollTo(last, anchor: .bottom)
+                                } else {
+                                    withAnimation(.linear(duration: 0.08)) {
+                                        proxy.scrollTo(last, anchor: .bottom)
+                                    }
                                 }
                             }
                         }

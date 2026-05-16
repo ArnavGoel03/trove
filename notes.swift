@@ -684,6 +684,10 @@ private struct NoteTabChip: View {
 private struct NoteSearchOverlay: View {
     @ObservedObject var store: NoteStore
     @FocusState private var focused: Bool
+    // Fix 14: hits moved to @State, populated asynchronously with 80ms debounce
+    // so the synchronous store.search() is not called on every body re-render.
+    @State private var hits: [NoteStore.SearchHit] = []
+    @State private var debounceTask: Task<Void, Never>? = nil
 
     var body: some View {
         VStack(spacing: 0) {
@@ -708,8 +712,18 @@ private struct NoteSearchOverlay: View {
             }
             .padding(.horizontal, 14).padding(.vertical, 8)
             .background(.background.secondary)
+            .onChange(of: store.searchQuery) { newValue in
+                debounceTask?.cancel()
+                debounceTask = Task {
+                    try? await Task.sleep(nanoseconds: 80_000_000) // 80ms
+                    guard !Task.isCancelled else { return }
+                    let result = await Task.detached(priority: .userInitiated) {
+                        store.search(newValue)
+                    }.value
+                    await MainActor.run { hits = result }
+                }
+            }
 
-            let hits = store.search(store.searchQuery)
             if !store.searchQuery.isEmpty {
                 if hits.isEmpty {
                     VStack(spacing: 10) {
@@ -717,7 +731,7 @@ private struct NoteSearchOverlay: View {
                             .font(.system(size: 28, weight: .light))
                             .foregroundStyle(.tertiary)
                         Text("No matches for \"\(store.searchQuery)\"")
-                            .font(.headline)
+                            .headerText()
                         Text("Searched the body and title of all five tabs. Try a different word, or clear the search.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
