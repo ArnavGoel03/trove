@@ -2212,11 +2212,12 @@ struct PDFOpsDetailView: View {
 
     @ViewBuilder
     private func sourceRow(_ s: PDFOpsSource, isImage: Bool) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: isImage ? "photo" : "doc.richtext")
-                .foregroundStyle(s.invalid ? AnyShapeStyle(Color.red)
-                                           : AnyShapeStyle(Color.accentColor))
-                .frame(width: 18)
+        HStack(spacing: 12) {
+            // First-page thumbnail. Replaces the generic doc icon so the
+            // user can SEE what they're reordering — especially important
+            // for Merge (order matters) and Organize Pages.
+            PDFSourceThumb(url: s.url, isImage: isImage, invalid: s.invalid)
+                .frame(width: 38, height: 50)
             VStack(alignment: .leading, spacing: 1) {
                 Text(s.url.lastPathComponent).font(.callout).lineLimit(1)
                 HStack(spacing: 6) {
@@ -3134,5 +3135,113 @@ private struct PDFOutputPreviewFallbackView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(40)
+    }
+}
+
+// ===========================================================================
+// MARK: - PDF source thumbnail
+// ===========================================================================
+
+/// Tiny 38×50 first-page thumbnail for the PDF Tools source list. Renders
+/// page 1 of a PDF via `PDFDocument` or downscales an image via
+/// `CGImageSourceCreateThumbnailAtIndex` (max 256px). Loads asynchronously
+/// off the main thread; shows a placeholder icon during load and on failure.
+///
+/// Why this matters: the source list supports drag-to-reorder (`.onMove`),
+/// but with only a generic `doc.richtext` icon the user had to read filenames
+/// to know which file was which. The thumbnail makes "merge in this order"
+/// visually obvious.
+struct PDFSourceThumb: View {
+    let url: URL
+    let isImage: Bool
+    let invalid: Bool
+
+    @State private var image: NSImage? = nil
+    @State private var loadFailed: Bool = false
+
+    var body: some View {
+        ZStack {
+            // Background — subtle card so the thumbnail has structure
+            // even before the image loads.
+            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                .fill(Color.troveBgElev)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .strokeBorder(invalid ? Color.red.opacity(0.5)
+                                              : Color.troveLine,
+                                      lineWidth: 0.5)
+                )
+            if let image {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.medium)
+                    .scaledToFill()
+                    .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+            } else if loadFailed {
+                Image(systemName: invalid ? "exclamationmark.triangle.fill"
+                                          : (isImage ? "photo" : "doc.richtext"))
+                    .font(.system(size: 16))
+                    .foregroundStyle(invalid ? AnyShapeStyle(Color.red)
+                                             : AnyShapeStyle(Color.secondary))
+            } else {
+                // Loading placeholder — same icon, just dimmer.
+                Image(systemName: isImage ? "photo" : "doc.richtext")
+                    .font(.system(size: 16))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .onAppear(perform: loadIfNeeded)
+        // Refire if a re-validation flipped `invalid` so the border updates.
+        .onChange(of: url) { _, _ in
+            image = nil; loadFailed = false; loadIfNeeded()
+        }
+        .accessibilityLabel(invalid ? "Couldn't load \(url.lastPathComponent)"
+                                    : "Preview of \(url.lastPathComponent)")
+    }
+
+    private func loadIfNeeded() {
+        guard image == nil, !loadFailed else { return }
+        let u = url
+        let asImage = isImage
+        Task.detached(priority: .userInitiated) {
+            let img: NSImage? = asImage
+                ? Self.imageThumbnail(at: u, maxPixel: 256)
+                : Self.pdfFirstPageThumbnail(at: u, maxPixel: 256)
+            await MainActor.run {
+                if let img {
+                    self.image = img
+                } else {
+                    self.loadFailed = true
+                }
+            }
+        }
+    }
+
+    /// PDFKit-based PDF first-page render. Capped at `maxPixel` so a huge
+    /// page doesn't allocate a 4K pixel buffer just for a tiny thumbnail.
+    private static func pdfFirstPageThumbnail(at url: URL, maxPixel: CGFloat) -> NSImage? {
+        guard let doc = PDFDocument(url: url),
+              let page = doc.page(at: 0) else { return nil }
+        let bounds = page.bounds(for: .mediaBox)
+        guard bounds.width > 0, bounds.height > 0 else { return nil }
+        let scale = min(maxPixel / max(bounds.width, bounds.height), 1.0)
+        let size = NSSize(width: bounds.width * scale, height: bounds.height * scale)
+        return page.thumbnail(of: size, for: .mediaBox)
+    }
+
+    /// Downscaled image thumbnail using ImageIO. Doesn't allocate the
+    /// full-resolution pixel buffer.
+    private static func imageThumbnail(at url: URL, maxPixel: CGFloat) -> NSImage? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else {
+            return nil
+        }
+        return NSImage(cgImage: cg, size: .zero)
     }
 }

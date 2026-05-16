@@ -148,7 +148,9 @@ final class NoteStore: ObservableObject {
         self.terminateObserver = NotificationCenter.default.addObserver(
             forName: .troveWillTerminate, object: nil, queue: .main
         ) { [weak self] _ in
-            self?.flushSynchronously()
+            MainActor.assumeIsolated {
+                self?.flushSynchronously()
+            }
         }
     }
 
@@ -712,13 +714,12 @@ private struct NoteSearchOverlay: View {
             }
             .padding(.horizontal, 14).padding(.vertical, 8)
             .background(.background.secondary)
-            .onChange(of: store.searchQuery) { newValue in
+            .onChange(of: store.searchQuery) { _, newValue in
                 debounceTask?.cancel()
-                debounceTask = Task {
+                debounceTask = Task { @MainActor in
                     try? await Task.sleep(nanoseconds: 80_000_000) // 80ms
                     guard !Task.isCancelled else { return }
-                    let result = store.search(newValue)
-                    hits = result
+                    hits = store.search(newValue)
                 }
             }
 

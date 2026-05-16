@@ -106,6 +106,7 @@ enum ProcSampler {
 
 /// A live row in the table. Identity is by PID — same PID across ticks updates
 /// the same row (which keeps SwiftUI's diffing happy and lets sparklines accrete).
+@MainActor
 final class ProcRow: Identifiable, ObservableObject {
     let pid: Int32
     @Published var ppid: Int32
@@ -151,6 +152,7 @@ final class ProcRow: Identifiable, ObservableObject {
 /// A visual group: either a single process or an app cluster (parent + children
 /// rolled up under one disclosure row). The "primary" is the row whose icon /
 /// name we display; children are everything sharing the same bundle / parent.
+@MainActor
 struct ProcGroup: Identifiable {
     let key: String          // bundle path or comm path
     let primary: ProcRow
@@ -172,6 +174,7 @@ private let procKillBlacklistNames: Set<String> = [
     "logind", "coreaudiod", "systemstats", "powerd",
 ]
 
+@MainActor
 func procIsBlacklisted(_ row: ProcRow) -> Bool {
     // red-team: this is called from inside ProcRowView.body for every visible
     // row on every redraw. Cache the lookup on the row so we only do the
@@ -347,6 +350,7 @@ final class ProcModel: ObservableObject {
 
 /// Returns the .app bundle path embedded in a `comm`/`args` path, if any.
 /// Example: "/Applications/Foo.app/Contents/MacOS/Foo" → "/Applications/Foo.app".
+@MainActor
 func procBundlePath(for row: ProcRow) -> String? {
     let candidates = [row.comm, row.args.split(separator: " ").first.map(String.init) ?? ""]
     for c in candidates where !c.isEmpty {
@@ -359,6 +363,7 @@ func procBundlePath(for row: ProcRow) -> String? {
 }
 
 /// Key used to bucket rows into app-groups.
+@MainActor
 func procAppKey(_ row: ProcRow) -> String {
     if let bundle = procBundlePath(for: row) { return bundle }
     // For non-bundle binaries (daemons, CLI tools), each unique comm is its
@@ -369,6 +374,7 @@ func procAppKey(_ row: ProcRow) -> String {
 /// True iff this row looks like the main executable of its bundle (as opposed
 /// to a "Helper" child). Heuristic: comm path is `…/Contents/MacOS/<X>` and
 /// the bundle basename matches `<X>.app` (case-insensitive).
+@MainActor
 func procIsBundleMain(_ row: ProcRow) -> Bool {
     guard let bundle = procBundlePath(for: row) else { return false }
     let bundleName = ((bundle as NSString).lastPathComponent as NSString).deletingPathExtension
@@ -377,6 +383,7 @@ func procIsBundleMain(_ row: ProcRow) -> Bool {
 }
 
 /// Display name for the group's header row.
+@MainActor
 func procDisplayName(_ row: ProcRow) -> String {
     if let bundle = procBundlePath(for: row) {
         let n = (bundle as NSString).lastPathComponent

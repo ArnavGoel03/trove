@@ -331,6 +331,7 @@ struct LogPreset: Identifiable, Hashable {
 /// All published state is mutated on the main queue (we route through
 /// `DispatchQueue.main.async` explicitly rather than relying on `@MainActor`,
 /// to match the dispatch style used elsewhere in Trove).
+@MainActor
 final class LogRunner: ObservableObject {
 
     @Published var entries: [LogEntry] = []
@@ -367,8 +368,8 @@ final class LogRunner: ObservableObject {
     private var proc: Process?
     private var stdoutHandle: FileHandle?
     private var stderrHandle: FileHandle?
-    private var stderrDrainQ = DispatchQueue(label: "trove.log.stderr")
-    private var stderrBox = LogDrainBox()
+    nonisolated(unsafe) private var stderrDrainQ = DispatchQueue(label: "trove.log.stderr")
+    nonisolated(unsafe) private var stderrBox = LogDrainBox()
 
     deinit {
         // Can't await main actor here; just signal the process if any.
@@ -435,6 +436,7 @@ final class LogRunner: ObservableObject {
                contains: String,
                includeInfoDebug: Bool,
                maxLines: Int = 5000) {
+        guard !isRunning else { return }
         stop()
         errorText = nil
         skipped = 0
@@ -559,6 +561,7 @@ final class LogRunner: ObservableObject {
                 process: String,
                 contains: String,
                 includeInfoDebug: Bool) {
+        guard !isRunning else { return }
         stop()
         errorText = nil
         skipped = 0

@@ -639,6 +639,7 @@ enum GPUPower {
 // MARK: - Model / refresh loop
 // ===========================================================================
 
+@MainActor
 final class GPUMonitorModel: ObservableObject {
     @Published var gpus: [GPUAccelerator] = []
     @Published var thermal: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
@@ -867,7 +868,7 @@ final class GPUMonitorModel: ObservableObject {
         // Power read is cheap now — call directly on background queue.
         powerQueue.async { [weak self] in
             let r = GPUPower.read()
-            DispatchQueue.main.async { self?.power = r }
+            Task { @MainActor [weak self] in self?.power = r }
         }
 
         self.gpus = probed
