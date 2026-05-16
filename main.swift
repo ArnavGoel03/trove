@@ -1217,6 +1217,248 @@ struct VersionBannerCard: View {
     }
 }
 
+// ===========================================================================
+// MARK: - Quick Switcher (⌘K palette)
+// ===========================================================================
+
+/// One row in the switcher's result list. Either jumps to a pane or runs a
+/// closure (for command-style actions like "Open Settings"). Closures are
+/// captured by the items array, which lives only while the sheet is open
+/// — no retain cycle.
+struct QuickSwitcherItem: Identifiable {
+    let id = UUID()
+    let label: String
+    let detail: String?
+    let icon: String
+    let action: Action
+    enum Action {
+        case openPane(Pane)
+        case run(() -> Void)
+    }
+    /// Score a query against this item. Lower is better; nil = no match.
+    /// Substring match wins over acronym match wins over fuzzy.
+    func score(_ q: String) -> Int? {
+        let needle = q.lowercased()
+        let hay = label.lowercased()
+        if needle.isEmpty { return 100 }
+        if hay == needle { return 0 }
+        if hay.hasPrefix(needle) { return 5 }
+        if hay.contains(needle) { return 10 }
+        // Acronym match: "ph" matches "Permissions Help" via initials.
+        let initials = hay.split(separator: " ").compactMap { $0.first }
+        let initialStr = String(initials)
+        if initialStr.hasPrefix(needle) { return 15 }
+        // Fuzzy: every needle char appears in order in hay.
+        var hi = hay.startIndex
+        for c in needle {
+            guard let next = hay[hi...].firstIndex(of: c) else { return nil }
+            hi = hay.index(after: next)
+        }
+        return 25
+    }
+}
+
+struct QuickSwitcherView: View {
+    @Binding var isOpen: Bool
+    @State private var query: String = ""
+    @State private var selected: Int = 0
+
+    /// All searchable items: every visible pane + common command actions.
+    private var allItems: [QuickSwitcherItem] {
+        var items: [QuickSwitcherItem] = []
+        // Panes (hidden ones omitted so the switcher matches sidebar visibility).
+        let visibility = PaneVisibilityStore.shared
+        for p in Pane.allCases where visibility.isVisible(p) {
+            items.append(QuickSwitcherItem(
+                label: p.rawValue,
+                detail: p.section,
+                icon: p.icon,
+                action: .openPane(p)
+            ))
+        }
+        // Commands.
+        items.append(QuickSwitcherItem(
+            label: "Open Settings",
+            detail: "Customize • ⌘,",
+            icon: "gearshape",
+            action: .run { openSettingsWindow() }
+        ))
+        items.append(QuickSwitcherItem(
+            label: "Check for Updates",
+            detail: "GitHub Releases",
+            icon: "arrow.triangle.2.circlepath",
+            action: .run { Task { await UpdateChecker.shared.check(quiet: false) } }
+        ))
+        items.append(QuickSwitcherItem(
+            label: "Clear Stage",
+            detail: "Remove all staged items",
+            icon: "tray",
+            action: .run { SharedStore.stage.clear() }
+        ))
+        items.append(QuickSwitcherItem(
+            label: "Paste into Stage",
+            detail: "From clipboard",
+            icon: "doc.on.clipboard",
+            action: .run { SharedStore.stage.pasteFromClipboard() }
+        ))
+        items.append(QuickSwitcherItem(
+            label: "Capture Screenshot",
+            detail: "Selection to Stage",
+            icon: "camera.viewfinder",
+            action: .run { SharedStore.stage.captureScreenshot() }
+        ))
+        return items
+    }
+
+    private var results: [QuickSwitcherItem] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let scored = allItems.compactMap { item -> (QuickSwitcherItem, Int)? in
+            guard let s = item.score(q) else { return nil }
+            return (item, s)
+        }
+        return scored.sorted { $0.1 < $1.1 }.map { $0.0 }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 16))
+                    .foregroundStyle(.secondary)
+                TextField("Jump to a pane or run a command…", text: $query)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 16))
+                    .onSubmit { execute(at: selected) }
+                if !query.isEmpty {
+                    Button { query = "" } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+
+            Divider()
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        let res = results
+                        if res.isEmpty {
+                            HStack {
+                                Spacer()
+                                Text("No matches")
+                                    .font(.callout).foregroundStyle(.secondary)
+                                    .padding(.vertical, 24)
+                                Spacer()
+                            }
+                        } else {
+                            ForEach(Array(res.enumerated()), id: \.element.id) { idx, item in
+                                row(item: item, isSelected: idx == selected)
+                                    .id(idx)
+                                    .contentShape(Rectangle())
+                                    .onTapGesture { execute(at: idx) }
+                                    .onHover { hovering in
+                                        if hovering { selected = idx }
+                                    }
+                            }
+                        }
+                    }
+                }
+                .onChange(of: selected) { _, new in
+                    proxy.scrollTo(new, anchor: .center)
+                }
+                .frame(maxHeight: 360)
+            }
+
+            Divider()
+
+            HStack(spacing: 14) {
+                tip("↑↓", "Navigate")
+                tip("⏎", "Open")
+                tip("Esc", "Dismiss")
+                Spacer()
+                Text("\(results.count) result\(results.count == 1 ? "" : "s")")
+                    .font(.caption.monospaced()).foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 16).padding(.vertical, 8)
+        }
+        .frame(width: 560)
+        .background(TroveAppBackground())
+        .onAppear { selected = 0 }
+        .onChange(of: query) { _, _ in selected = 0 }
+        .background {
+            // Hidden key handlers via Button + keyboardShortcut.
+            Group {
+                Button("") { moveSelection(-1) }
+                    .keyboardShortcut(.upArrow, modifiers: [])
+                Button("") { moveSelection(+1) }
+                    .keyboardShortcut(.downArrow, modifiers: [])
+                Button("") { isOpen = false }
+                    .keyboardShortcut(.escape, modifiers: [])
+            }
+            .hidden()
+        }
+    }
+
+    @ViewBuilder
+    private func row(item: QuickSwitcherItem, isSelected: Bool) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: item.icon)
+                .frame(width: 22).foregroundStyle(isSelected ? Color.white : .secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(item.label)
+                    .font(.system(size: 14, weight: isSelected ? .medium : .regular))
+                    .foregroundStyle(isSelected ? Color.white : .primary)
+                if let detail = item.detail {
+                    Text(detail).font(.caption).foregroundStyle(isSelected ? Color.white.opacity(0.7) : .secondary)
+                }
+            }
+            Spacer()
+            if isSelected {
+                Image(systemName: "return")
+                    .font(.caption).foregroundStyle(.white.opacity(0.85))
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(isSelected ? Color.troveAccentSky.opacity(0.85) : Color.clear)
+    }
+
+    @ViewBuilder
+    private func tip(_ key: String, _ label: String) -> some View {
+        HStack(spacing: 4) {
+            Text(key)
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .padding(.horizontal, 5).padding(.vertical, 1)
+                .background(Color.troveCardFill, in: RoundedRectangle(cornerRadius: 4))
+            Text(label).font(.caption).foregroundStyle(.tertiary)
+        }
+    }
+
+    private func moveSelection(_ delta: Int) {
+        let count = results.count
+        guard count > 0 else { return }
+        selected = (selected + delta + count) % count
+    }
+
+    private func execute(at idx: Int) {
+        let res = results
+        guard idx >= 0, idx < res.count else { return }
+        let item = res[idx]
+        isOpen = false
+        // Defer the action one runloop turn so the sheet dismissal animation
+        // doesn't race against the pane switch / window opening.
+        DispatchQueue.main.async {
+            switch item.action {
+            case .openPane(let p): switchToPane(p)
+            case .run(let f):      f()
+            }
+        }
+    }
+}
+
 /// Launch-at-login toggle for Settings.
 struct LaunchAtLoginCard: View {
     @ObservedObject private var lal = LaunchAtLogin.shared
@@ -1474,6 +1716,7 @@ struct RootView: View {
     // rename would silently mis-decode an old value. Keeping it as a string
     // means an obsolete rawValue cleanly degrades to .stage via the resolver.
     @AppStorage("trove.selectedPane") private var paneRaw: String = Pane.stage.rawValue
+    @State private var quickSwitcherOpen = false
     // App-wide tint choice (Settings → Accent). Default to magenta after the
     // warm-orange phase was retired for being too loud across 30+ panes.
     @AppStorage("trove.accent") private var accentRaw: String = TroveAccentChoice.white.rawValue
@@ -1630,6 +1873,17 @@ struct RootView: View {
         // flipping the swatch in Settings re-tints every control live. Do
         // NOT re-tint per-pane; see the coherence rules above.
         .tint(TroveAccentChoice(rawValue: accentRaw)?.color ?? .troveAccentAlt)
+        // ⌘K — quick switcher. Hidden button so the keyboard shortcut binds
+        // to the window without an on-screen control. Sheet renders the
+        // palette over the main view.
+        .background {
+            Button("") { quickSwitcherOpen = true }
+                .keyboardShortcut("k", modifiers: .command)
+                .hidden()
+        }
+        .sheet(isPresented: $quickSwitcherOpen) {
+            QuickSwitcherView(isOpen: $quickSwitcherOpen)
+        }
         .overlay(alignment: .bottomTrailing) {
             ToastStackView()
                 .environmentObject(stage)
