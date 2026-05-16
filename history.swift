@@ -111,8 +111,10 @@ final class ClipHistory: ObservableObject {
     }
 
     deinit {
-        // Fix 11: PasteboardWatcher subscription is cleaned up via setWatching(false).
-        // The handler closure captures [weak self] so on deinit it becomes a no-op.
+        // Ensure PasteboardWatcher subscription is always removed — if the store
+        // is deallocated while watching==true the setWatching(false) path never
+        // fires, leaving a dangling handler referencing a dead key.
+        PasteboardWatcher.shared.unsubscribe(key: self)
         // red-team: scrub per-instance tempDir so successive view recreates
         // don't leak a fresh `trove-history-XXXX` folder of PNGs each time.
         try? FileManager.default.removeItem(at: tempDir)

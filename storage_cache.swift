@@ -109,8 +109,11 @@ final class StorageCache {
         try? FileManager.default.createDirectory(at: dir,
                                                  withIntermediateDirectories: true)
 
-        // Best-effort load. Anything that goes wrong → quarantine + empty start.
-        loadFromDiskOrQuarantine()
+        // Seed empty defaults immediately so callers on the main thread don't
+        // block. Load from disk on a utility queue and patch `root` under lock.
+        Task.detached(priority: .utility) { [weak self] in
+            self?.loadFromDiskOrQuarantine()
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -59,6 +59,7 @@ struct NoteTab: Codable, Identifiable, Equatable {
 struct NotePersisted: Codable {
     var tabs: [NoteTab]
     var version: Int = 1
+    static let currentVersion: Int = 1
 }
 
 // ===========================================================================
@@ -115,6 +116,15 @@ final class NoteStore: ObservableObject {
             do {
                 guard let data = boundedRead(Self.storeURL) else { throw CocoaError(.fileReadNoSuchFile) }
                 let decoded = try JSONDecoder().decode(NotePersisted.self, from: data)
+                // Fix 2: reject files written by a future version to avoid silent data corruption.
+                guard decoded.version <= NotePersisted.currentVersion else {
+                    let ts = Int(Date().timeIntervalSince1970)
+                    let futureURL = Self.appSupportDir
+                        .appendingPathComponent("notes-future-\(ts).json")
+                    try? FileManager.default.moveItem(at: Self.storeURL, to: futureURL)
+                    recoveryMessage = "Notes file was written by a newer version of Trove — backed up to \(futureURL.lastPathComponent)"
+                    throw CocoaError(.fileReadCorruptFile)
+                }
                 // Replace defaults with any colors we recognize from disk.
                 for t in decoded.tabs {
                     if let i = loaded.firstIndex(where: { $0.color == t.color }) {
@@ -165,11 +175,24 @@ final class NoteStore: ObservableObject {
 
     // MARK: - Mutation entrypoints
 
+    // Fix 1: per-tab body size limits to prevent 50 MB note → quarantine → all-tabs-wiped.
+    static let warnBytes: Int = 4 * 1024 * 1024   // 4 MB — warn but allow
+    static let refuseBytes: Int = 10 * 1024 * 1024 // 10 MB — reject update
+
     /// Single source of truth for body edits. Updates state, schedules a
     /// debounced disk write, and throttles the word/char recount.
     func setBody(_ color: NoteColor, _ newValue: String) {
+        let byteCount = newValue.utf8.count
+        if byteCount > Self.refuseBytes {
+            SharedStore.stage.flash("Note too large (\(byteCount / 1_048_576) MB) — update rejected to protect your data.", kind: .warning)
+            return
+        }
         guard let i = tabs.firstIndex(where: { $0.color == color }) else { return }
         guard tabs[i].body != newValue else { return }
+        if byteCount > Self.warnBytes && tabs[i].body.utf8.count <= Self.warnBytes {
+            // Flash once when crossing the warn threshold (not on every keystroke).
+            SharedStore.stage.flash("Note is over 4 MB — consider splitting it into smaller notes.", kind: .warning)
+        }
         tabs[i].body = newValue
         scheduleSave()
         scheduleCount(color, newValue)
@@ -578,8 +601,8 @@ public struct NotesView: View {
                 }
                 .labelStyle(.iconOnly)
                 .keyboardShortcut(KeyEquivalent(Character("\(idx + 1)")),
-                                  modifiers: .command)
-                .help("Switch to \(c.defaultTitle) (⌘\(idx + 1))")
+                                  modifiers: [.command, .option])
+                .help("Switch to \(c.defaultTitle) (⌘⌥\(idx + 1))")
                 .opacity(0)
                 .frame(width: 0, height: 0)
             }
@@ -892,8 +915,10 @@ private struct NotePreviewPane: View {
         guard existing == " " || existing == "x" || existing == "X" else { return }
 
         // Map back to absolute body index.
-        let absoluteIndex = body.index(lineRange.lowerBound, offsetBy: slotOffsetInLine)
-        guard absoluteIndex < body.endIndex else { return }
+        guard let absoluteIndex = body.index(lineRange.lowerBound,
+                                             offsetBy: slotOffsetInLine,
+                                             limitedBy: body.endIndex),
+              absoluteIndex < body.endIndex else { return }
 
         let replacement: Character = newChecked ? "x" : " "
         var newBody = body

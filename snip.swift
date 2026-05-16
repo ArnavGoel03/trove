@@ -413,7 +413,7 @@ final class SnipEngine: ObservableObject {
     /// Fan the captured PNG out to one or more destinations.
     private func routeCapturedFile(at workURL: URL, mode: SnipMode, destination: SnipDestination) {
         guard let img = NSImage(contentsOf: workURL) else {
-            SharedStore.stage.flash("Snip failed to decode")
+            SharedStore.stage.flash("Couldn't read the captured image — try again.")
             return
         }
 
@@ -445,6 +445,12 @@ final class SnipEngine: ObservableObject {
             do {
                 try FileManager.default.copyItem(at: workURL, to: target)
                 savedURL = target
+                OutputsLibrary.shared.record(
+                    url: target,
+                    producer: "snip",
+                    sourceLabel: target.lastPathComponent,
+                    kind: "image"
+                )
             } catch {
                 SharedStore.stage.flash("Snip save failed: \(error.localizedDescription)")
             }

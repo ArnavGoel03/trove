@@ -110,7 +110,14 @@ final class AccountStore: ObservableObject {
     /// only weak-refs its delegate. Stash it here while a request is in flight.
     fileprivate var pendingCoordinator: AccountSIWACoordinator?
 
-    private init() { load() }
+    private init() {
+        // Seed published defaults immediately; load() can block on slow disks.
+        // Defer to a detached task and patch back on MainActor, matching the
+        // pattern used by ProfileSync.init().
+        Task.detached(priority: .utility) { [weak self] in
+            await MainActor.run { self?.load() }
+        }
+    }
 
     // ---- file path -------------------------------------------------------
 

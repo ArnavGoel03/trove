@@ -1,7 +1,7 @@
 // Trove — Global hotkeys (Carbon) with user-configurable bindings.
 //
 // Ships one app-wide shortcut by default:
-//   ⌘⇧2  →  capture full screen, write a PNG, add to Stage.
+//   ⌘⌥⇧T  →  capture full screen, write a PNG, add to Stage.
 //
 // Users can rebind it (or disable it entirely) from the Customize pane.
 // Settings persist to UserDefaults.
@@ -27,6 +27,14 @@ struct HotkeyBinding: Equatable, Hashable, Codable {
     var modifiers: UInt32   // bitmask of cmdKey | optionKey | controlKey | shiftKey
     var keyCode: UInt32     // virtual keycode (kVK_*)
 
+    /// ⌘⌥⇧T — triple-modifier default avoids collisions with macOS Screenshot
+    /// (⌘⇧2/3/4/5) and other common system shortcuts.
+    static let cmdOptShiftT = HotkeyBinding(
+        modifiers: UInt32(cmdKey | optionKey | shiftKey),
+        keyCode: UInt32(kVK_ANSI_T)
+    )
+    // Legacy name kept so existing UserDefaults round-trips still compile.
+    @available(*, deprecated, renamed: "cmdOptShiftT")
     static let cmdShift2 = HotkeyBinding(
         modifiers: UInt32(cmdKey | shiftKey),
         keyCode: UInt32(kVK_ANSI_2)
@@ -105,8 +113,9 @@ final class HotkeySettings: ObservableObject {
 
     private init() {
         let defaults = UserDefaults.standard
+        // Fix 15: default to false on first launch — don't activate a global hotkey without consent.
         if defaults.object(forKey: Self.keyEnabled) == nil {
-            self.fullScreenToStageEnabled = true
+            self.fullScreenToStageEnabled = false
         } else {
             self.fullScreenToStageEnabled = defaults.bool(forKey: Self.keyEnabled)
         }
@@ -120,7 +129,7 @@ final class HotkeySettings: ObservableObject {
            Self.isValid(binding: decoded) {
             self.fullScreenToStageBinding = decoded
         } else {
-            self.fullScreenToStageBinding = .cmdShift2
+            self.fullScreenToStageBinding = .cmdOptShiftT
         }
     }
 
@@ -222,7 +231,7 @@ final class TroveGlobalHotkeys: ObservableObject {
         case OSStatus(memFullErr):
             return "Out of memory installing the hotkey. Restart Trove."
         default:
-            return "Hotkey conflict (OS code \(regStatus)) — try another"
+            return "That shortcut couldn't be registered — try a different combination."
         }
     }
 
@@ -401,7 +410,7 @@ struct HotkeySettingsCard: View {
                         .disabled(!settings.fullScreenToStageEnabled)
                         .help("Click then press the shortcut you want (modifiers + key)")
                     }
-                    Text("Works from any app while Trove is running. Default ⌘⇧2.")
+                    Text("Works from any app while Trove is running. Default ⌘⌥⇧T.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

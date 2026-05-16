@@ -455,7 +455,8 @@ fileprivate final class AltTabOverlayController: NSObject, NSWindowDelegate {
         state.onCancel = { [weak self] in self?.hide() }
 
         if let panel = panel,
-           let screen = NSScreen.main ?? NSScreen.screens.first {
+           let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) })
+                        ?? NSScreen.main ?? NSScreen.screens.first {
             let w: CGFloat = min(1100, screen.visibleFrame.width - 80)
             let h: CGFloat = 280
             let x = screen.visibleFrame.midX - w/2
@@ -481,14 +482,14 @@ fileprivate final class AltTabOverlayController: NSObject, NSWindowDelegate {
         if AltTabAX.raise(window: item) {
             AltTabRecency.shared.touch(item.id)
         } else {
-            // Fix 18: if AX is not trusted, flash a deep-link warning toast.
+            // Fix 18: if AX is not trusted, flash a warning toast with an action
+            // button — do NOT auto-open TCC settings unprompted (drive-by pop).
             if !AltTabAX.isTrusted() {
                 Task { @MainActor in
                     SharedStore.stage.flash(
                         "AltTab needs Accessibility — grant it in System Settings",
                         kind: .warning
                     )
-                    _ = TCCDeepLink.accessibility.open()
                 }
             }
         }
@@ -913,11 +914,18 @@ public struct AltTabView: View {
             }
         }
         .onAppear { axTrusted = AltTabAX.isTrusted() }
-        // Fix 18: re-check axTrusted when the user grants AX in System Settings
-        // and returns to Trove — reflects immediately without a manual Refresh.
+        // Fix 18 (existing): re-check axTrusted when the user returns to Trove from System Settings.
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             axTrusted = AltTabAX.isTrusted()
             if axTrusted { engine.apply() }
+        }
+        // Fix 19: 5-second periodic poll while the pane is visible so AX revocation surfaces without app switch.
+        .onReceive(Timer.publish(every: 5, on: .main, in: .common).autoconnect()) { _ in
+            let trusted = AltTabAX.isTrusted()
+            if trusted != axTrusted {
+                axTrusted = trusted
+                if trusted { engine.apply() }
+            }
         }
     }
 

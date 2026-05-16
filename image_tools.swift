@@ -886,6 +886,12 @@ final class ImgToolsModel: ObservableObject {
                 if toStage {
                     SharedStore.stage.addFile(url)
                 }
+                OutputsLibrary.shared.record(
+                    url: url,
+                    producer: "image_tools.convert",
+                    sourceLabel: src.url.lastPathComponent,
+                    kind: "image"
+                )
             case .failure(let err):
                 failures.append(ImgToolsFailure(
                     sourceURL: src.url,

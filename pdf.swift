@@ -791,6 +791,18 @@ final class PDFOpsModel: ObservableObject {
         outputs.append(o)
         recents.add(o)
         if toStage { SharedStore.stage.addFile(o.url) }
+        // Wire OutputsLibrary so the Library pane is populated after every op.
+        let kind: String
+        switch o.opKind {
+        case .toJPG, .toPNG: kind = "image"
+        default:             kind = "pdf"
+        }
+        OutputsLibrary.shared.record(
+            url: o.url,
+            producer: "pdf.\(o.opKind.rawValue)",
+            sourceLabel: o.sourceLabel,
+            kind: kind
+        )
     }
     @MainActor private func appendFailure(_ f: PDFOpsFailure) { failures.append(f) }
 

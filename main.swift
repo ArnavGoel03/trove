@@ -99,6 +99,15 @@ struct TroveApp: App {
             // ─── Help ──────────────────────────────────────────────────────
             // Replace the default search-only Help menu with branded links.
             CommandGroup(replacing: .help) {
+                Button("Keyboard Shortcuts") {
+                    NotificationCenter.default.post(name: .troveOpenKeyboardShortcuts, object: nil)
+                }
+                Button("What's New") {
+                    if let url = URL(string: "https://github.com/ArnavGoel03/trove/releases") {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+                Divider()
                 Button("Trove Website") {
                     if let url = URL(string: "https://gettrove.vercel.app") {
                         NSWorkspace.shared.open(url)
@@ -196,14 +205,39 @@ enum TCCDeepLink: String {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
+    // Keep Awake menu bar one-tap toggle. Observes KeepAwakeCoordinator.masterOn
+    // so the checkmark and status-item icon reflect state changes from any
+    // source (toolbar button in Keep Awake pane, auto-release on battery, etc.).
+    private var keepAwakeItem: NSMenuItem?
+    private var keepAwakeCancellable: AnyCancellable?
 
     func applicationDidFinishLaunching(_ note: Notification) {
         #if !TROVE_TESTING
+        // Single-instance guard: `open -na Trove.app` bypasses the normal
+        // activation-of-existing-instance path. Detect and bail immediately
+        // without crashing — just a clean NSApp.terminate.
+        let bundleID = Bundle.main.bundleIdentifier ?? ""
+        if !bundleID.isEmpty {
+            let running = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            if running.count > 1 {
+                NSApp.terminate(nil)
+                return
+            }
+        }
+
         let s = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         s.button?.image = NSImage(systemSymbolName: "tray.full.fill",
                                   accessibilityDescription: "Trove")
         let m = NSMenu()
         m.addItem(make("Show Trove",      #selector(showWin), "0"))
+        m.addItem(.separator())
+        // One-tap "Prevent Sleep" toggle: holds Keep Awake assertions when on,
+        // releases them when off. Checkmark + status-item icon reflect state.
+        let ka = make("Prevent Sleep", #selector(toggleKeepAwake))
+        ka.state = KeepAwakeCoordinator.shared.masterOn ? .on : .off
+        ka.toolTip = "Hold Keep Awake assertions to prevent display + system sleep. Click again to release."
+        m.addItem(ka)
+        keepAwakeItem = ka
         m.addItem(.separator())
         m.addItem(make("Capture Screenshot", #selector(cap)))
         m.addItem(make("Paste Clipboard",    #selector(pst)))
@@ -215,6 +249,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                              keyEquivalent: "q"))
         s.menu = m
         statusItem = s
+        // Reflect Keep Awake state on the status item — when active, swap the
+        // tray glyph for a "filled" variant so the user can see at a glance
+        // (without opening the menu) that something is held.
+        updateKeepAwakeAffordance(active: KeepAwakeCoordinator.shared.masterOn)
+        keepAwakeCancellable = KeepAwakeCoordinator.shared.$masterOn
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] on in
+                self?.keepAwakeItem?.state = on ? .on : .off
+                self?.updateKeepAwakeAffordance(active: on)
+            }
 
         // red-team: install the configurable global hotkey (⌘⇧2 → full-screen
         // screenshot to Stage by default). Settings UI lives in Customize.
@@ -247,6 +291,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidBecomeActive(_ note: Notification) {
         // Fix 4: CalcRateStore.shared.refreshIfStale() moved into
         // CalcRateStore.init() so the store self-manages its lifecycle.
+
+        // Fix 10: CutPaste appleScriptDenied sticky flag — clear it on
+        // app-become-active so the user sees the banner disappear once they
+        // grant Automation permission in System Settings and return to Trove.
+        if CutPasteController.shared.appleScriptDenied {
+            CutPasteController.shared.appleScriptDenied = false
+        }
+        // R5 fix #17: permissionMissing (AX tap denied) should auto-clear once
+        // the user grants Accessibility and returns to Trove.
+        if CutPasteController.shared.permissionMissing && AXIsProcessTrusted() {
+            CutPasteController.shared.permissionMissing = false
+        }
     }
 
     @objc func systemDidWake(_ note: Notification) {
@@ -287,6 +343,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return it
     }
 
+    @objc func toggleKeepAwake() {
+        // Menu actions always fire on the main thread; assume MainActor so
+        // we can touch the @MainActor-isolated coordinator without a Task hop.
+        MainActor.assumeIsolated {
+            let coord = KeepAwakeCoordinator.shared
+            coord.toggleMaster(!coord.masterOn)
+        }
+    }
+
+    private func updateKeepAwakeAffordance(active: Bool) {
+        let name = active ? "bolt.fill" : "tray.full.fill"
+        statusItem?.button?.image = NSImage(systemSymbolName: name,
+                                            accessibilityDescription: active ? "Trove — preventing sleep" : "Trove")
+    }
+
     @objc func showWin() {
         NSApp.activate(ignoringOtherApps: true)
         if let w = NSApp.windows.first { w.makeKeyAndOrderFront(nil) }
@@ -304,6 +375,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !flag { showWin() }
         return true
     }
+
+    deinit {
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+        NotificationCenter.default.removeObserver(self)
+    }
 }
 
 // red-team: notifications used across files for centralized lifecycle hooks.
@@ -318,6 +394,8 @@ extension Notification.Name {
     /// Posted when the View → Quick Switcher menu item (⌘K) fires. RootView
     /// listens and presents the QuickSwitcherView sheet.
     static let troveOpenQuickSwitcher = Notification.Name("TroveOpenQuickSwitcher")
+    /// Posted from the Help menu "Keyboard Shortcuts" item. RootView listens.
+    static let troveOpenKeyboardShortcuts = Notification.Name("TroveOpenKeyboardShortcuts")
 }
 
 // Fix 11: shared pasteboard poller that replaces the twin 0.5s timers that
@@ -428,6 +506,17 @@ struct WindowChrome: NSViewRepresentable {
                 // expose a frame-autosave API until macOS 14.
                 if w.frameAutosaveName.isEmpty {
                     w.setFrameAutosaveName("trove.mainWindow")
+                }
+                // Fix 18: clamp restored frame to visible screen area.
+                // Prevents the window from being off-screen after connecting
+                // a different display configuration (e.g. Mac Pro vs MacBook).
+                let wf = w.frame
+                let onScreen = NSScreen.screens.contains { $0.frame.intersects(wf) }
+                if !onScreen, let main = NSScreen.main {
+                    w.setFrameOrigin(NSPoint(
+                        x: main.visibleFrame.midX - wf.width / 2,
+                        y: main.visibleFrame.midY - wf.height / 2
+                    ))
                 }
             }
             context.coordinator.applyFloating(stage.floating)
@@ -748,23 +837,27 @@ final class PaneVisibilityStore: ObservableObject {
     }
 
     private init() {
+        // Seed "all visible" immediately so the view paints without blocking.
+        // Load the persisted layout off-main and patch back via MainActor.
         let url = Self.fileURL
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        do {
-            guard let data = boundedRead(url) else { return }
-            let arr = try JSONDecoder().decode([String].self, from: data)
-            // Fix 1: filter stale rawValues so removed panes don't persist.
-            let valid = Set(Pane.allCases.map(\.rawValue))
-            self.hidden = Set(arr).intersection(valid)
-        } catch {
-            // Quarantine corrupt file so next save doesn't clobber it.
-            let ts = Int(Date().timeIntervalSince1970)
-            let corrupt = url.deletingLastPathComponent()
-                .appendingPathComponent("sidebar-corrupt-\(ts).json")
-            try? FileManager.default.moveItem(at: url, to: corrupt)
-            let msg = "Sidebar layout file unreadable — backed up to \(corrupt.lastPathComponent)"
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                SharedStore.stage.flash(msg, kind: .warning)
+        Task.detached(priority: .utility) { [weak self] in
+            guard FileManager.default.fileExists(atPath: url.path) else { return }
+            do {
+                guard let data = boundedRead(url) else { return }
+                let arr = try JSONDecoder().decode([String].self, from: data)
+                let valid = Set(Pane.allCases.map(\.rawValue))
+                let loaded = Set(arr).intersection(valid)
+                await MainActor.run { self?.hidden = loaded }
+            } catch {
+                // Quarantine corrupt file so next save doesn't clobber it.
+                let ts = Int(Date().timeIntervalSince1970)
+                let corrupt = url.deletingLastPathComponent()
+                    .appendingPathComponent("sidebar-corrupt-\(ts).json")
+                try? FileManager.default.moveItem(at: url, to: corrupt)
+                let msg = "Sidebar layout file unreadable — backed up to \(corrupt.lastPathComponent)"
+                await MainActor.run {
+                    SharedStore.stage.flash(msg, kind: .warning)
+                }
             }
         }
     }
@@ -776,10 +869,16 @@ final class PaneVisibilityStore: ObservableObject {
             return
         }
         let target = Self.fileURL
-        let tmp = target.appendingPathExtension("tmp")
+        // Fix 5: UUID-suffixed tmp to prevent concurrent-write races.
+        let tmp = target.deletingLastPathComponent()
+            .appendingPathComponent(".sidebar-\(UUID().uuidString.prefix(8)).tmp")
         do {
             try data.write(to: tmp, options: .atomic)
-            _ = try FileManager.default.replaceItemAt(target, withItemAt: tmp)
+            if FileManager.default.fileExists(atPath: target.path) {
+                _ = try FileManager.default.replaceItemAt(target, withItemAt: tmp)
+            } else {
+                try FileManager.default.moveItem(at: tmp, to: target)
+            }
         } catch {
             try? FileManager.default.removeItem(at: tmp)
             // Fix 2: surface write failures instead of silently discarding them.
@@ -830,7 +929,8 @@ final class ProfileSync: ObservableObject {
     /// Files in Application Support that count as part of the user's profile.
     /// Anything not listed here is left alone on import.
     private static let bundledFiles = [
-        "sidebar.json", "snippets.json", "notes.json", "account.json"
+        // Fix 17: add outputs-library.json.
+        "sidebar.json", "snippets.json", "notes.json", "account.json", "outputs-library.json"
     ]
 
     private var appSupportDir: URL {
@@ -865,6 +965,24 @@ final class ProfileSync: ObservableObject {
     }
 
     /// Build a single JSON blob from the profile files.
+    /// UserDefaults keys included in the version-2 profile snapshot.
+    private static let bundledDefaultsKeys = [
+        "trove.selectedPane",
+        "trove.accent",
+        // Fix 16: removed "trove.sidebar.visibility" (display layout, not user data).
+        // Fix 16: added all 8 alttab keys.
+        "alttab.enabled",
+        "alttab.hotkey.mods",
+        "alttab.hotkey.key",
+        "alttab.crossSpace",
+        "alttab.includeHidden",
+        "alttab.colorCode",
+        "alttab.recency",
+        "alttab.recencyList",
+        "hotkey.fullScreenToStage.enabled",
+        "hotkey.fullScreenToStage.binding"
+    ]
+
     func snapshot() -> Data? {
         var bundle: [String: String] = [:]
         for name in Self.bundledFiles {
@@ -873,10 +991,21 @@ final class ProfileSync: ObservableObject {
                 bundle[name] = data.base64EncodedString()
             }
         }
+        var userDefaultsDict: [String: String] = [:]
+        for key in Self.bundledDefaultsKeys {
+            if let val = UserDefaults.standard.object(forKey: key) {
+                // Store as JSON string so we don't need special-casing per type.
+                if let encoded = try? JSONSerialization.data(withJSONObject: val),
+                   let str = String(data: encoded, encoding: .utf8) {
+                    userDefaultsDict[key] = str
+                }
+            }
+        }
         var wrapped: [String: Any] = [
-            "schema": 1,
+            "schema": 2,
             "createdAt": ISO8601DateFormatter().string(from: Date()),
-            "files": bundle
+            "files": bundle,
+            "userDefaults": userDefaultsDict
         ]
         if let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String {
             wrapped["appVersion"] = appVersion
@@ -899,6 +1028,16 @@ final class ProfileSync: ObservableObject {
               let files = obj["files"] as? [String: String] else {
             lastError = "File is not a valid Trove profile"
             return false
+        }
+        // Schema 2 includes UserDefaults; schema 1 omits it — handle both.
+        let schemaVersion = obj["schema"] as? Int ?? 1
+        if schemaVersion >= 2, let defaults = obj["userDefaults"] as? [String: String] {
+            for (key, jsonStr) in defaults {
+                guard Self.bundledDefaultsKeys.contains(key),
+                      let jsonData = jsonStr.data(using: .utf8),
+                      let val = try? JSONSerialization.jsonObject(with: jsonData) else { continue }
+                UserDefaults.standard.set(val, forKey: key)
+            }
         }
         // red-team-sec: per-entry cap so one malicious key can't blow memory.
         let maxFileBytes = 2 * 1024 * 1024
@@ -978,11 +1117,25 @@ final class ProfileSync: ObservableObject {
     @discardableResult
     func restoreFromICloud() -> Bool {
         let url = iCloudDir.appendingPathComponent("profile.json")
-        guard let data = try? Data(contentsOf: url) else {
-            lastError = "No iCloud profile found yet — back up from another Mac first."
-            return false
+        // Fix: move iCloud I/O off the main actor — synchronous Data(contentsOf:)
+        // on a CloudDocs path can block until bird daemon responds (200ms–∞).
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            guard let data = try? Data(contentsOf: url) else {
+                await MainActor.run {
+                    self.lastError = "No iCloud profile found yet — back up from another Mac first."
+                }
+                return
+            }
+            let ok = await MainActor.run { self.apply(data) }
+            if ok {
+                await MainActor.run {
+                    SharedStore.stage.flash("Profile restored from iCloud — relaunch Trove to apply changes")
+                }
+            }
         }
-        return apply(data)
+        // Return true optimistically; callers should observe lastError for failure.
+        return true
     }
 
     func exportToFile(_ url: URL) -> Bool {
@@ -1182,7 +1335,13 @@ struct CustomizeView: View {
                                     Spacer()
                                     Toggle("", isOn: Binding(
                                         get: { store.isVisible(p) },
-                                        set: { store.setVisible(p, $0) }
+                                        set: {
+                                            store.setVisible(p, $0)
+                                            if !$0,
+                                               UserDefaults.standard.string(forKey: "trove.selectedPane") == p.rawValue {
+                                                UserDefaults.standard.set(Pane.stage.rawValue, forKey: "trove.selectedPane")
+                                            }
+                                        }
                                     ))
                                     .labelsHidden()
                                 }
@@ -1869,7 +2028,9 @@ struct RootView: View {
     // rename would silently mis-decode an old value. Keeping it as a string
     // means an obsolete rawValue cleanly degrades to .stage via the resolver.
     @AppStorage("trove.selectedPane") private var paneRaw: String = Pane.stage.rawValue
+    @AppStorage("trove.hasSeenWelcome.v1") private var hasSeenWelcome: Bool = false
     @State private var quickSwitcherOpen = false
+    @State private var keyboardShortcutsOpen = false
     // App-wide tint choice (Settings → Accent). Default to magenta after the
     // warm-orange phase was retired for being too loud across 30+ panes.
     @AppStorage("trove.accent") private var accentRaw: String = TroveAccentChoice.white.rawValue
@@ -1953,6 +2114,14 @@ struct RootView: View {
             // see at a glance which build they're on, without having to
             // open the About dialog or Settings.
             Divider().opacity(0.4)
+            // ⌘K quick-jump hint — single non-scrolling line.
+            Text("Press ⌘K to jump to any tool")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.top, 6)
+                .padding(.horizontal, 12)
             HStack(spacing: 8) {
                 Image(systemName: "circle.hexagongrid.fill")
                     .foregroundStyle(.tint)
@@ -2033,8 +2202,20 @@ struct RootView: View {
         .onReceive(NotificationCenter.default.publisher(for: .troveOpenQuickSwitcher)) { _ in
             quickSwitcherOpen = true
         }
+        .onReceive(NotificationCenter.default.publisher(for: .troveOpenKeyboardShortcuts)) { _ in
+            keyboardShortcutsOpen = true
+        }
         .sheet(isPresented: $quickSwitcherOpen) {
             QuickSwitcherView(isOpen: $quickSwitcherOpen)
+        }
+        .sheet(isPresented: $keyboardShortcutsOpen) {
+            KeyboardShortcutsSheet()
+        }
+        .sheet(isPresented: Binding(
+            get: { !hasSeenWelcome },
+            set: { if !$0 { hasSeenWelcome = true } }
+        )) {
+            WelcomeSheet { hasSeenWelcome = true }
         }
         .overlay(alignment: .bottomTrailing) {
             ToastStackView()
@@ -2081,12 +2262,24 @@ struct RootView: View {
             }
             if action == "copy-text" { stage.copyAllAsText() } else { stage.copyAllAsFiles() }
         case "clear":
+            // red-team-sec: a drive-by <a href="trove://clear"> can wipe Stage
+            // unless we gate on Trove being frontmost.
+            guard Self.isTroveFrontmost() else {
+                stage.flash("Clear refused — Trove must be frontmost")
+                return
+            }
             stage.clear()
             stage.flash("Stage cleared")
         case "add":
             paneRaw = Pane.stage.rawValue
             let type = q["type"] ?? "file"
             if type == "text", let v = q["value"] {
+                // red-team-sec: gate text injection on frontmost — drive-by
+                // URL could inject arbitrary clipboard content otherwise.
+                guard Self.isTroveFrontmost() else {
+                    stage.flash("Add refused — Trove must be frontmost")
+                    return
+                }
                 // red-team-sec: bound text size — website firing 10 MB of
                 // text would balloon the in-memory Stage.
                 if v.utf8.count > 1_000_000 {
@@ -2113,8 +2306,11 @@ struct RootView: View {
     /// safe to stage, otherwise a human-readable rejection reason. Split out
     /// so tests can exercise the policy without poking SharedStore.stage.
     static func stageFileValidation(path p: String) -> String? {
+        // red-team-sec: resolve symlinks first so a symlink pointing into /dev/
+        // or /proc/ doesn't bypass the blocklist.
+        let resolvedPath = URL(fileURLWithPath: p).resolvingSymlinksInPath().path
         let blockedPrefixes = ["/dev/", "/proc/", "/sys/", "/private/var/run/"]
-        for pfx in blockedPrefixes where p.hasPrefix(pfx) {
+        for pfx in blockedPrefixes where resolvedPath.hasPrefix(pfx) {
             return "CLI path refused: \(pfx) blocked"
         }
         let fileURL = URL(fileURLWithPath: p)
@@ -2159,16 +2355,138 @@ struct RootView: View {
 }
 
 // ===========================================================================
+// MARK: - Welcome sheet (first launch)
+// ===========================================================================
+
+struct WelcomeSheet: View {
+    let onDismiss: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            VStack(spacing: 10) {
+                Image(systemName: "tray.full.fill")
+                    .font(.system(size: 48))
+                    .foregroundStyle(.tint)
+                    .padding(.top, 32)
+                Text("Welcome to Trove")
+                    .font(.system(.title, design: .rounded).weight(.bold))
+                Text("32 local-only tools, zero telemetry.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.bottom, 24)
+
+            // Hint bullets
+            Card {
+                VStack(alignment: .leading, spacing: 14) {
+                    WelcomeHint(icon: "magnifyingglass", label: "Press ⌘K to find any tool")
+                    WelcomeHint(icon: "square.and.arrow.down", label: "Drop or paste anything into Stage")
+                    WelcomeHint(icon: "slider.horizontal.3", label: "Customize the sidebar in Settings ⌘,")
+                }
+            }
+            .padding(.horizontal, 24)
+
+            Button {
+                onDismiss()
+            } label: {
+                Text("Got it")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            .padding(.horizontal, 24)
+            .padding(.top, 20)
+            .padding(.bottom, 28)
+        }
+        .frame(width: 400)
+    }
+}
+
+private struct WelcomeHint: View {
+    let icon: String
+    let label: String
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .frame(width: 22)
+                .foregroundStyle(.tint)
+            Text(label)
+                .font(.callout)
+                .foregroundStyle(.primary)
+        }
+    }
+}
+
+// ===========================================================================
+// MARK: - Keyboard Shortcuts sheet (Help menu)
+// ===========================================================================
+
+struct KeyboardShortcutsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+
+    private let shortcuts: [(String, String)] = [
+        ("⌘1", "Stage pane"),
+        ("⌘2", "History pane"),
+        ("⌘3", "Snippets pane"),
+        ("⌘4", "Notes pane"),
+        ("⌘K", "Quick Switcher"),
+        ("⌘⇧V", "Paste into Stage"),
+        ("⌘⇧N", "Capture screenshot"),
+        ("⌘⇧⌫", "Clear Stage"),
+        ("⌘,", "Settings"),
+        ("⌘⌥⇧T", "Global screenshot to Stage"),
+    ]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Text("Keyboard Shortcuts")
+                .font(.system(.title2, design: .rounded).weight(.bold))
+                .padding(.top, 28)
+                .padding(.bottom, 20)
+
+            Card {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(shortcuts, id: \.0) { key, label in
+                        HStack {
+                            Text(label)
+                                .font(.callout)
+                                .foregroundStyle(.primary)
+                            Spacer()
+                            Text(key)
+                                .font(.system(.callout, design: .monospaced).weight(.medium))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 24)
+
+            Button("Done") { dismiss() }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .padding(.top, 20)
+                .padding(.bottom, 28)
+        }
+        .frame(width: 380)
+    }
+}
+
+// ===========================================================================
 // MARK: - Shared UI helpers
 // ===========================================================================
 
 extension Int64 {
-    var human: String {
+    // Fix 13: static formatter avoids allocating a new ByteCountFormatter per call.
+    private static let humanFormatter: ByteCountFormatter = {
         let f = ByteCountFormatter()
         f.allowedUnits = [.useGB, .useMB, .useKB]
         f.countStyle = .file
-        return f.string(fromByteCount: self)
-    }
+        return f
+    }()
+    var human: String { Self.humanFormatter.string(fromByteCount: self) }
 }
 
 // ===========================================================================
@@ -2200,29 +2518,62 @@ extension Int64 {
 // ===========================================================================
 
 extension Color {
-    /// Page background — `--color-bg` (#08080B) in globals.css.
-    static let troveBg          = Color(red: 0.031, green: 0.031, blue: 0.043)
-    /// Elevated surface — `--color-bg-elev` (#0E0E12).
-    static let troveBgElev      = Color(red: 0.055, green: 0.055, blue: 0.071)
-    /// Card stroke — `rgba(255,255,255,0.08)` matches every visual's
-    /// `border-white/[0.06]` / `border-white/[0.08]` band.
-    static let troveCardStroke  = Color.white.opacity(0.08)
-    /// Card fill — translucent overlay (`rgba(255,255,255,0.035)`); pairs with
-    /// `.thinMaterial` for the Linear-style glass look.
-    static let troveCardFill    = Color.white.opacity(0.035)
-    /// Solid fallback when Reduce Transparency is on. ~`#0E0F14`.
-    static let troveCardSolid   = Color(red: 0.055, green: 0.060, blue: 0.082)
-    /// `--color-fg-dim` (#A1A1AA) for body copy.
-    static let troveFgDim       = Color(red: 0.631, green: 0.631, blue: 0.667)
-    /// `--color-fg-mute` (#71717A) for captions / hotkey labels.
-    static let troveFgMute      = Color(red: 0.443, green: 0.443, blue: 0.478)
-    /// Hairline divider — `--color-line` (#1F1F24).
-    static let troveLine        = Color(red: 0.122, green: 0.122, blue: 0.141)
-    /// Warm orange accent — `--color-accent` (#FF7A45).
+    // Helper: wraps NSColor dynamic-provider so SwiftUI Color adapts to
+    // light/dark mode automatically. Dark values match the existing tokens;
+    // light values use near-white backgrounds and near-black text.
+    private static func dynamic(
+        light: (r: CGFloat, g: CGFloat, b: CGFloat),
+        dark:  (r: CGFloat, g: CGFloat, b: CGFloat)
+    ) -> Color {
+        Color(NSColor(name: nil) { appearance in
+            let isDark = appearance.bestMatch(from: [.darkAqua, .vibrantDark]) != nil
+            let c = isDark ? dark : light
+            return NSColor(calibratedRed: c.r, green: c.g, blue: c.b, alpha: 1.0)
+        })
+    }
+
+    /// Page background — dark: #08080B / light: #F5F5F7.
+    static let troveBg = dynamic(
+        light: (r: 0.961, g: 0.961, b: 0.969),
+        dark:  (r: 0.031, g: 0.031, b: 0.043))
+    /// Elevated surface — dark: #0E0E12 / light: #FFFFFF.
+    static let troveBgElev = dynamic(
+        light: (r: 1.000, g: 1.000, b: 1.000),
+        dark:  (r: 0.055, g: 0.055, b: 0.071))
+    /// Card stroke — translucent: light uses black/8%, dark uses white/8%.
+    static let troveCardStroke  = Color(NSColor(name: nil) { a in
+        let isDark = a.bestMatch(from: [.darkAqua, .vibrantDark]) != nil
+        return isDark ? NSColor.white.withAlphaComponent(0.08)
+                      : NSColor.black.withAlphaComponent(0.08)
+    })
+    /// Card fill — translucent overlay; adapts automatically via `.thinMaterial`.
+    static let troveCardFill    = Color(NSColor(name: nil) { a in
+        let isDark = a.bestMatch(from: [.darkAqua, .vibrantDark]) != nil
+        return isDark ? NSColor.white.withAlphaComponent(0.035)
+                      : NSColor.black.withAlphaComponent(0.025)
+    })
+    /// Solid fallback when Reduce Transparency is on.
+    /// Dark: ~#0E0F14 / Light: #F0F0F5.
+    static let troveCardSolid = dynamic(
+        light: (r: 0.941, g: 0.941, b: 0.961),
+        dark:  (r: 0.055, g: 0.060, b: 0.082))
+    /// `--color-fg-dim` — dark: #A1A1AA / light: #3F3F46.
+    static let troveFgDim = dynamic(
+        light: (r: 0.247, g: 0.247, b: 0.275),
+        dark:  (r: 0.631, g: 0.631, b: 0.667))
+    /// `--color-fg-mute` — dark: #71717A / light: #71717A (same mid-grey).
+    static let troveFgMute = dynamic(
+        light: (r: 0.443, g: 0.443, b: 0.478),
+        dark:  (r: 0.443, g: 0.443, b: 0.478))
+    /// Hairline divider — dark: #1F1F24 / light: #E4E4E7.
+    static let troveLine = dynamic(
+        light: (r: 0.894, g: 0.894, b: 0.906),
+        dark:  (r: 0.122, g: 0.122, b: 0.141))
+    /// Warm orange accent — `--color-accent` (#FF7A45). Same in both modes.
     static let troveAccent      = Color(red: 1.0,   green: 0.478, blue: 0.271)
-    /// Magenta accent — `--color-accent-2` (#B27CFF).
+    /// Magenta accent — `--color-accent-2` (#B27CFF). Same in both modes.
     static let troveAccentAlt   = Color(red: 0.698, green: 0.486, blue: 1.0)
-    /// Sky accent — `--color-accent-3` (#4CB8FF).
+    /// Sky accent — `--color-accent-3` (#4CB8FF). Same in both modes.
     static let troveAccentSky   = Color(red: 0.298, green: 0.722, blue: 1.0)
 }
 
@@ -2466,7 +2817,8 @@ enum ClipboardReader {
             }
         }
 
-        if let urls = pb.readObjects(forClasses: [NSURL.self]) as? [URL], !urls.isEmpty {
+        // Fix 7: cap URL count to prevent OOM from adversarial pasteboard.
+        if let urls = (pb.readObjects(forClasses: [NSURL.self]) as? [URL])?.prefix(500).map({ $0 }), !urls.isEmpty {
             return .files(urls)
         }
         // Pre-decode size guard: probe raw bytes before allocating NSImage (defense-in-depth below).
@@ -2697,6 +3049,15 @@ final class Stage: ObservableObject {
                 NSApp.activate(ignoringOtherApps: true)
                 if FileManager.default.fileExists(atPath: url.path) {
                     self.items.append(StagedItem(kind: .image(url)))
+                } else if !CGPreflightScreenCaptureAccess() {
+                    // R5 fix #18: screencapture exits 0 with no file when Screen
+                    // Recording is denied — surface the TCC deep-link instead of
+                    // silently doing nothing. Mirrors snip.swift:394.
+                    self.flash("Screen Recording permission required",
+                               kind: .warning,
+                               actionLabel: "Open Settings") {
+                        TCCDeepLink.screenRecording.open()
+                    }
                 }
                 InteractiveCaptureGate.release()
             }
@@ -2874,24 +3235,27 @@ struct StageView: View {
         }
     }
     func handleDrop(_ providers: [NSItemProvider]) {
-        for p in providers {
+        // Fix 6: cap provider count to avoid OOM from adversarial drag payloads.
+        for p in providers.prefix(500) {
             if p.canLoadObject(ofClass: URL.self) {
                 _ = p.loadObject(ofClass: URL.self) { obj, _ in
-                    if let u = obj { DispatchQueue.main.async { stage.addFile(u) } }
+                    // Fix 8: reject non-regular-file URLs (e.g. /dev/urandom) before staging.
+                    guard let u = obj,
+                          (try? u.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+                    else { return }
+                    DispatchQueue.main.async { stage.addFile(u) }
                 }
-            } else if p.canLoadObject(ofClass: NSImage.self) {
-                _ = p.loadObject(ofClass: NSImage.self) { obj, _ in
-                    guard let img = obj as? NSImage else { return }
-                    let maxBytes = 100 * 1024 * 1024
-                    if let bytes = img.tiffRepresentation?.count, bytes > maxBytes {
-                        NSLog("Trove: dropped dropped image (%.1f MB) — exceeds 100 MB limit", Double(bytes) / 1_048_576)
-                        return
-                    }
+            } else if p.hasItemConformingToTypeIdentifier("public.image") {
+                // Fix 6: check data size BEFORE instantiating NSImage to avoid OOM.
+                _ = p.loadDataRepresentation(forTypeIdentifier: "public.image") { data, _ in
+                    guard let data, data.count <= 100_000_000,
+                          let img = NSImage(data: data) else { return }
                     DispatchQueue.main.async { stage.addImage(img) }
                 }
             } else if p.canLoadObject(ofClass: NSString.self) {
                 _ = p.loadObject(ofClass: NSString.self) { obj, _ in
-                    if let s = obj as? String { DispatchQueue.main.async { stage.addText(s) } }
+                    guard let s = obj as? String, s.utf8.count <= 5_000_000 else { return }
+                    DispatchQueue.main.async { stage.addText(s) }
                 }
             }
         }
@@ -3398,11 +3762,14 @@ func troveExpandFolders(_ urls: [URL],
         var isDir: ObjCBool = false
         if fm.fileExists(atPath: u.path, isDirectory: &isDir), isDir.boolValue {
             guard let it = fm.enumerator(at: u,
-                                          includingPropertiesForKeys: [.isRegularFileKey],
+                                          includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
                                           options: [.skipsHiddenFiles, .skipsPackageDescendants])
             else { continue }
             while let child = it.nextObject() as? URL {
                 if out.count >= cap { return out }
+                // red-team-sec: skip symlinks — following /tmp/evil→/dev/urandom
+                // would let file_hash / rename reach blocked device paths.
+                if (try? child.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true { continue }
                 let ext = child.pathExtension.lowercased()
                 if let allowed = allowedExtensions, !allowed.contains(ext) { continue }
                 if (try? child.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
@@ -3523,9 +3890,11 @@ struct SizedRow: View {
 // ===========================================================================
 
 struct OverviewView: View {
-    @State private var disk: DiskInfo = StorageCache.shared.loadedOverview()?.0 ?? DiskInfo.fetch()
-    @State private var topHome: [SizedItem] = StorageCache.shared.loadedOverview()?.1 ?? []
-    @State private var cachedAt: Date? = StorageCache.shared.loadedOverview()?.2
+    // Seed empty/zero so body paints immediately without blocking the main thread.
+    // Cached values are patched in from .task on first appear.
+    @State private var disk: DiskInfo = DiskInfo(total: 0, free: 0)
+    @State private var topHome: [SizedItem] = []
+    @State private var cachedAt: Date? = nil
     @State private var loading = false
 
     var body: some View {
@@ -3614,6 +3983,16 @@ struct OverviewView: View {
                 }
                 .disabled(loading)
                 .keyboardShortcut("r", modifiers: .command)
+            }
+        }
+        // Load cached overview off-main on first appear; DiskInfo.fetch() calls
+        // resourceValues which can block on slow/network volumes.
+        .task {
+            if let cached = StorageCache.shared.loadedOverview() {
+                disk = cached.0; topHome = cached.1; cachedAt = cached.2
+            } else {
+                let fetched = await Task.detached { DiskInfo.fetch() }.value
+                await MainActor.run { disk = fetched }
             }
         }
         // No auto-scan. Walking ~/* trips macOS TCC for Downloads / Documents /

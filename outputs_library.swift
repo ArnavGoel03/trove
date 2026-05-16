@@ -285,8 +285,9 @@ final class OutputsLibrary: ObservableObject {
                 return Self.groupByProducer(vis)
             }
             .receive(on: RunLoop.main)
-            .assign(to: \.groupedVisible, on: self)
-            .store(in: &cancellables)
+            // Use the `assign(to:)` Published form — it does NOT retain self,
+            // breaking the retain cycle that `.assign(to:on:).store(in:)` creates.
+            .assign(to: &$groupedVisible)
     }
 
     /// Mirror of `OutputsLibraryView.group(_:)` so the store can drive

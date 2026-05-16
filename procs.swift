@@ -44,6 +44,9 @@ enum ProcSampler {
         p.standardOutput = out
         p.standardError = Pipe()
         do { try p.run() } catch { return [] }
+        // R5 fix #20: close the read handle after consuming data to prevent
+        // leaking an FD per sample tick.
+        defer { try? out.fileHandleForReading.close() }
         let data = out.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExitOffMain()
         guard let s = String(data: data, encoding: .utf8) else { return [] }
@@ -109,6 +112,8 @@ enum ProcSampler {
 @MainActor
 final class ProcRow: Identifiable, ObservableObject {
     let pid: Int32
+    // Fix 22: nonisolated id so Identifiable works across actor boundaries.
+    nonisolated var id: Int32 { pid }
     @Published var ppid: Int32
     @Published var comm: String
     @Published var args: String
@@ -121,7 +126,6 @@ final class ProcRow: Identifiable, ObservableObject {
     /// property (not @Published) — UI doesn't need to redraw on a cache fill.
     fileprivate var _blacklistCache: (commVersion: String, value: Bool)? = nil
 
-    var id: Int32 { pid }
 
     init(_ s: ProcSample) {
         self.pid = s.pid
@@ -158,7 +162,8 @@ struct ProcGroup: Identifiable {
     let primary: ProcRow
     let children: [ProcRow]  // does not include `primary`
 
-    var id: String { key }
+    // Fix 22: nonisolated so Identifiable works across actor boundaries.
+    nonisolated var id: String { key }
     var totalCPU: Double { primary.cpu + children.reduce(0) { $0 + $1.cpu } }
     var totalRSS: Int64 { primary.rssBytes + children.reduce(0) { $0 + $1.rssBytes } }
     var count: Int { 1 + children.count }
@@ -225,9 +230,23 @@ final class ProcModel: ObservableObject {
     /// the latest. Red-team #4: if user pauses mid-flight, we check this
     /// after the detached sample returns and discard the result if stale.
     private var generation: UInt64 = 0
+    private var wakeObserver: NSObjectProtocol? = nil
 
     func start() {
         guard tickTask == nil else { return }
+        // Bump generation on wake so in-flight samples from before sleep are
+        // discarded on return — prevents stale CPU% from a pre-sleep `ps` call
+        // from merging with freshly-awoken rows.
+        if wakeObserver == nil {
+            wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                // Fix 21: hop to MainActor to satisfy Swift 6 Sendable-closure isolation.
+                Task { @MainActor [weak self] in
+                    self?.generation &+= 1
+                }
+            }
+        }
         tickTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.tick()
@@ -249,6 +268,10 @@ final class ProcModel: ObservableObject {
         tickTask?.cancel(); tickTask = nil
         sampleTask?.cancel(); sampleTask = nil
         generation &+= 1
+        if let o = wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(o)
+            wakeObserver = nil
+        }
     }
 
     /// One sampling pass: shell out off-main, merge into `rows`, regroup.
@@ -607,8 +630,8 @@ struct ProcRowView: View {
             .buttonStyle(.borderless)
             .disabled(blacklisted)
             .help(blacklisted
-                  ? "System process — refusing to kill"
-                  : "Send SIGTERM to \(row.pid). Escalates to SIGKILL if it lingers.")
+                  ? "System process — refusing to quit"
+                  : "Quit \(row.comm). Force-quits if it doesn't respond.")
         }
         .padding(.vertical, 4)
         .contentShape(Rectangle())
@@ -650,8 +673,8 @@ public struct ProcView: View {
         }
         .alert(item: $pendingKill) { tgt in
             Alert(
-                title: Text("Force kill \(procDisplayName(tgt.row))?"),
-                message: Text("It didn't exit after SIGTERM. Send SIGKILL (kill -9, PID \(tgt.row.pid))?\(tgt.needsAdmin ? "\n\nThis process is owned by another user; macOS will prompt for an admin password." : "")"),
+                title: Text("Force-quit \(procDisplayName(tgt.row))?"),
+                message: Text("It didn't respond to the quit request. Force-quit \(procDisplayName(tgt.row))?\(tgt.needsAdmin ? "\n\nThis process is owned by another user; macOS will prompt for an admin password." : "")"),
                 primaryButton: .destructive(Text("Force Kill")) {
                     Task { await escalate(tgt) }
                 },
@@ -795,18 +818,18 @@ public struct ProcView: View {
             return
         }
         let name = procDisplayName(row)
-        killStatus = "Sending SIGTERM to \(name) (\(row.pid))…"
+        killStatus = "Asking \(name) to quit…"
         let res = procSendSignal(row.pid, SIGTERM)
         switch res {
         case .alreadyGone:
-            killStatus = "\(name) (\(row.pid)) already exited."
+            killStatus = "\(name) already exited."
             return
         case .permissionDenied:
-            // Skip SIGTERM and offer the admin-escalated SIGKILL directly.
+            // Skip graceful quit and offer admin force-quit directly.
             pendingKill = ProcKillTarget(row: row, needsAdmin: true)
             return
         case .otherError(let e):
-            killStatus = "kill \(row.pid): \(e)"
+            killStatus = "Couldn't quit \(name): \(e)"
             return
         case .sent:
             break
@@ -833,7 +856,7 @@ public struct ProcView: View {
         case .sent:
             // Brief recheck — SIGKILL is uncatchable, should be ~immediate.
             let gone = await procWaitForExit(tgt.row.pid, timeout: 1.0)
-            killStatus = gone ? "\(name) force-killed." : "Sent SIGKILL to \(name); awaiting exit."
+            killStatus = gone ? "\(name) force-quit." : "Force-quit sent to \(name); waiting for exit."
         case .alreadyGone:
             killStatus = "\(name) already exited."
         case .permissionDenied:
@@ -841,7 +864,7 @@ public struct ProcView: View {
             killStatus = "Permission denied. Retry with administrator privileges."
             pendingKill = ProcKillTarget(row: tgt.row, needsAdmin: true)
         case .otherError(let e):
-            killStatus = "kill -9 \(tgt.row.pid): \(e)"
+            killStatus = "Couldn't force-quit \(name): \(e)"
         }
     }
 }

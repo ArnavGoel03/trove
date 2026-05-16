@@ -788,6 +788,13 @@ final class BigScanCache {
     private func loadOrQuarantine() {
         let fm = FileManager.default
         guard fm.fileExists(atPath: fileURL.path) else { return }
+        // security: reject oversized cache files to prevent OOM — 32 MB cap
+        // mirrors storage_cache.swift:183.
+        let maxCacheBytes = 32 * 1024 * 1024
+        if let attrs = try? fm.attributesOfItem(atPath: fileURL.path),
+           let sz = attrs[.size] as? NSNumber, sz.intValue > maxCacheBytes {
+            quarantine("oversized (\(sz.intValue) bytes)"); return
+        }
         do {
             let data = try Data(contentsOf: fileURL)
             let dec = JSONDecoder()
@@ -1281,7 +1288,7 @@ public struct BigScanView: View {
                             .foregroundStyle(.tertiary)
                         Text("No scan yet")
                             .font(.headline)
-                        Text("Big Scan walks the folder above and surfaces what's actually eating disk — top hogs by size, oldest files, duplicates, and per-category totals. Time Machine snapshots and TCC-walled directories are flagged separately.")
+                        Text("Big Scan walks the folder above and surfaces what's actually eating disk — top hogs by size, oldest files, duplicates, and per-category totals. Time Machine snapshots and privacy-protected folders are flagged separately.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: 420)
@@ -1324,7 +1331,7 @@ public struct BigScanView: View {
         let max = kids.first?.size ?? 1
         return VStack(alignment: .leading, spacing: 4) {
             if kids.isEmpty {
-                Text("No entries (empty folder, or everything was TCC-walled/inaccessible).")
+                Text("No entries (empty folder, or macOS blocked access to everything here).")
                     .foregroundStyle(.secondary).font(.callout)
             } else {
                 ForEach(kids) { c in

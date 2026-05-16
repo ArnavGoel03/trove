@@ -90,15 +90,27 @@ final class SnippetStore: ObservableObject {
     // Fix 13: `visible` is now @Published, populated on snippets/search changes.
     var snippets: [Snippet] = [] {
         willSet { objectWillChange.send() }
-        didSet  { recomputeVisible() }
+        didSet  { scheduleRecomputeVisible() }
     }
     var search: String = "" {
         willSet { objectWillChange.send() }
-        didSet  { recomputeVisible() }
+        didSet  { scheduleRecomputeVisible() }
     }
     /// Surface load errors visually without blocking startup.
     @Published var lastErrorMessage: String? = nil
     @Published private(set) var visible: [Snippet] = []
+
+    // Fix 14: 50 ms debounce so rapid keystrokes don't filter on every character.
+    private var recomputeTask: Task<Void, Never>?
+
+    private func scheduleRecomputeVisible() {
+        recomputeTask?.cancel()
+        recomputeTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(50))
+            guard !Task.isCancelled else { return }
+            recomputeVisible()
+        }
+    }
 
     private func recomputeVisible() {
         let q = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()

@@ -46,7 +46,7 @@ enum NetSamplerError: Error, CustomStringConvertible {
     case noOutput
     var description: String {
         switch self {
-        case .notInstalled:      return "/usr/bin/nettop is not present on this system. Install the Xcode Command Line Tools (`xcode-select --install`) or upgrade macOS."
+        case .notInstalled:      return "/usr/bin/nettop is not present on this system. Try upgrading macOS."
         case .launchFailed(let s): return "nettop failed: \(s)"
         case .noOutput:          return "nettop returned no rows (check that the Network pane has TCC traffic-sampling rights, or try again — macOS occasionally needs a warm-up tick)."
         }
@@ -131,6 +131,9 @@ enum NetSampler {
         // the wait so we never hang the sampler.
         _ = drainGroup.wait(timeout: .now() + 0.5)
         outPipe.fileHandleForReading.readabilityHandler = nil
+        // R5 fix #19: nil the errPipe handler too — on the success path it was
+        // left alive, leaking a file descriptor per sample tick.
+        errPipe.fileHandleForReading.readabilityHandler = nil
 
         let s = String(data: box.snapshot(), encoding: .utf8) ?? ""
         let rows = parse(s)
@@ -254,6 +257,8 @@ enum NetDirection: String, CaseIterable, Identifiable {
 @MainActor
 final class NetRow: Identifiable, ObservableObject {
     let pid: Int32
+    // Fix 22: nonisolated id so Identifiable conformance works across actor boundaries.
+    nonisolated var id: Int32 { pid }
     @Published var name: String
 
     // Cumulative bytes as reported by nettop on the most recent tick.
@@ -277,7 +282,6 @@ final class NetRow: Identifiable, ObservableObject {
     // rows after 30s of silence (red-team #5).
     @Published var lastSeen: Date = .now
 
-    var id: Int32 { pid }
     var totalIn:  Int64 { max(0, cumIn  - baseIn)  }
     var totalOut: Int64 { max(0, cumOut - baseOut) }
     var sumRate:  Double { rateIn + rateOut }
@@ -351,7 +355,8 @@ struct NetGroup: Identifiable {
     let bundlePath: String?
     let primary: NetRow            // chosen by max sumRate for icon/pid display
     let members: [NetRow]
-    var id: String { key }
+    // Fix 22: nonisolated so Identifiable works across actor boundaries.
+    nonisolated var id: String { key }
 
     // red-team: NetRow is @MainActor; computed reducers must run main-actor too.
     var rateIn:  Double { members.reduce(0) { $0 + $1.rateIn  } }
@@ -392,6 +397,7 @@ final class NetModel: ObservableObject {
     /// result is discarded instead of being merged with mismatched dt.
     private var generation: UInt64 = 0
     private var lastTickAt: Date? = nil
+    private var wakeObserver: NSObjectProtocol? = nil
 
     func start() {
         // Early sanity — surface "nettop not installed" without waiting for
@@ -403,6 +409,19 @@ final class NetModel: ObservableObject {
         }
         hasNettop = true
         guard tickTask == nil else { return }
+        // Reset lastTickAt on wake so the first post-wake dt isn't "8 hours"
+        // which produces a massive spurious rate spike.
+        if wakeObserver == nil {
+            wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                // Fix 20: hop to MainActor to satisfy Swift 6 Sendable-closure isolation.
+                Task { @MainActor [weak self] in
+                    self?.lastTickAt = nil
+                    self?.generation &+= 1
+                }
+            }
+        }
         tickTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.tick()
@@ -432,6 +451,10 @@ final class NetModel: ObservableObject {
         groups.removeAll(keepingCapacity: false)
         csvBuffer.removeAll(keepingCapacity: false)
         lastTickAt = nil
+        if let o = wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(o)
+            wakeObserver = nil
+        }
     }
 
     func bumpGeneration() { generation &+= 1 }
@@ -751,12 +774,15 @@ final class NetIconCache {
 extension Double {
     /// Bytes-per-second → human ("12.4 MB/s"). Distinct from Int64.human
     /// (in main.swift) which is for absolute byte counts.
-    var humanRate: String {
+    // Fix 13: static formatter avoids per-call allocation.
+    private static let rateFormatter: ByteCountFormatter = {
         let f = ByteCountFormatter()
         f.allowedUnits = [.useGB, .useMB, .useKB, .useBytes]
         f.countStyle = .file
-        let s = f.string(fromByteCount: Int64(self))
-        return "\(s)/s"
+        return f
+    }()
+    var humanRate: String {
+        "\(Self.rateFormatter.string(fromByteCount: Int64(self)))/s"
     }
 }
 

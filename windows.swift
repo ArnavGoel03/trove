@@ -540,7 +540,8 @@ enum WinSnapEngine {
                 return "\(displayName): refused (AX \(err.rawValue))"
             }
             if i < steps {
-                try? await Task.sleep(nanoseconds: UInt64(stepMs * 1_000_000))
+                // Fix 31: use typed duration to avoid silent overflow on large stepMs.
+                try? await Task.sleep(for: .milliseconds(stepMs))
             }
         }
         return "\(displayName): snapped"

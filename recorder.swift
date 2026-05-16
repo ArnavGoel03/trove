@@ -37,6 +37,7 @@ import ScreenCaptureKit
 import CoreMedia
 import Foundation
 import UniformTypeIdentifiers
+import IOKit.pwr_mgt
 
 // ===========================================================================
 // MARK: - Presets, sources, errors
@@ -411,6 +412,9 @@ final class RecEngine: NSObject, ObservableObject {
     private var accumulated: TimeInterval = 0
     private var tickTimer: Timer?
 
+    // ---- IOPMAssertion (prevent system sleep during recording) --------------
+    private var pmAssertionID: IOPMAssertionID = IOPMAssertionID(0)
+
     // red-team: tokens for willTerminate / willSleep / screens-changed.
     // willTerminate: finalize a recording in progress so the user gets a
     //   playable mp4 instead of an orphaned .tmp.mp4.
@@ -472,6 +476,11 @@ final class RecEngine: NSObject, ObservableObject {
         micOutput  = nil
         stream?.stopCapture(completionHandler: { _ in })
         stream = nil
+        // Release any lingering IOPMAssertion on dealloc (should already be
+        // released in stop(), but guard double-release here too).
+        if pmAssertionID != IOPMAssertionID(0) {
+            IOPMAssertionRelease(pmAssertionID)
+        }
     }
 
     // =========================================================================
@@ -710,6 +719,15 @@ final class RecEngine: NSObject, ObservableObject {
         self.isPaused    = false
         self.startWall   = Date()
         startTickTimer()
+        // Prevent system sleep during recording — SCStream and AVAssetWriter
+        // don't survive a multi-hour suspend reliably (red-team #8).
+        if pmAssertionID == IOPMAssertionID(0) {
+            IOPMAssertionCreateWithName(
+                kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
+                IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                "Trove recording in progress" as CFString,
+                &pmAssertionID)
+        }
     }
 
     /// Pause. SCStream stays alive but we stop appending samples to the
@@ -774,6 +792,12 @@ final class RecEngine: NSObject, ObservableObject {
                     }
                     try FileManager.default.moveItem(at: tmp, to: dest)
                     self.lastOutputURL = dest
+                    OutputsLibrary.shared.record(
+                        url: dest,
+                        producer: "recorder",
+                        sourceLabel: dest.lastPathComponent,
+                        kind: "video"
+                    )
                 } catch {
                     self.lastError = .other("Finalize failed: \(error.localizedDescription)")
                     self.lastOutputURL = tempURL
@@ -798,6 +822,11 @@ final class RecEngine: NSObject, ObservableObject {
         teardownMicrophoneSession()
         // red-team: clear finalize latch so a future start/stop cycle works
         self.isFinalizing = false
+        // Release IOPMAssertion now that recording has ended.
+        if pmAssertionID != IOPMAssertionID(0) {
+            IOPMAssertionRelease(pmAssertionID)
+            pmAssertionID = IOPMAssertionID(0)
+        }
     }
 
     // =========================================================================

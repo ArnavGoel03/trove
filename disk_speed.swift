@@ -11,6 +11,7 @@ import AppKit
 import Foundation
 import Darwin
 import UniformTypeIdentifiers
+import IOKit.pwr_mgt
 
 // ===========================================================================
 // MARK: - Constants + helpers
@@ -58,7 +59,7 @@ private enum DiskSpeedError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .openFailed(let s):       return "Open failed: \(s)"
-        case .nocacheFailed(let e):    return "F_NOCACHE failed (errno \(e))"
+        case .nocacheFailed(let e):    return "Couldn't configure the test file (system error \(e)) — try again."
         case .writeFailed(let s):      return "Write failed: \(s)"
         case .readFailed(let s):       return "Read failed: \(s)"
         case .diskFull:                return "Disk full — wrote less than requested"
@@ -67,7 +68,7 @@ private enum DiskSpeedError: Error, LocalizedError {
         case .readOnly:                return "Volume is read-only"
         case .cancelled:               return "Cancelled"
         case .insufficientSpace(let f, let r):
-            return "Need ≤50% of free space — free is \(f) MiB, blob is \(r) MiB"
+            return "Need ≤50% of free space — \(f) MB free, test file is \(r) MB"
         }
     }
 }
@@ -552,6 +553,9 @@ final class DiskSpeedViewModel: ObservableObject {
     // `cancelFlagBox`, replaced per-run by `start()`. Keeping a stale, never
     // cancelled flag around was a footgun for whoever next added IO code.
     private var willTerminateObserver: NSObjectProtocol?
+    private var willSleepObserver: NSObjectProtocol?
+    // IOPMAssertion: prevent system sleep during a benchmark run.
+    private var pmAssertionID: IOPMAssertionID = IOPMAssertionID(0)
 
     init() {
         // Both `purgeOrphanedScratchOnLaunch` and `refreshVolumes` iterate
@@ -576,10 +580,33 @@ final class DiskSpeedViewModel: ObservableObject {
         ) { _ in
             DiskSpeedScratchRegistry.purgeAll()
         }
+        // Cancel/finalize an in-flight benchmark before the Mac sleeps so an
+        // 8-hour suspend doesn't leave a stale IO task running across wake.
+        willSleepObserver = NotificationCenter.default.addObserver(
+            forName: .troveSystemWillSleep, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.cancelForSleep()
+        }
+    }
+
+    /// Cancels the active benchmark on sleep. Mirrors `cancelScanForSleep` in BigScan.
+    private func cancelForSleep() {
+        guard running else { return }
+        task?.cancel()
+        cancelFlagBox.cancel()
+        running = false
+        liveMessage = "Benchmark cancelled — Mac going to sleep."
+        if pmAssertionID != IOPMAssertionID(0) {
+            IOPMAssertionRelease(pmAssertionID)
+            pmAssertionID = IOPMAssertionID(0)
+        }
     }
 
     deinit {
         if let o = willTerminateObserver {
+            NotificationCenter.default.removeObserver(o)
+        }
+        if let o = willSleepObserver {
             NotificationCenter.default.removeObserver(o)
         }
         // red-team: belt-and-suspenders — if the VM is dropped while a run is
@@ -627,6 +654,15 @@ final class DiskSpeedViewModel: ObservableObject {
         }
         running = true
         errorMessage = nil
+        // Prevent system sleep while the benchmark is running — a sleep mid-
+        // benchmark produces bogus latency numbers and can corrupt scratch blobs.
+        if pmAssertionID == IOPMAssertionID(0) {
+            IOPMAssertionCreateWithName(
+                kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
+                IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                "Trove disk benchmark in progress" as CFString,
+                &pmAssertionID)
+        }
         let mib = clampedBlobMiB()
         // red-team: race fix — install the new cancelFlagBox BEFORE launching
         // the detached task. Previously the box was assigned after Task
@@ -675,6 +711,11 @@ final class DiskSpeedViewModel: ObservableObject {
                 self.stageProgress = 0
                 self.overallProgress = 0
                 self.etaSeconds = nil
+                // Release IOPMAssertion now that the benchmark has ended.
+                if self.pmAssertionID != IOPMAssertionID(0) {
+                    IOPMAssertionRelease(self.pmAssertionID)
+                    self.pmAssertionID = IOPMAssertionID(0)
+                }
             }
         }
 

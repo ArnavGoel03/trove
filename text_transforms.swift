@@ -779,8 +779,10 @@ final class XformModel: ObservableObject {
     private var revision: UInt64 = 0
 
     /// Size thresholds — warn at 1 MB, refuse at 50 MB. Matches the spec.
-    static let warnBytes: Int = 1_000_000
-    static let refuseBytes: Int = 50_000_000
+    /// `nonisolated` so XformEngine.run (nonisolated) can read them without
+    /// a Swift 6 actor-isolation error.
+    nonisolated static let warnBytes: Int = 1_000_000
+    nonisolated static let refuseBytes: Int = 50_000_000
 
     init() {}
 
@@ -1406,6 +1408,7 @@ struct XformChipRow: View {
                     XformStepParamEditor(model: model, step: step)
                         .padding(14)
                         .frame(width: 320)
+                        .onExitCommand { showParamPopover = false }
                 }
             }
             Button { model.removeStep(id: step.id) } label: {

@@ -39,6 +39,11 @@ enum FinderShell {
             return Result(stdout: "", stderr: "launch failed: \(error)", code: -1)
         }
         task.waitUntilExitOffMain()
+        // R5 fix #21: close pipe read handles after consuming data.
+        defer {
+            outPipe.fileHandleForReading.closeFile()
+            errPipe.fileHandleForReading.closeFile()
+        }
         let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(),
                          encoding: .utf8) ?? ""
         let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(),

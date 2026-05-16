@@ -223,19 +223,36 @@ final class UpdateChecker: ObservableObject {
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         req.setValue("Trove/\(Self.currentVersion() ?? "dev")", forHTTPHeaderField: "User-Agent")
 
-        var hitRateLimit = false
+        var suppressStamp = false
         do {
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            // Use download(for:) so the response streams to a temp file instead
+            // of accumulating the full body in memory before the size cap fires.
+            let (tmpURL, resp) = try await URLSession.shared.download(for: req)
+            defer { try? FileManager.default.removeItem(at: tmpURL) }
             // Hard cap: GitHub's /releases/latest payload is ~5-15 KB. The
             // full /releases list with 100 entries is ~1-3 MB. Anything
-            // bigger than 4 MB is either a mistake or hostile — refuse to
-            // hold it in memory.
-            guard data.count <= 4 * 1024 * 1024 else {
+            // bigger than 4 MB is either a mistake or hostile — refuse to load.
+            let fileSize = (try? tmpURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            guard fileSize <= 4 * 1024 * 1024 else {
                 await markUpToDate()
                 return
             }
-            hitRateLimit = (resp as? HTTPURLResponse)?.statusCode == 403
-            await ingest(data: data, response: resp, quiet: quiet)
+            guard let data = try? Data(contentsOf: tmpURL) else {
+                await markUpToDate()
+                return
+            }
+            let statusCode = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            // Fix 12: also suppress on 429 (rate limit) and captive-portal HTML responses.
+            let mimeType = (resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type") ?? ""
+            let isCaptivePortal = statusCode == 200 && mimeType.hasPrefix("text/html")
+            suppressStamp = (statusCode == 403) || (statusCode == 429)
+                || (500..<600).contains(statusCode) || isCaptivePortal
+            if isCaptivePortal {
+                // Don't ingest HTML as JSON.
+                await markUpToDate()
+            } else {
+                await ingest(data: data, response: resp, quiet: quiet)
+            }
         } catch {
             // DNS, timeout, offline, certificate errors — silently degrade.
             if quiet {
@@ -245,9 +262,7 @@ final class UpdateChecker: ObservableObject {
                 await clearAvailable()
             }
         }
-        // Don't stamp the 6h cooldown on rate-limit — the limit usually
-        // resets in 15-60min and we want a fresh attempt sooner.
-        if !hitRateLimit { stampCheck() }
+        if !suppressStamp { stampCheck() }
     }
 
     // -----------------------------------------------------------------------
@@ -451,6 +466,8 @@ struct UpdateCheckerCard: View {
                         Spacer(minLength: 8)
                         Button("Download") {
                             if let s = info.preferredDownloadURL, let url = URL(string: s) {
+                                // Fix 10: only open https URLs — reject file://, javascript://, etc.
+                                guard url.scheme == "https" else { return }
                                 NSWorkspace.shared.open(url)
                             }
                         }

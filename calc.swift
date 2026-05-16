@@ -130,8 +130,24 @@ struct CalcRateCache: Codable {
     /// Load whatever's on disk. Returns nil if file missing or unreadable —
     /// callers fall back to `.fallback`.
     static func loadFromDisk() -> CalcRateCache? {
+        // security: cap exchange.json at 256 KB to prevent a crafted/swapped
+        // file from causing an OOM during startup.
+        let maxBytes = 256 * 1024
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+           let sz = attrs[.size] as? NSNumber, sz.intValue > maxBytes {
+            return nil
+        }
         guard let data = try? Data(contentsOf: fileURL) else { return nil }
-        return try? JSONDecoder().decode(CalcRateCache.self, from: data)
+        // Fix 4: quarantine corrupt exchange.json rather than silently re-reading it forever.
+        do {
+            return try JSONDecoder().decode(CalcRateCache.self, from: data)
+        } catch {
+            let ts = Int(Date().timeIntervalSince1970)
+            let corrupt = fileURL.deletingLastPathComponent()
+                .appendingPathComponent("exchange-corrupt-\(ts).json")
+            try? FileManager.default.moveItem(at: fileURL, to: corrupt)
+            return nil
+        }
     }
 
     /// Atomic write: write to a sibling .tmp then rename. If the encode or
@@ -140,11 +156,17 @@ struct CalcRateCache: Codable {
     func saveToDisk() {
         guard let data = try? JSONEncoder().encode(self) else { return }
         let target = Self.fileURL
-        let tmp = target.appendingPathExtension("tmp")
+        // Fix 5: use UUID-suffixed tmp name to avoid races with concurrent writes.
+        let tmp = target.deletingLastPathComponent()
+            .appendingPathComponent(".exchange-\(UUID().uuidString.prefix(8)).tmp")
         do {
             try data.write(to: tmp, options: .atomic)
-            // FileManager.replaceItemAt does the safe rename across volumes.
-            _ = try FileManager.default.replaceItemAt(target, withItemAt: tmp)
+            // Fix 3: replaceItemAt requires destination to exist; fall back to moveItem on first write.
+            if FileManager.default.fileExists(atPath: target.path) {
+                _ = try FileManager.default.replaceItemAt(target, withItemAt: tmp)
+            } else {
+                try FileManager.default.moveItem(at: tmp, to: target)
+            }
         } catch {
             // Best-effort cleanup of the tmp; don't surface the error.
             try? FileManager.default.removeItem(at: tmp)
@@ -269,6 +291,9 @@ final class CalcRateStore: ObservableObject {
             guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                 return nil
             }
+            // red-team: ECB XML feed is <10 KB. Cap at 256 KB to refuse a
+            // hostile/unexpected oversized response before parsing.
+            guard data.count <= 256 * 1024 else { return nil }
             let parser = CalcECBParser()
             guard let rates = parser.parse(data) else { return nil }
             // red-team: ECB doesn't ship every currency in our fallback table

@@ -791,7 +791,7 @@ final class RenameViewModel: ObservableObject {
                 isApplying = false
                 var msg = "Apply failed at \"\(failedAt)\"; rolled back \(doneSoFar.count - rollbackFailures.count) of \(doneSoFar.count) prior renames. \(error.localizedDescription)"
                 if !rollbackFailures.isEmpty {
-                    msg += " · ROLLBACK INCOMPLETE: \(rollbackFailures.joined(separator: ", "))"
+                    msg += " · Undo incomplete — these files were not restored: \(rollbackFailures.joined(separator: ", "))"
                 }
                 globalError = msg
                 return

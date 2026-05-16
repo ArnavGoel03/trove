@@ -476,6 +476,13 @@ final class OCRViewModel: ObservableObject {
 
     let history = OCRHistoryStore()
 
+    /// Tracked so we can cancel on disappear and avoid [strong self] cycles.
+    private var recognitionTask: Task<Void, Never>?
+
+    deinit {
+        recognitionTask?.cancel()
+    }
+
     init() {
         // red-team: if the user is currently viewing the entry that's about
         // to be evicted (either by overflow or manual remove), wipe the main
@@ -527,7 +534,8 @@ final class OCRViewModel: ObservableObject {
             self.recognition = nil
             self.translatedText = ""
             self.working = true
-            Task { await self.runRecognition(url: url) }
+            recognitionTask?.cancel()
+            recognitionTask = Task { [weak self] in await self?.runRecognition(url: url) }
         }
     }
 
@@ -1061,6 +1069,12 @@ public struct OCRView: View {
                 try text.write(to: dest, atomically: true, encoding: .utf8)
                 NSWorkspace.shared.activateFileViewerSelecting([dest])
                 SharedStore.stage.flash("Saved \(kind.label) to \(dest.deletingLastPathComponent().lastPathComponent)")
+                OutputsLibrary.shared.record(
+                    url: dest,
+                    producer: "ocr.capture",
+                    sourceLabel: kind.label,
+                    kind: "text"
+                )
             } catch {
                 SharedStore.stage.flash("Save failed: \(error.localizedDescription)")
             }
@@ -1079,6 +1093,12 @@ public struct OCRView: View {
             try text.write(to: dest, atomically: true, encoding: .utf8)
             NSWorkspace.shared.activateFileViewerSelecting([dest])
             SharedStore.stage.flash("Saved \(kind.label) to Downloads")
+            OutputsLibrary.shared.record(
+                url: dest,
+                producer: "ocr.capture",
+                sourceLabel: kind.label,
+                kind: "text"
+            )
         } catch {
             SharedStore.stage.flash("Save failed: \(error.localizedDescription)")
         }

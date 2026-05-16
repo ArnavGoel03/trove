@@ -87,7 +87,10 @@ final class CutPasteController: ObservableObject {
     // CutPasteController is a singleton so deinit is unreachable in production,
     // but pairing addObserver with removeObserver is required for correctness
     // and test-harness safety (tests may instantiate multiple instances).
-    deinit { NotificationCenter.default.removeObserver(self) }
+    deinit {
+        NotificationCenter.default.removeObserver(self,
+            name: NSApplication.willTerminateNotification, object: nil)
+    }
 
     // -----------------------------------------------------------------------
     // Enable / disable the global event tap.
@@ -454,19 +457,24 @@ final class CutPasteController: ObservableObject {
 
 enum CutPasteFinderBridge {
     static func selection() -> [URL] {
+        // Fix 9: use NUL-byte sentinel to safely handle filenames containing newlines.
+        // Also cap iteration at 5000 items to avoid 10 MB truncation of AppleScript output.
         let src = """
         tell application "Finder"
             set sel to selection
             set out to {}
+            set iterCount to 0
             repeat with i in sel
+                set iterCount to iterCount + 1
+                if iterCount > 5000 then exit repeat
                 set end of out to (POSIX path of (i as alias))
             end repeat
-            set AppleScript's text item delimiters to linefeed
+            set AppleScript's text item delimiters to (ASCII character 0)
             return out as text
         end tell
         """
         guard let text = runAppleScript(src), !text.isEmpty else { return [] }
-        return text.split(separator: "\n", omittingEmptySubsequences: true).map {
+        return text.split(separator: "\u{0}", omittingEmptySubsequences: true).map {
             URL(fileURLWithPath: String($0))
         }
     }
