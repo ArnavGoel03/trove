@@ -3360,11 +3360,20 @@ final class Stage: ObservableObject {
             try png.write(to: url)
             items.append(StagedItem(kind: .image(url)))
             enforceCapIfNeeded()
+            // Off-main: if the screenshot is oversized, write a smaller WebP
+            // sibling and surface a "PNG 4.2 MB → WebP 380 KB" undo toast.
+            Task.detached { await AutoCompress.shared.maybeCompress(at: url) }
         } catch { /* ignore */ }
     }
 
     func addText(_ s: String) { items.append(StagedItem(kind: .text(s))); enforceCapIfNeeded() }
-    func addFile(_ url: URL)  { items.append(StagedItem(kind: .file(url))); enforceCapIfNeeded() }
+    func addFile(_ url: URL)  {
+        items.append(StagedItem(kind: .file(url)))
+        enforceCapIfNeeded()
+        // Auto-compress oversized PNG/JPEG drops. No-op for small files
+        // (<2 MB), already-compact formats (WebP/HEIC), or when disabled.
+        Task.detached { await AutoCompress.shared.maybeCompress(at: url) }
+    }
     func remove(_ id: UUID)   { items.removeAll { $0.id == id } }
     func clear()              { items.removeAll() }
 
