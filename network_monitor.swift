@@ -326,9 +326,15 @@ final class NetRow: Identifiable, ObservableObject {
         let dOut = max(0, s.bytesOut - cumOut)
         cumIn = s.bytesIn
         cumOut = s.bytesOut
-        let denom = max(dt, 0.001)
-        rateIn  = Double(dIn)  / denom
-        rateOut = Double(dOut) / denom
+        // Fix: skip rate computation when dt == 0 (first tick). Pushing 0
+        // avoids a spurious rate spike from bytes accrued before Trove launched.
+        if dt <= 0 {
+            rateIn  = 0; rateOut = 0
+        } else {
+            let denom = max(dt, 0.001)
+            rateIn  = Double(dIn)  / denom
+            rateOut = Double(dOut) / denom
+        }
         rateInHistory.append(rateIn)
         rateOutHistory.append(rateOut)
         if rateInHistory.count  > 60 { rateInHistory.removeFirst(rateInHistory.count - 60) }
@@ -370,6 +376,7 @@ struct NetGroup: Identifiable {
 @MainActor
 final class NetModel: ObservableObject {
     @Published var groups: [NetGroup] = []
+    @Published var extraGroupCount: Int = 0   // how many groups were clipped by the display cap
     @Published var search: String = ""
     @Published var direction: NetDirection = .both
     @Published var groupByApp: Bool = true
@@ -480,7 +487,12 @@ final class NetModel: ObservableObject {
         if inFlight != nil { return }
         let myGen = generation
         let now = ContinuousClock.now
-        let dt: TimeInterval = lastTickAt.map { (now - $0).timeInterval } ?? interval
+        // Fix: skip rate computation on the very first tick (lastTickAt == nil).
+        // Defaulting dt to `interval` produces a spurious first-tick rate because
+        // the cumulative bytes accrued before Trove launched aren't "interval" worth
+        // of traffic. We push 0 on the first tick and compute real rates from tick 2+.
+        let isFirstTick = lastTickAt == nil
+        let dt: TimeInterval = lastTickAt.map { (now - $0).timeInterval } ?? 0
         lastTickAt = now
 
         let task: Task<[NetSample], Error> = Task.detached(priority: .utility) {
@@ -492,7 +504,7 @@ final class NetModel: ObservableObject {
         do {
             let samples = try await task.value
             if myGen != generation { return }   // red-team #6
-            apply(samples, dt: dt, at: Date())
+            apply(samples, dt: dt, firstTick: isFirstTick, at: Date())
             lastError = nil
         } catch {
             if myGen != generation { return }
@@ -501,11 +513,11 @@ final class NetModel: ObservableObject {
         }
     }
 
-    private func apply(_ samples: [NetSample], dt: Double, at now: Date) {
+    private func apply(_ samples: [NetSample], dt: Double, firstTick: Bool, at now: Date) {
         // Absorb samples into existing rows / spawn new ones.
         for s in samples {
             if let existing = rows[s.pid] {
-                existing.absorb(s, dt: dt, now: now)
+                existing.absorb(s, dt: firstTick ? 0 : dt, now: now)
             } else {
                 let r = NetRow(pid: s.pid, name: s.name, cumIn: s.bytesIn, cumOut: s.bytesOut)
                 r.lastSeen = now
@@ -601,7 +613,10 @@ final class NetModel: ObservableObject {
             if av != bv { return av > bv }
             return a.displayName.localizedCaseInsensitiveCompare(b.displayName) == .orderedAscending
         }
-        groups = Array(built.prefix(25))
+        let cap = 100
+        let extraCount = max(0, built.count - cap)
+        groups = Array(built.prefix(cap))
+        extraGroupCount = extraCount
     }
 
     /// Build the CSV blob for the last-minute buffer. Columns:
@@ -852,6 +867,10 @@ struct NetRowView: View {
     let totalIn:  Int64
     let totalOut: Int64
     let direction: NetDirection
+    /// Aggregated sparkline histories from all group members (element-wise sum).
+    /// Passed in by the caller so multi-process groups show combined throughput.
+    let sparkInHistory:  [Double]
+    let sparkOutHistory: [Double]
 
     var body: some View {
         HStack(spacing: 10) {
@@ -883,8 +902,8 @@ struct NetRowView: View {
                 rateColumn(symbol: "arrow.up",   rate: rateOut, total: totalOut, tint: .orange)
             }
 
-            NetSparkline(inHistory: primary.rateInHistory,
-                         outHistory: primary.rateOutHistory,
+            NetSparkline(inHistory: sparkInHistory,
+                         outHistory: sparkOutHistory,
                          mode: direction)
         }
         .padding(.vertical, 4)
@@ -1130,6 +1149,14 @@ public struct NetworkMonitorView: View {
                             .onTapGesture { selection = g.primary.pid }
                         Divider()
                     }
+                    if m.extraGroupCount > 0 {
+                        Text("+\(m.extraGroupCount) more processes…")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 6)
+                    }
                 }
                 .padding(.horizontal, 12).padding(.vertical, 6)
                 .animation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
@@ -1141,6 +1168,19 @@ public struct NetworkMonitorView: View {
 
     @ViewBuilder
     private func groupRow(_ g: NetGroup) -> some View {
+        // Fix: aggregate sparkline histories element-wise from all members so
+        // a grouped app row shows combined throughput rather than just the primary's.
+        let histLen = 60
+        let aggIn:  [Double] = (0..<histLen).map { i in
+            g.members.reduce(0.0) { sum, m in
+                i < m.rateInHistory.count ? sum + m.rateInHistory[i] : sum
+            }
+        }
+        let aggOut: [Double] = (0..<histLen).map { i in
+            g.members.reduce(0.0) { sum, m in
+                i < m.rateOutHistory.count ? sum + m.rateOutHistory[i] : sum
+            }
+        }
         NetRowView(
             primary: g.primary,
             displayName: g.displayName,
@@ -1150,7 +1190,9 @@ public struct NetworkMonitorView: View {
             rateOut: g.rateOut,
             totalIn: g.totalIn,
             totalOut: g.totalOut,
-            direction: m.direction
+            direction: m.direction,
+            sparkInHistory: aggIn,
+            sparkOutHistory: aggOut
         )
     }
 

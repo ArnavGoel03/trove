@@ -81,7 +81,8 @@ enum CalcValue: Hashable {
 
 struct CalcLineResult: Identifiable, Hashable {
     let id: Int                  // 1-indexed line number
-    let display: String          // pre-formatted, locale-aware
+    let display: String          // pre-formatted, locale-aware (max 6dp)
+    let fullPrecision: String?   // full-precision value for tooltip (nil if same as display)
     let value: CalcValue
     let errorText: String?
     let shadowedHint: String?    // non-nil if this line's assignment was later shadowed
@@ -348,6 +349,8 @@ private final class CalcECBParser: NSObject, XMLParserDelegate {
 final class CalcEvaluator {
 
     private let rateStore: CalcRateStore
+    /// Current angle unit for trig functions. Set at the start of each `evaluate()` call.
+    private var currentAngleUnit: AngleUnit = .degrees
 
     init(rateStore: CalcRateStore? = nil) {
         self.rateStore = rateStore ?? CalcRateStore.shared
@@ -609,7 +612,8 @@ final class CalcEvaluator {
     /// Evaluate every line of `text`. Returns one `CalcLineResult` per input
     /// line (including blank ones — they map to `.empty`). Variables and
     /// lineN refs flow forward; circular refs are detected and flagged.
-    func evaluate(text: String) -> [CalcLineResult] {
+    func evaluate(text: String, angleUnit: AngleUnit = .degrees) -> [CalcLineResult] {
+        self.currentAngleUnit = angleUnit
         let rawLines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
 
         // First pass: parse each line into (rawText, optional assignment name).
@@ -683,6 +687,7 @@ final class CalcEvaluator {
             // Blank line: emit an empty placeholder so right-pane stays aligned.
             if trimmed.isEmpty {
                 results.append(CalcLineResult(id: lineNumber, display: "",
+                                              fullPrecision: nil,
                                               value: .empty, errorText: nil,
                                               shadowedHint: nil))
                 continue
@@ -690,6 +695,7 @@ final class CalcEvaluator {
             // Comment lines starting with `#` or `//` — return empty.
             if trimmed.hasPrefix("#") || trimmed.hasPrefix("//") {
                 results.append(CalcLineResult(id: lineNumber, display: "",
+                                              fullPrecision: nil,
                                               value: .empty, errorText: nil,
                                               shadowedHint: nil))
                 continue
@@ -699,6 +705,7 @@ final class CalcEvaluator {
             if cyclicLines.contains(i) {
                 results.append(CalcLineResult(
                     id: lineNumber, display: "↻ cycle",
+                    fullPrecision: nil,
                     value: .error("circular reference"),
                     errorText: "circular reference",
                     shadowedHint: shadowedAt[i]
@@ -720,8 +727,11 @@ final class CalcEvaluator {
                 vars[name] = inner.v
             }
             let display = (outcome.value.isError ? "" : formatValue(outcome.value))
+            let full = formatValueFullPrecision(outcome.value)
+            let fp: String? = (full != display && !full.isEmpty) ? full : nil
             results.append(CalcLineResult(
                 id: lineNumber, display: display,
+                fullPrecision: fp,
                 value: outcome.value, errorText: outcome.errorText,
                 shadowedHint: shadowedAt[i]
             ))
@@ -874,6 +884,74 @@ final class CalcEvaluator {
     ///   2. Unit conversion ("5 mi to km")
     ///   3. Pure-arithmetic sanitization → NSExpression
     /// Percent semantics are normalized before substitution.
+    /// In degrees mode, rewrite trig calls so NSExpression (which uses radians):
+    ///   sin(x)  → sin(x * 0.017453292519943295)   (x * π/180)
+    ///   cos(x)  → cos(x * 0.017453292519943295)
+    ///   tan(x)  → tan(x * 0.017453292519943295)
+    ///   asin(x) → asin(x) * 57.29577951308232      (* 180/π)
+    ///   acos(x) → acos(x) * 57.29577951308232
+    ///   atan(x) → atan(x) * 57.29577951308232
+    private func applyDegreeMode(_ expr: String) -> String {
+        let degToRad = "0.017453292519943295"
+        let radToDeg = "57.29577951308232"
+        // Forward trig: wrap inner arg.
+        let fwdFuncs = ["sin", "cos", "tan"]
+        var out = expr
+        for fn in fwdFuncs {
+            guard let re = try? NSRegularExpression(pattern: #"\b\#(fn)\s*\("#, options: .caseInsensitive) else { continue }
+            var offset = 0
+            let ns = out
+            let matches = re.matches(in: ns, range: NSRange(ns.startIndex..., in: ns))
+            for m in matches {
+                let rangeStart = m.range.location + offset
+                let rangeLen   = m.range.length
+                let afterOpen = rangeStart + rangeLen
+                var depth = 1
+                var closeIdx = afterOpen
+                let chars = Array(out)
+                while closeIdx < chars.count && depth > 0 {
+                    if chars[closeIdx] == "(" { depth += 1 }
+                    else if chars[closeIdx] == ")" { depth -= 1 }
+                    if depth > 0 { closeIdx += 1 }
+                }
+                if depth != 0 { continue }
+                let inner = String(chars[afterOpen..<closeIdx])
+                let repl = "\(fn)((\(inner)) * \(degToRad))"
+                let replRange = NSRange(location: rangeStart, length: closeIdx - rangeStart + 1)
+                out = (out as NSString).replacingCharacters(in: replRange, with: repl)
+                offset += repl.count - replRange.length
+            }
+        }
+        // Inverse trig: wrap entire call result.
+        let invFuncs = ["asin", "acos", "atan"]
+        for fn in invFuncs {
+            guard let re = try? NSRegularExpression(pattern: #"\b\#(fn)\s*\("#, options: .caseInsensitive) else { continue }
+            var offset = 0
+            let ns = out
+            let matches = re.matches(in: ns, range: NSRange(ns.startIndex..., in: ns))
+            for m in matches {
+                let rangeStart = m.range.location + offset
+                let rangeLen   = m.range.length
+                let afterOpen = rangeStart + rangeLen
+                var depth = 1
+                var closeIdx = afterOpen
+                let chars = Array(out)
+                while closeIdx < chars.count && depth > 0 {
+                    if chars[closeIdx] == "(" { depth += 1 }
+                    else if chars[closeIdx] == ")" { depth -= 1 }
+                    if depth > 0 { closeIdx += 1 }
+                }
+                if depth != 0 { continue }
+                let inner = String(chars[afterOpen..<closeIdx])
+                let repl = "(\(fn)(\(inner)) * \(radToDeg))"
+                let replRange = NSRange(location: rangeStart, length: closeIdx - rangeStart + 1)
+                out = (out as NSString).replacingCharacters(in: replRange, with: repl)
+                offset += repl.count - replRange.length
+            }
+        }
+        return out
+    }
+
     /// Unicode + "x" math operators normalization. Lets users write `2 x 3`,
     /// `2×3`, `100÷4`, and pasted Unicode minus signs (`−` `–` `—`).
     private func normalizeOperators(_ expr: String) -> String {
@@ -908,7 +986,8 @@ final class CalcEvaluator {
             ("\\$", "USD"), ("€", "EUR"), ("£", "GBP"), ("¥", "JPY"),
             ("₹", "INR"), ("₩", "KRW"), ("₽", "RUB"), ("₣", "CHF"),
             ("₺", "TRY"), ("₪", "ILS"), ("₱", "PHP"), ("฿", "THB"),
-            ("R\\$", "BRL"), ("kr", "SEK"),
+            ("R\\$", "BRL"),
+            // "kr" intentionally omitted — ambiguous across SEK/NOK/DKK; use explicit codes.
         ]
         for (sym, code) in symToCode {
             if let re = try? NSRegularExpression(pattern: "\(sym)\\s*(\\d[\\d.,]*)") {
@@ -1002,6 +1081,12 @@ final class CalcEvaluator {
         // first so every downstream step sees ASCII operators.
         substituted = normalizeOperators(substituted)
 
+        // Degree→radian conversion: when angle unit is degrees, wrap sin/cos/tan
+        // args with (* π/180) and asin/acos/atan results with (* 180/π).
+        if currentAngleUnit == .degrees {
+            substituted = applyDegreeMode(substituted)
+        }
+
         // Currency normalization: $/€/£/¥ → ISO, "dollars"/"euros"/etc. → ISO.
         // Done before conversion detection so "100 dollars in euros" parses.
         substituted = normalizeCurrencyTokens(substituted)
@@ -1027,8 +1112,15 @@ final class CalcEvaluator {
         // Done here, AFTER unit/currency detection so "5 mi to km" still parses correctly.
         let withWords = normalizeNaturalLanguage(substituted)
 
+        // Decimal normalization: comma → dot BEFORE smart-percent expansion so
+        // "200 + 10,5%" parses correctly (comma decimal in percent operand).
+        let withDotDecimal: String = {
+            guard withWords.contains(","), !withWords.contains(".") else { return withWords }
+            return withWords.replacingOccurrences(of: ",", with: ".")
+        }()
+
         // Arithmetic with smart percent. Resolve "X + Y%" first.
-        let withPercent = expandSmartPercent(withWords)
+        let withPercent = expandSmartPercent(withDotDecimal)
 
         switch evaluateArithmetic(withPercent) {
         case .success(let n):  return .number(n)
@@ -1073,6 +1165,15 @@ final class CalcEvaluator {
                 out = (out as NSString).replacingCharacters(in: range, with: repl)
             }
         }
+        // Built-in math constants — substituted before user variables so a
+        // user variable named `pi` would shadow the constant (last-write wins).
+        let mathConstants: [(String, Double)] = [
+            ("pi",  Double.pi),
+            ("tau", Double.pi * 2),
+            ("e",   2.718281828459045),
+            ("phi", 1.618033988749895),
+        ]
+
         // Identifiers — only replace those we have values for, in reverse
         // so substring overlaps don't bite.
         let idRe = try? NSRegularExpression(pattern: #"\b[A-Za-z_][A-Za-z0-9_]*\b"#)
@@ -1082,11 +1183,30 @@ final class CalcEvaluator {
             re.enumerateMatches(in: out, range: NSRange(location: 0, length: ns.length)) { m, _, _ in
                 guard let m = m else { return }
                 let tok = ns.substring(with: m.range)
+                let tokLower = tok.lowercased()
                 // Preserve recognized unit/currency tokens — they get
                 // consumed by the conversion / measurement passes upstream.
                 if Self.units(tok) != nil { return }
                 if currencyCodes.contains(tok.uppercased()) { return }
-                if tok.lowercased() == "in" || tok.lowercased() == "to" || tok.lowercased() == "as" {
+                if tokLower == "in" || tokLower == "to" || tokLower == "as" {
+                    return
+                }
+                // ans / prev — resolves to the most recent non-empty prior value.
+                if tokLower == "ans" || tokLower == "prev" {
+                    // Walk backwards through priorValues to find the last numeric one.
+                    if let lastVal = priorValues.sorted(by: { $0.key > $1.key })
+                                               .first(where: { $0.value.numericForReference != nil }),
+                       let n = lastVal.value.numericForReference {
+                        replacements.append((m.range, formatNumberForSubstitution(n)))
+                    }
+                    return
+                }
+                // Built-in math constants.
+                if let entry = mathConstants.first(where: { $0.0 == tokLower }) {
+                    // Only substitute if the user hasn't defined a variable with this name.
+                    if priorVars[tok] == nil {
+                        replacements.append((m.range, formatNumberForSubstitution(entry.1)))
+                    }
                     return
                 }
                 if let v = priorVars[tok]?.numericForReference {
@@ -1217,7 +1337,8 @@ final class CalcEvaluator {
         // X +/- Y%  → X * (1 +/- Y/100.0)
         // The `.0` forces float division — NSExpression does integer division
         // on `/` when both operands look like integers ("10/100" → 0, not 0.1).
-        let addSubPattern = #"(\([^()]*\)|-?\d+(?:[.,]\d+)?)\s*([+\-])\s*(-?\d+(?:[.,]\d+)?)\s*%"#
+        // Non-greedy (.+?) so multi-term LHS "50 + 10 + 10%" captures "50 + 10".
+        let addSubPattern = #"(.+?)\s*([+\-])\s*(-?\d+(?:[.,]\d+)?)\s*%"#
         if let re = try? NSRegularExpression(pattern: addSubPattern) {
             while true {
                 let ns = out as NSString
@@ -1226,7 +1347,7 @@ final class CalcEvaluator {
                 let lhs = ns.substring(with: m.range(at: 1))
                 let op  = ns.substring(with: m.range(at: 2))
                 let pct = ns.substring(with: m.range(at: 3))
-                let repl = "(\(lhs) * (1.0 \(op) (\(pct))/100.0))"
+                let repl = "((\(lhs)) * (1.0 \(op) (\(pct))/100.0))"
                 out = ns.replacingCharacters(in: m.range, with: repl)
             }
         }
@@ -1395,8 +1516,46 @@ final class CalcEvaluator {
         return true
     }
 
+    /// Rewrite `ln(...)` → `log(...)/log(2.718281828459045)` so NSExpression,
+    /// which only has a base-10 `log()`, produces the natural logarithm.
+    private static func rewriteLn(_ expr: String) -> String {
+        guard expr.lowercased().contains("ln") else { return expr }
+        guard let re = try? NSRegularExpression(pattern: #"\bln\s*\("#, options: .caseInsensitive) else { return expr }
+        let ns = expr as NSString
+        var out = expr
+        var offset = 0
+        let matches = re.matches(in: expr, range: NSRange(location: 0, length: ns.length))
+        for m in matches {
+            let rangeStart = m.range.location + offset
+            let rangeLen   = m.range.length
+            // Find the matching closing paren for this ln( call.
+            let afterOpen = rangeStart + rangeLen  // index just after "("
+            var depth = 1
+            var closeIdx = afterOpen
+            let chars = Array(out)
+            while closeIdx < chars.count && depth > 0 {
+                if chars[closeIdx] == "(" { depth += 1 }
+                else if chars[closeIdx] == ")" { depth -= 1 }
+                if depth > 0 { closeIdx += 1 }
+            }
+            if depth != 0 { continue }  // unbalanced — leave it for the validator to reject
+            let inner = String(chars[afterOpen..<closeIdx])
+            let repl = "log(\(inner))/log(2.718281828459045)"
+            let replRange = NSRange(location: rangeStart, length: closeIdx - rangeStart + 1)
+            out = (out as NSString).replacingCharacters(in: replRange, with: repl)
+            offset += repl.count - replRange.length
+        }
+        return out
+    }
+
     private func evaluateArithmetic(_ expr: String) -> ArithResult {
-        let trimmed = expr.trimmingCharacters(in: .whitespaces)
+        // Numi-style natural-language preprocessor: rewrite English phrasing
+        // ("15% of 240", "half of 18", "200 on 10%", "sqrt 49", "double 7")
+        // into arithmetic. Idempotent — pure arithmetic inputs pass through.
+        let nl = NaturalLanguageCalc.preprocess(expr)
+        // Rewrite ln(...) → log(...)/log(e) before any other processing.
+        let withLn = Self.rewriteLn(nl)
+        let trimmed = withLn.trimmingCharacters(in: .whitespaces)
         if trimmed.isEmpty { return .failure("empty") }
 
         // Reject obviously dangerous characters.
@@ -1452,7 +1611,13 @@ final class CalcEvaluator {
             if let n = exp.expressionValue(with: nil, context: nil) as? NSNumber {
                 let d = n.doubleValue
                 if d.isFinite { return .success(d) }
-                return .failure("not finite")
+                // Distinguish common domain errors for better UX.
+                // tan(π/2) → ±Infinity (not a domain violation, just undefined);
+                // asin/acos out of [-1,1] → NaN.
+                if d.isNaN {
+                    return .failure("domain error (argument out of range)")
+                }
+                return .failure("undefined")
             }
         }
         return .failure("parse error")
@@ -1507,6 +1672,28 @@ final class CalcEvaluator {
         }
     }
 
+    /// Full-precision version of `formatValue` — up to 15 significant digits,
+    /// used as a tooltip when the display value is rounded.
+    func formatValueFullPrecision(_ v: CalcValue) -> String {
+        switch v {
+        case .number(let n):
+            guard n.isFinite else { return "" }
+            let s = String(format: "%.15g", n)
+            return s
+        case .measurement(let val, let sym):
+            guard val.isFinite else { return "" }
+            return "\(String(format: "%.15g", val)) \(sym)"
+        case .money(let val, let ccy, _):
+            guard val.isFinite else { return "" }
+            return String(format: "%.15g \(ccy)", val)
+        case .assignment(let name, let inner):
+            let inner2 = formatValueFullPrecision(inner.v)
+            return inner2.isEmpty ? "" : "\(name) = \(inner2)"
+        case .empty, .error:
+            return ""
+        }
+    }
+
     // red-team: was `static let` so it captured Locale.current at first use and
     // never updated on mid-session region change (US→DE comma decimal).
     // Now keyed off Formatters.epoch which AppDelegate bumps on
@@ -1537,6 +1724,16 @@ final class CalcEvaluator {
 }
 
 // ===========================================================================
+// MARK: - Angle unit
+// ===========================================================================
+
+enum AngleUnit: String, CaseIterable, Identifiable {
+    case degrees = "DEG"
+    case radians = "RAD"
+    var id: String { rawValue }
+}
+
+// ===========================================================================
 // MARK: - View model
 // ===========================================================================
 
@@ -1547,6 +1744,11 @@ final class CalcViewModel: ObservableObject {
     /// undo/redo just works.
     @Published var source: String = CalcViewModel.starterTape
     @Published private(set) var results: [CalcLineResult] = []
+    @AppStorage("calc.angleUnit") var angleUnitRaw: String = AngleUnit.degrees.rawValue
+    var angleUnit: AngleUnit {
+        get { AngleUnit(rawValue: angleUnitRaw) ?? .degrees }
+        set { angleUnitRaw = newValue.rawValue; scheduleRecompute() }
+    }
 
     private let evaluator = CalcEvaluator()
     private var debounceWork: DispatchWorkItem?
@@ -1585,7 +1787,7 @@ final class CalcViewModel: ObservableObject {
     }
 
     private func recompute() {
-        results = evaluator.evaluate(text: source)
+        results = evaluator.evaluate(text: source, angleUnit: angleUnit)
     }
 
     /// Clear all lines back to a single blank line.
@@ -1705,6 +1907,19 @@ public struct CalcView: View {
     @ToolbarContentBuilder
     private func calcToolbar() -> some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
+            // DEG / RAD mode picker.
+            Picker("Angle", selection: Binding(
+                get: { vm.angleUnit },
+                set: { vm.angleUnit = $0 }
+            )) {
+                ForEach(AngleUnit.allCases) { u in
+                    Text(u.rawValue).tag(u)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 80)
+            .help("Angle unit for sin/cos/tan/asin/acos/atan")
+
             Button {
                 rates.refreshOnce()
             } label: {
@@ -2026,7 +2241,7 @@ struct CalcResultRow: View {
                 .foregroundStyle(textColor)
                 .lineLimit(1)
                 .truncationMode(.middle)
-                .help(result.display)
+                .help(result.fullPrecision ?? result.display)
         }
         .frame(height: lineHeight)
         .contentShape(Rectangle())

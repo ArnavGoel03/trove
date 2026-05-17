@@ -571,7 +571,29 @@ enum ImgToolsConverter {
         // orientation into the pixel buffer. Output is visually upright with
         // no orientation tag, which is what we want.
 
-        CGImageDestinationAddImage(dest, cgImage, props as CFDictionary)
+        // Fix #1: JPEG has no alpha channel — composite onto white before encoding
+        // so transparency doesn't become black fringe / undefined pixels.
+        let imageToEncode: CGImage
+        if opts.format == .jpeg {
+            let alphaInfo = cgImage.alphaInfo
+            let hasAlpha = alphaInfo != .none && alphaInfo != .noneSkipFirst && alphaInfo != .noneSkipLast
+            if hasAlpha {
+                let w = cgImage.width, h = cgImage.height
+                let cs = CGColorSpaceCreateDeviceRGB()
+                let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
+                                    bytesPerRow: 0, space: cs,
+                                    bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
+                ctx?.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+                ctx?.fill(CGRect(x: 0, y: 0, width: w, height: h))
+                ctx?.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
+                imageToEncode = ctx?.makeImage() ?? cgImage
+            } else {
+                imageToEncode = cgImage
+            }
+        } else {
+            imageToEncode = cgImage
+        }
+        CGImageDestinationAddImage(dest, imageToEncode, props as CFDictionary)
 
         if !CGImageDestinationFinalize(dest) {
             try? FileManager.default.removeItem(at: tempURL)
@@ -618,7 +640,10 @@ final class ImgToolsModel: ObservableObject {
     @Published var quality: Double = 0.85
     @Published var stripMetadata: Bool = true
 
-    @Published var outputDir: URL = URL(fileURLWithPath: "\(NSHomeDirectory())/Downloads")
+    @Published var outputDir: URL = UserDefaults.standard.url(forKey: "image_tools.outputDir")
+        ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first! { // lint-ok: no-collection-force-unwrap
+        didSet { UserDefaults.standard.set(outputDir, forKey: "image_tools.outputDir") }
+    }
     @Published var working: Bool = false
     @Published var progressLabel: String = ""
 
@@ -651,7 +676,9 @@ final class ImgToolsModel: ObservableObject {
         // by the non-regular-file guard below.
         let urls = troveExpandFolders(
             urls,
-            allowedExtensions: ["png","jpg","jpeg","heic","tiff","tif","gif","bmp","webp"],
+            allowedExtensions: ["png","jpg","jpeg","heic","tiff","tif","gif","bmp","webp",
+                                 "cr2","cr3","crw","nef","nrw","arw","sr2","srw","raf","orf",
+                                 "pef","rw2","rwl","3fr","fff","dng"],
             cap: 1000
         )
         var toLoad: [(id: UUID, url: URL)] = []
@@ -845,62 +872,92 @@ final class ImgToolsModel: ObservableObject {
         toStage: Bool
     ) async {
         working = true
-        outputs.removeAll()
-        failures.removeAll { _ in true }  // wipe stale failures
+        // Fix #6: don't wipe results at run start — let them accumulate across runs.
+        // User clears explicitly via the toolbar Clear button.
         defer {
             working = false
             progressLabel = ""
             convertTask = nil
         }
 
-        for (idx, src) in snapshot.enumerated() {
-            // red-team: cancel between rows — the inner ImageIO write can't
-            // be interrupted mid-encode but a 200-file batch checks here so
-            // the user sees Cancel take effect within ~one image's worth of
-            // work, not at the end of the run.
-            if Task.isCancelled { break }
-            progressLabel = "Converting \(idx + 1) of \(snapshot.count)…"
+        // Fix #4: bounded parallel conversion — cap at 6 concurrent ImageIO encodes.
+        // serial await Task.detached was effectively sequential; TaskGroup fans out properly.
+        let total = snapshot.count
+        var newOutputs: [ImgToolsOutput] = []
+        var newFailures: [ImgToolsFailure] = []
+        var completed = 0
 
-            // Each conversion runs on a detached task so ImageIO buffers go out of
-            // scope (and the autoreleasepool inside drains) before we move on (red-team #7).
-            let result: Result<URL, Error> = await Task.detached(priority: .userInitiated) {
-                do {
-                    let url = try ImgToolsConverter.convert(source: src, opts: opts)
-                    return .success(url)
-                } catch {
-                    return .failure(error)
-                }
-            }.value
+        await withTaskGroup(of: (Result<URL, Error>, ImgToolsSource).self) { group in
+            var inFlight = 0
+            var iter = snapshot.makeIterator()
 
-            switch result {
-            case .success(let url):
-                let after: Int64 = (try? FileManager.default
-                    .attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? 0
-                outputs.append(ImgToolsOutput(
-                    sourceID: src.id,
-                    sourceName: src.url.lastPathComponent,
-                    outputURL: url,
-                    beforeBytes: src.bytes,
-                    afterBytes: after
-                ))
-                if toStage {
-                    SharedStore.stage.addFile(url)
+            // Seed up to 6 tasks initially.
+            while inFlight < 6, let src = iter.next() {
+                if Task.isCancelled { break }
+                group.addTask {
+                    do {
+                        let url = try ImgToolsConverter.convert(source: src, opts: opts)
+                        return (.success(url), src)
+                    } catch {
+                        return (.failure(error), src)
+                    }
                 }
-                OutputsLibrary.shared.record(
-                    url: url,
-                    producer: "image_tools.convert",
-                    sourceLabel: src.url.lastPathComponent,
-                    kind: "image"
-                )
-            case .failure(let err):
-                failures.append(ImgToolsFailure(
-                    sourceURL: src.url,
-                    reason: (err as? LocalizedError)?.errorDescription ?? "\(err)"
-                ))
+                inFlight += 1
+            }
+
+            // Drain completions and feed new work.
+            while let (result, src) = await group.next() {
+                inFlight -= 1
+                completed += 1
+                await MainActor.run {
+                    progressLabel = "Converting \(completed) of \(total)…"
+                }
+                switch result {
+                case .success(let url):
+                    let after: Int64 = (try? FileManager.default
+                        .attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? 0
+                    newOutputs.append(ImgToolsOutput(
+                        sourceID: src.id,
+                        sourceName: src.url.lastPathComponent,
+                        outputURL: url,
+                        beforeBytes: src.bytes,
+                        afterBytes: after
+                    ))
+                    if toStage {
+                        await MainActor.run { SharedStore.stage.addFile(url) }
+                    }
+                    OutputsLibrary.shared.record(
+                        url: url,
+                        producer: "image_tools.convert",
+                        sourceLabel: src.url.lastPathComponent,
+                        kind: "image"
+                    )
+                case .failure(let err):
+                    newFailures.append(ImgToolsFailure(
+                        sourceURL: src.url,
+                        reason: (err as? LocalizedError)?.errorDescription ?? "\(err)"
+                    ))
+                }
+
+                // Feed next item if not cancelled.
+                if !Task.isCancelled, let next = iter.next() {
+                    group.addTask {
+                        do {
+                            let url = try ImgToolsConverter.convert(source: next, opts: opts)
+                            return (.success(url), next)
+                        } catch {
+                            return (.failure(error), next)
+                        }
+                    }
+                    inFlight += 1
+                }
             }
         }
 
-        let n = outputs.count
+        outputs.append(contentsOf: newOutputs)
+        failures.append(contentsOf: newFailures)
+
+        let n = newOutputs.count
         if Task.isCancelled {
             SharedStore.stage.flash(
                 "Cancelled · \(n) image\(n == 1 ? "" : "s") converted",

@@ -31,6 +31,7 @@ struct Snippet: Identifiable, Codable, Hashable {
     var useCount: Int
     var lastUsedAt: Date?
     var pinned: Bool
+    var updatedAt: Date? = nil
 
     init(id: UUID = UUID(),
          name: String,
@@ -39,7 +40,8 @@ struct Snippet: Identifiable, Codable, Hashable {
          createdAt: Date = Date(),
          useCount: Int = 0,
          lastUsedAt: Date? = nil,
-         pinned: Bool = false) {
+         pinned: Bool = false,
+         updatedAt: Date? = nil) {
         self.id = id
         self.name = name
         self.body = body
@@ -48,26 +50,35 @@ struct Snippet: Identifiable, Codable, Hashable {
         self.useCount = useCount
         self.lastUsedAt = lastUsedAt
         self.pinned = pinned
+        self.updatedAt = updatedAt
     }
 
     // Custom decoding so future-added fields and previously-missing fields don't
     // explode on existing files. Every field except `id` has a sane default.
     enum CodingKeys: String, CodingKey {
-        case id, name, body, tags, createdAt, useCount, lastUsedAt, pinned
+        case id, name, body, tags, createdAt, useCount, lastUsedAt, pinned, updatedAt
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         // id: tolerate missing by minting a fresh one — corrupt rows still load.
-        self.id         = (try? c.decode(UUID.self, forKey: .id)) ?? UUID()
-        self.name       = (try? c.decode(String.self, forKey: .name)) ?? "Untitled"
-        self.body       = (try? c.decode(String.self, forKey: .body)) ?? ""
-        self.tags       = (try? c.decode([String].self, forKey: .tags)) ?? []
-        self.createdAt  = (try? c.decode(Date.self, forKey: .createdAt)) ?? Date()
-        self.useCount   = (try? c.decode(Int.self, forKey: .useCount)) ?? 0
+        self.id        = (try? c.decode(UUID.self, forKey: .id)) ?? UUID()
+        self.name      = (try? c.decode(String.self, forKey: .name)) ?? "Untitled"
+        self.body      = (try? c.decode(String.self, forKey: .body)) ?? ""
+        self.tags      = (try? c.decode([String].self, forKey: .tags)) ?? []
+        self.createdAt = (try? c.decode(Date.self, forKey: .createdAt)) ?? Date()
+        self.useCount  = (try? c.decode(Int.self, forKey: .useCount)) ?? 0
         self.lastUsedAt = try? c.decodeIfPresent(Date.self, forKey: .lastUsedAt)
-        self.pinned     = (try? c.decode(Bool.self, forKey: .pinned)) ?? false
+        self.pinned    = (try? c.decode(Bool.self, forKey: .pinned)) ?? false
+        self.updatedAt = try? c.decodeIfPresent(Date.self, forKey: .updatedAt)
     }
+}
+
+enum SortMode: String, CaseIterable {
+    case smart          = "Smart"
+    case alphabetical   = "A–Z"
+    case recentlyUsed   = "Recently Used"
+    case recentlyCreated = "Recently Created"
 }
 
 enum SnippetError: LocalizedError {
@@ -99,6 +110,16 @@ final class SnippetStore: ObservableObject {
     /// Surface load errors visually without blocking startup.
     @Published var lastErrorMessage: String? = nil
     @Published private(set) var visible: [Snippet] = []
+    var sortMode: SortMode = {
+        let raw = UserDefaults.standard.string(forKey: "trove.snippets.sortMode") ?? ""
+        return SortMode(rawValue: raw) ?? .smart
+    }() {
+        willSet { objectWillChange.send() }
+        didSet {
+            UserDefaults.standard.set(sortMode.rawValue, forKey: "trove.snippets.sortMode")
+            scheduleRecomputeVisible()
+        }
+    }
 
     // Fix 14: 50 ms debounce so rapid keystrokes don't filter on every character.
     private var recomputeTask: Task<Void, Never>?
@@ -114,18 +135,35 @@ final class SnippetStore: ObservableObject {
 
     private func recomputeVisible() {
         let q = search.trimmingCharacters(in: .whitespacesAndNewlines)
-        let filtered: [Snippet] = q.isEmpty
-            ? snippets
-            : snippets.filter { s in
+        let filtered: [Snippet]
+        if q.isEmpty {
+            filtered = snippets
+        } else if q.lowercased().hasPrefix("tag:") {
+            let tagQuery = String(q.dropFirst(4)).trimmingCharacters(in: .whitespacesAndNewlines)
+            filtered = snippets.filter { s in
+                s.tags.contains(where: { $0.localizedCaseInsensitiveContains(tagQuery) })
+            }
+        } else {
+            filtered = snippets.filter { s in
                 if s.name.localizedCaseInsensitiveContains(q) { return true }
                 if s.body.localizedCaseInsensitiveContains(q) { return true }
                 if s.tags.contains(where: { $0.localizedCaseInsensitiveContains(q) }) { return true }
                 return false
             }
+        }
         visible = filtered.sorted { a, b in
-            if a.pinned != b.pinned { return a.pinned && !b.pinned }
-            if a.useCount != b.useCount { return a.useCount > b.useCount }
-            return a.createdAt > b.createdAt
+            switch sortMode {
+            case .smart:
+                if a.pinned != b.pinned { return a.pinned && !b.pinned }
+                if a.useCount != b.useCount { return a.useCount > b.useCount }
+                return a.createdAt > b.createdAt
+            case .alphabetical:
+                return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+            case .recentlyUsed:
+                return a.useCount > b.useCount
+            case .recentlyCreated:
+                return a.createdAt > b.createdAt
+            }
         }
     }
 
@@ -189,7 +227,9 @@ final class SnippetStore: ObservableObject {
     func update(_ s: Snippet) -> SnippetError? {
         if let e = validate(s) { return e }
         guard let i = snippets.firstIndex(where: { $0.id == s.id }) else { return nil }
-        snippets[i] = s
+        var stamped = s
+        stamped.updatedAt = Date()
+        snippets[i] = stamped
         save()
         return nil
     }
@@ -202,6 +242,7 @@ final class SnippetStore: ObservableObject {
     func togglePin(_ id: UUID) {
         guard let i = snippets.firstIndex(where: { $0.id == id }) else { return }
         snippets[i].pinned.toggle()
+        snippets[i].updatedAt = Date()
         save()
     }
 
@@ -209,6 +250,7 @@ final class SnippetStore: ObservableObject {
         guard let i = snippets.firstIndex(where: { $0.id == id }) else { return }
         snippets[i].useCount &+= 1
         snippets[i].lastUsedAt = Date()
+        snippets[i].updatedAt = Date()
         save()
     }
 
@@ -334,7 +376,12 @@ final class SnippetStore: ObservableObject {
             try data.write(to: tmp, options: [.atomic])
 
             if fm.fileExists(atPath: url.path) {
-                _ = try fm.replaceItemAt(url, withItemAt: tmp)
+                do {
+                    _ = try fm.replaceItemAt(url, withItemAt: tmp)
+                } catch {
+                    try? fm.removeItem(at: tmp)
+                    throw error
+                }
             } else {
                 try fm.moveItem(at: tmp, to: url)
             }
@@ -372,6 +419,13 @@ struct SnippetsView: View {
         .navigationSubtitle(subtitle)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                Picker("Sort", selection: $store.sortMode) {
+                    ForEach(SortMode.allCases, id: \.self) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .pickerStyle(.menu)
+                .help("Sort order")
                 Button { editorTarget = .new } label: {
                     Label("New", systemImage: "plus")
                 }
@@ -462,7 +516,8 @@ struct SnippetsView: View {
                         SnippetRow(
                             snippet: snip,
                             onCopy: { copy(snip) },
-                            onTogglePin: { store.togglePin(snip.id) }
+                            onTogglePin: { store.togglePin(snip.id) },
+                            onTagFilter: { store.search = "tag:\($0)" }
                         )
                         .contextMenu {
                             Button("Copy") { copy(snip) }
@@ -513,12 +568,14 @@ private struct SnippetRow: View {
     let snippet: Snippet
     let onCopy: () -> Void
     let onTogglePin: () -> Void
+    let onTagFilter: (String) -> Void
     @State private var hover = false
 
     private var preview: String {
-        let firstLine = snippet.body.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
-        let trimmed = firstLine.trimmingCharacters(in: .whitespaces)
-        return trimmed.isEmpty ? "(empty)" : trimmed
+        let firstNonEmpty = snippet.body.split(separator: "\n")
+            .first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
+            .map(String.init) ?? ""
+        return firstNonEmpty.isEmpty ? "(empty)" : firstNonEmpty
     }
 
     var body: some View {
@@ -540,15 +597,19 @@ private struct SnippetRow: View {
                         if !snippet.tags.isEmpty {
                             HStack(spacing: 4) {
                                 ForEach(snippet.tags.prefix(4), id: \.self) { tag in
-                                    Text(tag)
-                                        .font(.caption2)
-                                        .padding(.horizontal, 6).padding(.vertical, 2)
-                                        .background(.secondary.opacity(0.15), in: Capsule())
-                                        .foregroundStyle(.secondary)
+                                    Button { onTagFilter(tag) } label: {
+                                        Text(tag)
+                                            .font(.caption2)
+                                            .padding(.horizontal, 6).padding(.vertical, 2)
+                                            .background(.secondary.opacity(0.15), in: Capsule())
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .buttonStyle(.plain)
                                 }
                                 if snippet.tags.count > 4 {
                                     Text("+\(snippet.tags.count - 4)")
                                         .font(.caption2).foregroundStyle(.tertiary)
+                                        .help(snippet.tags.joined(separator: ", "))
                                 }
                             }
                         }

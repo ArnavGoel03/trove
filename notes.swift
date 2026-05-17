@@ -77,6 +77,7 @@ final class NoteStore: ObservableObject {
     /// Background-computed (word, char) per tab. Stays in sync with `tabs`.
     /// Updated off-main for large notes so typing latency never spikes.
     @Published var counts: [NoteColor: (words: Int, chars: Int)] = [:]
+    @Published var oversized: Set<NoteColor> = []
 
     private static let appSupportDir: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory,
@@ -194,6 +195,11 @@ final class NoteStore: ObservableObject {
             SharedStore.stage.flash("Note is over 4 MB — consider splitting it into smaller notes.", kind: .warning)
         }
         tabs[i].body = newValue
+        if byteCount > Self.warnBytes {
+            oversized.insert(color)
+        } else {
+            oversized.remove(color)
+        }
         scheduleSave()
         scheduleCount(color, newValue)
     }
@@ -221,6 +227,70 @@ final class NoteStore: ObservableObject {
         }
         SharedStore.stage.addText(cur.body)
         SharedStore.stage.flash("Sent “\(cur.title)” note to Stage")
+    }
+
+    // MARK: - Find / Replace
+
+    /// Replace the next occurrence of `query` in `color`'s tab with `replacement`.
+    /// Returns true if a replacement was made.
+    @discardableResult
+    func replaceNext(query: String, with replacement: String, in color: NoteColor) -> Bool {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return false }
+        let opts: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+        guard let i = tabs.firstIndex(where: { $0.color == color }) else { return false }
+        let body = tabs[i].body
+        guard let r = body.range(of: q, options: opts) else { return false }
+        var newBody = body
+        newBody.replaceSubrange(r, with: replacement)
+        setBody(color, newBody)
+        return true
+    }
+
+    /// Replace all occurrences of `query` in `color`'s tab with `replacement`.
+    /// Applies replacements in reverse-index order to preserve indices.
+    func replaceAll(query: String, with replacement: String, in color: NoteColor) {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return }
+        let opts: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+        guard let i = tabs.firstIndex(where: { $0.color == color }) else { return }
+        var body = tabs[i].body
+        var ranges: [Range<String.Index>] = []
+        var cursor = body.startIndex
+        while let r = body.range(of: q, options: opts, range: cursor..<body.endIndex) {
+            ranges.append(r)
+            cursor = r.upperBound == r.lowerBound
+                ? body.index(after: r.upperBound)
+                : r.upperBound
+            if cursor > body.endIndex { break }
+        }
+        guard !ranges.isEmpty else { return }
+        for r in ranges.reversed() {
+            body.replaceSubrange(r, with: replacement)
+        }
+        setBody(color, body)
+        SharedStore.stage.flash("Replaced \(ranges.count) occurrence\(ranges.count == 1 ? "" : "s")")
+    }
+
+    // MARK: - Export
+
+    func exportCurrentTab() {
+        let cur = tab(selected)
+        let panel = NSSavePanel()
+        panel.title = "Export \"\(cur.title)\""
+        panel.nameFieldStringValue = cur.title
+        panel.allowedContentTypes = [.plainText]
+        panel.canCreateDirectories = true
+        panel.begin { [weak self] resp in
+            guard resp == .OK, let url = panel.url, let self else { return }
+            let body = self.tab(self.selected).body
+            do {
+                try body.write(to: url, atomically: true, encoding: .utf8)
+                SharedStore.stage.flash("Exported \"\(cur.title)\" to \(url.lastPathComponent)")
+            } catch {
+                SharedStore.stage.flash("Export failed: \(error.localizedDescription)", kind: .warning)
+            }
+        }
     }
 
     // MARK: - Save scheduling (debounced, atomic, off-main)
@@ -346,12 +416,22 @@ final class NoteStore: ObservableObject {
     func search(_ query: String) -> [SearchHit] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard q.count >= 1 else { return [] }
+        let opts: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
         var out: [SearchHit] = []
         for t in tabs {
             let lines = t.body.split(separator: "\n", omittingEmptySubsequences: false)
             for (i, lineSub) in lines.enumerated() {
                 let line = String(lineSub)
-                if let r = line.range(of: q, options: .caseInsensitive) {
+                var cursor = line.startIndex
+                var firstRange: Range<String.Index>? = nil
+                while let r = line.range(of: q, options: opts, range: cursor..<line.endIndex) {
+                    if firstRange == nil { firstRange = r }
+                    cursor = r.upperBound == r.lowerBound
+                        ? line.index(after: r.upperBound)
+                        : r.upperBound
+                    if cursor > line.endIndex { break }
+                }
+                if let r = firstRange {
                     out.append(SearchHit(color: t.color,
                                          tabTitle: t.title,
                                          lineNumber: i + 1,
@@ -530,6 +610,7 @@ public struct NotesView: View {
                     title: store.tab(c).title,
                     isSelected: store.selected == c,
                     isRenaming: renaming == c,
+                    isOversized: store.oversized.contains(c),
                     renameText: $renameText,
                     onSelect: { store.selected = c },
                     onBeginRename: {
@@ -615,6 +696,14 @@ public struct NotesView: View {
             .help("Stage this note as a text item")
             .keyboardShortcut(.return, modifiers: [.command, .shift])
 
+            Button {
+                store.exportCurrentTab()
+            } label: {
+                Label("Export", systemImage: "arrow.down.doc")
+            }
+            .help("Export note as .txt (⌘E)")
+            .keyboardShortcut("e", modifiers: .command)
+
             Toggle(isOn: $store.showPreview) {
                 Label("Preview", systemImage: "doc.richtext")
             }
@@ -650,6 +739,7 @@ private struct NoteTabChip: View {
     let title: String
     let isSelected: Bool
     let isRenaming: Bool
+    let isOversized: Bool
     @Binding var renameText: String
     let onSelect: () -> Void
     let onBeginRename: () -> Void
@@ -666,10 +756,19 @@ private struct NoteTabChip: View {
                 .overlay(
                     Circle().strokeBorder(.white.opacity(0.35), lineWidth: 0.5)
                 )
+                .overlay(alignment: .topTrailing) {
+                    if isOversized {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 7, weight: .bold))
+                            .foregroundStyle(Color.orange.opacity(0.85))
+                            .offset(x: 5, y: -4)
+                    }
+                }
             if isRenaming {
-                TextField("", text: $renameText, onCommit: onCommitRename)
+                TextField("", text: $renameText)
                     .textFieldStyle(.plain)
                     .frame(minWidth: 60, maxWidth: 120)
+                    .onSubmit { onCommitRename() }
                     .onExitCommand(perform: onCancelRename)
             } else {
                 Text(title)
@@ -713,29 +812,56 @@ private struct NoteSearchOverlay: View {
     // so the synchronous store.search() is not called on every body re-render.
     @State private var hits: [NoteStore.SearchHit] = []
     @State private var debounceTask: Task<Void, Never>? = nil
+    @State private var replaceQuery: String = ""
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("Search all notes", text: $store.searchQuery)
-                    .textFieldStyle(.plain)
-                    .focused($focused)
-                    .onSubmit { focused = false }
-                if !store.searchQuery.isEmpty {
-                    Button { store.searchQuery = "" } label: {
-                        Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+            VStack(spacing: 0) {
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    TextField("Search all notes", text: $store.searchQuery)
+                        .textFieldStyle(.plain)
+                        .focused($focused)
+                        .onSubmit { focused = false }
+                    if !store.searchQuery.isEmpty {
+                        Button { store.searchQuery = "" } label: {
+                            Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
+                    Button {
+                        store.searchActive = false
+                        store.searchQuery = ""
+                        replaceQuery = ""
+                    } label: { Text("Done").font(.callout) }
+                    .buttonStyle(.borderless)
+                    .keyboardShortcut(.escape, modifiers: [])
                 }
-                Button {
-                    store.searchActive = false
-                    store.searchQuery = ""
-                } label: { Text("Done").font(.callout) }
-                .buttonStyle(.borderless)
-                .keyboardShortcut(.escape, modifiers: [])
+                .padding(.horizontal, 14).padding(.vertical, 8)
+
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.2.squarepath").foregroundStyle(.secondary)
+                    TextField("Replace", text: $replaceQuery)
+                        .textFieldStyle(.plain)
+                    Button("Replace") {
+                        store.replaceNext(query: store.searchQuery,
+                                          with: replaceQuery,
+                                          in: store.selected)
+                        hits = store.search(store.searchQuery)
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(store.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button("Replace All") {
+                        store.replaceAll(query: store.searchQuery,
+                                         with: replaceQuery,
+                                         in: store.selected)
+                        hits = store.search(store.searchQuery)
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(store.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                .padding(.horizontal, 14).padding(.vertical, 6)
             }
-            .padding(.horizontal, 14).padding(.vertical, 8)
             .background(.background.secondary)
             .onChange(of: store.searchQuery) { newValue in
                 debounceTask?.cancel()

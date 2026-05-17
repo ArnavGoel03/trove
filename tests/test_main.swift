@@ -385,6 +385,11 @@ func testCalc_expandSmartPercent() {
     if case .number(let n) = r4[0].value {
         assertApprox(n, 20, eps: 1e-9, "calc.pct.of")
     } else { assertTrue(false, "calc.pct.of", "wrong: \(r4[0].value)") }
+    // Multi-term LHS: "50 + 10 + 10%" should be (50+10) * 1.1 = 66.
+    let r5 = e.evaluate(text: "50 + 10 + 10%")
+    if case .number(let n) = r5[0].value {
+        assertApprox(n, 66, eps: 1e-9, "calc.pct.multiTermLHS")
+    } else { assertTrue(false, "calc.pct.multiTermLHS", "wrong: \(r5[0].value)") }
 }
 
 @MainActor
@@ -988,7 +993,7 @@ func runAllTests() async {
     testCalc_normalizeCurrency_symbols()
     testCalc_normalizeCurrency_words()
     testCalc_normalizeNaturalLanguage()
-    testCalc_expandSmartPercent()
+    testCalc_expandSmartPercent()  // includes multi-term LHS test
     testCalc_isLikelyValidArithmetic_accepts()
     testCalc_isLikelyValidArithmetic_rejects()
     testCalc_CalcRateCache_convert_basics()

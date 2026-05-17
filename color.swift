@@ -1245,7 +1245,7 @@ struct ColorToolSwatchCard: View {
             }
             .padding(8)
         }
-        .background(.background.tertiary, in: RoundedRectangle(cornerRadius: 9))
+        .background(Color.troveCardSolid.opacity(0.6), in: RoundedRectangle(cornerRadius: 9))
         .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(.separator.opacity(0.5), lineWidth: 0.5))
         .contextMenu {
             if let onUseInContrast = onUseInContrast {
@@ -1510,7 +1510,7 @@ struct ColorToolHistoryRow: View {
             }
         }
         .padding(10)
-        .background(.background.tertiary, in: RoundedRectangle(cornerRadius: 8))
+        .background(Color.troveCardSolid.opacity(0.6), in: RoundedRectangle(cornerRadius: 8))
         .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.separator.opacity(0.4), lineWidth: 0.5))
     }
 

@@ -1361,7 +1361,7 @@ struct LogPresetsCard: View {
                             }
                             .padding(8)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(.background.tertiary, in: RoundedRectangle(cornerRadius: 8))
+                            .background(Color.troveCardSolid.opacity(0.6), in: RoundedRectangle(cornerRadius: 8))
                             .overlay(
                                 RoundedRectangle(cornerRadius: 8)
                                     .strokeBorder(.separator.opacity(0.5), lineWidth: 0.5)
@@ -1420,7 +1420,7 @@ struct LogResultsCard: View {
                             .padding(.vertical, 2)
                         }
                         .frame(minHeight: 320, maxHeight: 560)
-                        .background(.background.tertiary,
+                        .background(Color.troveCardSolid.opacity(0.6),
                                     in: RoundedRectangle(cornerRadius: 8))
                         .overlay(
                             RoundedRectangle(cornerRadius: 8)

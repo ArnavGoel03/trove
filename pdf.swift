@@ -430,6 +430,8 @@ final class PDFOpsModel: ObservableObject {
     private var runTask: Task<Void, Never>?
     private var cancelled: Bool = false
 
+    deinit { runTask?.cancel() }
+
     // Op-specific parameters (one model for all ops — keeps the View simple).
     // Split
     @Published var splitMode: SplitMode = .everyPage
@@ -858,12 +860,18 @@ final class PDFOpsModel: ObservableObject {
             // copy buffers in the surrounding autorelease pool, which only
             // drained when the runner Task suspended. Drain per-page so a
             // 5-doc × 1000-page merge doesn't pin gigabytes mid-run.
+            let srcName = src.url.lastPathComponent
             for i in 0..<doc.pageCount {
                 try await checkCancel()
                 autoreleasepool {
                     if let p = doc.page(at: i)?.copy() as? PDFPage {
                         out.insert(p, at: pageIdx)
                         pageIdx += 1
+                    } else {
+                        Task { @MainActor in
+                            self.appendFailure(.init(label: "page \(i+1) of \(srcName)",
+                                                     message: "Page copy failed — skipped"))
+                        }
                     }
                 }
             }
@@ -919,8 +927,19 @@ final class PDFOpsModel: ObservableObject {
                 groups = (0..<pageCount).map { [$0] }
             case .ranges:
                 do {
-                    let pages = try PDFOpsRange.parse(snapshot.ranges, pageCount: pageCount)
-                    groups = [pages]
+                    // Parse each comma-separated token into its own group so
+                    // "1-3, 7-9" produces two output PDFs, not one.
+                    let tokens = snapshot.ranges
+                        .split(separator: ",")
+                        .map { $0.trimmingCharacters(in: .whitespaces) }
+                        .filter { !$0.isEmpty }
+                    if tokens.isEmpty {
+                        throw NSError(domain: "PDFOps", code: 2,
+                                      userInfo: [NSLocalizedDescriptionKey: "No ranges specified"])
+                    }
+                    groups = try tokens.map { token in
+                        try PDFOpsRange.parse(token, pageCount: pageCount)
+                    }
                 } catch {
                     await MainActor.run {
                         self.appendFailure(.init(label: src.url.lastPathComponent,
@@ -945,7 +964,8 @@ final class PDFOpsModel: ObservableObject {
                     case .everyPage:
                         label = "\(base) - p\(String(format: "%03d", group[0] + 1))"
                     case .ranges:
-                        label = "\(base) - pages"
+                        let pageList = group.map { String($0 + 1) }.joined(separator: ",")
+                        label = "\(base) - pages \(pageList)"
                     }
                     let target = PDFOpsFS.uniqueURL(in: dir, baseName: label, ext: "pdf")
                     do {
@@ -1274,6 +1294,17 @@ final class PDFOpsModel: ObservableObject {
                     textAnn.color = .clear
                     textAnn.contents = snap.text
                     textAnn.alignment = .center
+                    // Apply user rotation. PDF spec stores rotation as a positive
+                    // integer multiple of 90, but many viewers (Preview, Chrome)
+                    // honor arbitrary integer degrees via the /Rotate key.
+                    // Normalise to 0–359 so we never store a negative value,
+                    // which some viewers reject.
+                    let rotDeg = Int(snap.rot.rounded())
+                    let normRot = ((rotDeg % 360) + 360) % 360
+                    if normRot != 0 {
+                        textAnn.setValue(NSNumber(value: normRot),
+                                         forAnnotationKey: PDFAnnotationKey(rawValue: "/Rotate"))
+                    }
                     page.addAnnotation(textAnn)
                 } else if let stamp = stampImage {
                     // Image watermark: center, fit to ~60% page width.
@@ -1700,6 +1731,7 @@ final class PDFOpsModel: ObservableObject {
                     skipped += 1
                     continue
                 }
+                try checkCancelSync()
                 autoreleasepool {
                     let bounds = page.bounds(for: .mediaBox)
                     // red-team: must account for page.rotation. We render in

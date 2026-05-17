@@ -1819,6 +1819,17 @@ struct QuickSwitcherView: View {
             icon: "camera.viewfinder",
             action: .run { SharedStore.stage.captureScreenshot() }
         ))
+        // App launcher entries — cuts rcmd/Launchy by letting ⌘K open any
+        // installed app. Index is async-built at app launch (see app_launcher.swift)
+        // so this loop is empty on cold start and populates within ~100ms.
+        for app in AppLauncherIndex.shared.entries {
+            items.append(QuickSwitcherItem(
+                label: app.displayName,
+                detail: "App",
+                icon: "app.fill",
+                action: .run { AppLauncherIndex.shared.launch(app) }
+            ))
+        }
         return items
     }
 
@@ -4521,18 +4532,18 @@ final class CleanModel: ObservableObject {
                   action: .runCommand(brewExecutablePath() ?? "/opt/homebrew/bin/brew", ["cleanup", "-s"])),
             .init(name: "npm cache",
                   desc: "Cached package tarballs. Re-downloads on demand.",
-                  path: "\(home)/.npm",
+                  path: nil,   // byte count via `npm cache` would overstate; skip
                   action: .runCommand("/usr/bin/env", ["npm", "cache", "clean", "--force"])),
             .init(name: "pnpm store",
                   desc: "Unreferenced packages in the pnpm content-addressable store.",
-                  path: "\(home)/Library/pnpm",
+                  path: nil,   // byte count via directory would overstate shared store; skip
                   action: .runCommand("/usr/bin/env", ["pnpm", "store", "prune"])),
             .init(name: "yarn cache",
-                  desc: "Cached package archives.",
+                  desc: "Cached package archives. Requires re-download on next use.",
                   path: nil,
                   action: .runCommand("/usr/bin/env", ["yarn", "cache", "clean"])),
             .init(name: "pip cache",
-                  desc: "Cached wheel files.",
+                  desc: "Cached wheel files. Requires re-download on next use.",
                   path: "\(home)/Library/Caches/pip",
                   action: .runCommand("/usr/bin/env", ["pip", "cache", "purge"])),
             .init(name: "User caches (Xcode/Homebrew/Yarn/pip)",
@@ -4604,6 +4615,8 @@ final class CleanModel: ObservableObject {
         working = true; defer { working = false }
         log = "Running selected cleanups…\n"
         for i in cats.indices where cats[i].selected && cats[i].available {
+            try? Task.checkCancellation()
+            if Task.isCancelled { log += "\nCancelled."; return }
             let name = cats[i].name
             log += "\n▸ \(name)\n"
             let result: String = await Task.detached { [action = self.cats[i].action] in
@@ -4614,21 +4627,54 @@ final class CleanModel: ObservableObject {
                         var msgs: [String] = []
                         for sub in ["com.apple.dt.Xcode", "Homebrew", "Yarn", "pip"] {
                             let target = "\(base)/\(sub)"
-                            if FileManager.default.fileExists(atPath: target) {
-                                let (_, code) = runShell("/bin/rm", ["-rf", target])
-                                msgs.append("  rm \(target) → exit \(code)")
+                            let url = URL(fileURLWithPath: target)
+                            guard FileManager.default.fileExists(atPath: target) else { continue }
+                            // Symlink guard: only unlink symlink, never follow.
+                            if let rv = try? url.resourceValues(forKeys: [.isSymbolicLinkKey]),
+                               rv.isSymbolicLink == true {
+                                do {
+                                    try FileManager.default.removeItem(at: url)
+                                    msgs.append("  unlinked symlink \(target)")
+                                } catch {
+                                    msgs.append("  unlink \(target) failed: \(error.localizedDescription)")
+                                }
+                                continue
+                            }
+                            do {
+                                try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+                                msgs.append("  trashed \(target)")
+                            } catch {
+                                msgs.append("  trash \(target) failed: \(error.localizedDescription)")
                             }
                         }
-                        return msgs.joined(separator: "\n")
+                        return msgs.isEmpty ? "  (nothing to do)" : msgs.joined(separator: "\n")
                     } else {
                         guard let entries = try? FileManager.default.contentsOfDirectory(atPath: p) else {
                             return "  (nothing to do)"
                         }
+                        var wiped = 0
+                        var permErrors = 0
                         for e in entries {
                             let full = (p as NSString).appendingPathComponent(e)
-                            _ = runShell("/bin/rm", ["-rf", full])
+                            let url = URL(fileURLWithPath: full)
+                            // Symlink guard: unlink without following.
+                            if let rv = try? url.resourceValues(forKeys: [.isSymbolicLinkKey]),
+                               rv.isSymbolicLink == true {
+                                _ = try? FileManager.default.removeItem(at: url)
+                                wiped += 1
+                                continue
+                            }
+                            do {
+                                try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+                                wiped += 1
+                            } catch {
+                                permErrors += 1
+                            }
                         }
-                        return "  wiped contents of \(p)"
+                        if permErrors > 0 {
+                            return "  wiped \(wiped) of \(wiped + permErrors) (\(permErrors) permission errors)"
+                        }
+                        return "  wiped \(wiped) items from \(p)"
                     }
                 case .runCommand(let exe, let args):
                     let (out, code) = runShell(exe, args)
@@ -4729,11 +4775,13 @@ struct CleanView: View {
             Button("Apply", role: .destructive) { Task { await m.apply() } }
             Button("Cancel", role: .cancel) {}
         } message: {
+            let total = m.cats.filter { $0.selected }.reduce(Int64(0)) { $0 + max($1.size, 0) }
+            let totalStr = total > 0 ? " approximately \(total.human) from" : " items in"
             let wipingDerived = m.cats.contains { $0.selected && $0.name == "Xcode DerivedData" }
             if wipingDerived && isXcodeRunning() {
-                Text("⚠️ Xcode is currently running. Wiping DerivedData mid-build can confuse Xcode — quit it first, or expect to re-build from scratch.\n\nCaches and build outputs regenerate automatically; this is safe but not instantly reversible.")
+                Text("⚠️ Xcode is currently running. Wiping DerivedData mid-build can confuse Xcode — quit it first, or expect to re-build from scratch.\n\nThis will move\(totalStr) selected categories to Trash. Items go to Trash and can be restored from there. Caches and build outputs regenerate automatically.")
             } else {
-                Text("Caches and build outputs regenerate automatically; this is safe but not instantly reversible.")
+                Text("This will move\(totalStr) selected categories to Trash. Items go to Trash and can be restored from there. Caches and build outputs regenerate automatically.")
             }
         }
     }

@@ -35,7 +35,8 @@ enum ProcSampler {
     /// the UI prefers a stale list to a crash.
     static func sample() -> [ProcSample] {
         let p = Process()
-        p.launchPath = "/bin/ps"
+        // Fix 7: use executableURL instead of deprecated launchPath.
+        p.executableURL = URL(fileURLWithPath: "/bin/ps")
         // -A: every process. -ww: no truncation. -o: ordered columns.
         // pcpu/rss are the columns we care about; comm/args are last so any
         // whitespace inside args doesn't bleed into adjacent fields.
@@ -44,11 +45,24 @@ enum ProcSampler {
         p.standardOutput = out
         p.standardError = Pipe()
         do { try p.run() } catch { return [] }
+        // Fix 4: watchdog — terminate ps if it hangs beyond 6s (e.g. on
+        // extremely large process lists or wedged kernel state). Mirrors the
+        // nettop watchdog in network_monitor.swift.
+        let killQueue = DispatchQueue.global(qos: .utility)
+        let watchdog = DispatchWorkItem { [weak p] in
+            guard let p = p, p.isRunning else { return }
+            p.terminate()
+            killQueue.asyncAfter(deadline: .now() + .milliseconds(250)) { [weak p] in
+                if let p = p, p.isRunning { kill(p.processIdentifier, SIGKILL) }
+            }
+        }
+        killQueue.asyncAfter(deadline: .now() + .seconds(6), execute: watchdog)
         // R5 fix #20: close the read handle after consuming data to prevent
         // leaking an FD per sample tick.
         defer { try? out.fileHandleForReading.close() }
         let data = out.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExitOffMain()
+        watchdog.cancel()
         guard let s = String(data: data, encoding: .utf8) else { return [] }
 
         let self_pid = ProcessInfo.processInfo.processIdentifier
@@ -121,6 +135,9 @@ final class ProcRow: Identifiable, ObservableObject {
     @Published var rssBytes: Int64 = 0
     @Published var cpuHistory: [Double] = []   // capped at 60
     @Published var ramHistory: [Double] = []   // MB, capped at 60
+    /// Timestamp of the last tick in which this process was seen alive.
+    /// Rows linger for 5s after exit so short-lived processes stay visible briefly.
+    @Published var lastSeen: Date = .now
 
     /// Cached blacklist result, invalidated when comm changes. Plain stored
     /// property (not @Published) — UI doesn't need to redraw on a cache fill.
@@ -150,6 +167,7 @@ final class ProcRow: Identifiable, ObservableObject {
         let mb = Double(s.rssBytes) / 1_048_576.0
         ramHistory.append(mb)
         if ramHistory.count > 60 { ramHistory.removeFirst(ramHistory.count - 60) }
+        lastSeen = .now
     }
 }
 
@@ -290,10 +308,13 @@ final class ProcModel: ObservableObject {
     }
 
     private func apply(_ samples: [ProcSample]) {
-        // Drop rows whose PID disappeared this tick — frees their sparkline
-        // memory immediately (red-team #5).
+        let now = Date()
         let alive = Set(samples.map(\.pid))
-        for pid in rows.keys where !alive.contains(pid) { rows.removeValue(forKey: pid) }
+        // Fix 5: keep rows visible for 5s after the process exits so short-lived
+        // processes don't vanish instantly. Only purge rows older than the fade window.
+        for (pid, row) in rows where !alive.contains(pid) {
+            if now.timeIntervalSince(row.lastSeen) > 5.0 { rows.removeValue(forKey: pid) }
+        }
 
         for s in samples {
             if let existing = rows[s.pid] {
@@ -610,9 +631,11 @@ struct ProcRowView: View {
                     .font(.system(.callout, design: .monospaced))
                     .frame(width: 64, alignment: .trailing)
                     .foregroundStyle(totalCPU > 50 ? Color.orange : .primary)
+                // Fix 6: pin sparkline scale to total available CPU so a 0.1%
+                // process doesn't draw full-height relative to its own tiny max.
                 ProcSparkline(values: row.cpuHistory,
                               tint: totalCPU > 50 ? .orange : .blue,
-                              maxValue: nil)
+                              maxValue: Double(ProcessInfo.processInfo.processorCount) * 100)
             }
 
             // RAM column: MB + sparkline.

@@ -408,6 +408,28 @@ final class UpdateChecker: ObservableObject {
         await MainActor.run { self.latestAvailable = nil }
     }
 
+    @MainActor func installLatest() async {
+        guard let info = self.latestAvailable else {
+            SharedStore.stage.flash("No update info available — try Check Now first.", kind: .warning)
+            return
+        }
+        let zipString: String?
+        if let url = info.preferredDownloadURL, url.hasSuffix(".zip") {
+            zipString = url
+        } else {
+            zipString = nil
+        }
+        guard let zipString, let zipURL = URL(string: zipString) else {
+            SharedStore.stage.flash("Update has no .zip asset — open release page manually.", kind: .warning)
+            return
+        }
+        do {
+            try await AutoInstaller.shared.installUpdate(zipURL: zipURL, expectedVersion: info.versionString ?? "")
+        } catch {
+            SharedStore.stage.flash("Update failed: \(error.localizedDescription)", kind: .warning)
+        }
+    }
+
     private func stampCheck() {
         let now = Date()
         lastCheck = now
@@ -482,6 +504,11 @@ struct UpdateCheckerCard: View {
                             }
                         }
                         .buttonStyle(.borderedProminent)
+                        Button("Install Now") {
+                            Task { await UpdateChecker.shared.installLatest() }
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(UpdateChecker.currentVersion() == info.versionString)
                     }
                     .padding(8)
                     .background(.yellow.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))

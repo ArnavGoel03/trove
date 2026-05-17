@@ -1167,7 +1167,7 @@ public struct BigScanView: View {
                             }
                             .padding(10)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(.background.tertiary, in: RoundedRectangle(cornerRadius: 8))
+                            .background(Color.troveCardSolid.opacity(0.6), in: RoundedRectangle(cornerRadius: 8))
                         }
                         .buttonStyle(.plain)
                     }
@@ -1450,6 +1450,11 @@ public struct BigScanView: View {
                 Text("No duplicates detected (size + partial-hash match). If you just changed the size threshold, click Scan again.")
                     .foregroundStyle(.secondary).font(.callout)
             } else {
+                // Caveat: 2-file groups are matched by size + partial-hash only.
+                // 3+ file groups use a full SHA-256. Verify before deleting.
+                Label("Pairs use partial-hash comparison — verify before deleting.", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
                 HStack {
                     Text("Wasted space across \(groups.count) groups:").foregroundStyle(.secondary)
                     Text(totalWasted.human).bold()

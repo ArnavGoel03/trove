@@ -517,6 +517,7 @@ final class RecEngine: NSObject, ObservableObject {
                outputFolder: URL,
                systemAudio: Bool,
                microphone: Bool,
+               micUID: String? = nil,
                showsCursor: Bool,
                excludeBundleID: String?) async throws {
 
@@ -717,7 +718,7 @@ final class RecEngine: NSObject, ObservableObject {
         // --- Microphone capture session ------------------------------------
 
         if microphone {
-            try await setupMicrophoneSession()
+            try await setupMicrophoneSession(uid: micUID)
         }
 
         // --- SCStream ------------------------------------------------------
@@ -863,6 +864,22 @@ final class RecEngine: NSObject, ObservableObject {
         }
     }
 
+    /// Stop recording and delete the in-progress temp file. `lastOutputURL` is
+    /// NOT set so callers can distinguish a discard from a normal stop.
+    func discard() async {
+        let urlToDelete = tempURL
+        await stop()
+        // stop() sets lastOutputURL = dest on success; clear it since this is a discard.
+        self.lastOutputURL = nil
+        if let url = urlToDelete {
+            try? FileManager.default.removeItem(at: url)
+        }
+        // Also remove the renamed final file if stop() managed to finalize in time.
+        if let final = finalURL {
+            try? FileManager.default.removeItem(at: final)
+        }
+    }
+
     // =========================================================================
     // MARK: Internal — display picking
     // =========================================================================
@@ -894,8 +911,16 @@ final class RecEngine: NSObject, ObservableObject {
     // MARK: Internal — microphone
     // =========================================================================
 
-    private func setupMicrophoneSession() async throws {
-        guard let device = AVCaptureDevice.default(for: .audio) else {
+    private func setupMicrophoneSession(uid: String? = nil) async throws {
+        // Fix #3: honour the user's mic selection. Resolve via uniqueID first;
+        // fall back to system default if uid is nil or the device has gone away.
+        let device: AVCaptureDevice?
+        if let uid = uid {
+            device = AVCaptureDevice(uniqueID: uid) ?? AVCaptureDevice.default(for: .audio)
+        } else {
+            device = AVCaptureDevice.default(for: .audio)
+        }
+        guard let device = device else {
             // Red-team #4: no mic connected. Record video-only, surface
             // a warning, do not crash.
             self.lastError = .noMicrophone
@@ -1377,7 +1402,7 @@ struct RecView: View {
                             Spacer()
                             Button("Choose…") { chooseFolder() }
                         }
-                        Toggle("Highlight cursor clicks", isOn: $vm.highlightCursor)
+                        Toggle("Show cursor", isOn: $vm.highlightCursor)
                         Toggle("Send to Stage when stopped", isOn: $vm.sendToStageOnStop)
                     }
                 }
@@ -1462,27 +1487,31 @@ struct RecView: View {
     private func startRecording() {
         Task {
             do {
+                // Fix #1: Request mic permission BEFORE starting the engine
+                // so the OS dialog appears before recording begins and we can
+                // gate the mic track accurately rather than starting it and
+                // then discovering it was denied.
+                var micGranted = vm.microphoneOn
+                if vm.microphoneOn {
+                    let granted = await withCheckedContinuation { cont in
+                        RecPermissions.requestMicrophone { ok in cont.resume(returning: ok) }
+                    }
+                    if !granted {
+                        vm.microphoneOn = false
+                        micGranted = false
+                        SharedStore.stage.flash("Microphone permission denied", kind: .warning)
+                        return
+                    }
+                }
                 try await vm.engine.start(
                     source: vm.buildSource(),
                     outputFolder: vm.outputFolder,
                     systemAudio: vm.systemAudioOn,
-                    microphone: vm.microphoneOn,
+                    microphone: micGranted,
+                    micUID: vm.selectedMicUID,
                     showsCursor: vm.highlightCursor,
                     excludeBundleID: Bundle.main.bundleIdentifier
                 )
-                // Mic permission prompt happens on first sample-buffer
-                // delegate dispatch; we proactively prompt here too so the
-                // OS dialog appears before the user wonders why mic meter
-                // is flat.
-                if vm.microphoneOn {
-                    RecPermissions.requestMicrophone { ok in
-                        if !ok {
-                            Task { @MainActor in
-                                vm.engine.lastError = .needsMicrophonePermission
-                            }
-                        }
-                    }
-                }
             } catch {
                 // Engine already set lastError; nothing else to do.
             }
@@ -1819,6 +1848,17 @@ struct RecHUD: View {
                     .accessibilityHidden(true)
 
                     Spacer()
+
+                    // Fix #2: Discard button — stop and delete the temp file
+                    // without propagating lastOutputURL to the caller.
+                    Button {
+                        Task { await engine.discard() }
+                    } label: {
+                        Label("Discard", systemImage: "trash")
+                    }
+                    .controlSize(.large)
+                    .foregroundStyle(.red)
+                    .help("Stop recording and delete this clip")
                 }
             }
         }
