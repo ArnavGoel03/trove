@@ -553,6 +553,7 @@ private func outputsProducerLabel(_ id: String) -> String {
     case "image_tools.convert": return "Image Tools"
     case "ocr.capture":       return "OCR Capture"
     case "recorder":          return "Screen Recorder"
+    case "color.palette":     return "Color Palette"
     default:                  return id
     }
 }

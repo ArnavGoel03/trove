@@ -917,6 +917,12 @@ public struct XformView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .navigationTitle("Text Transforms")
         .navigationSubtitle(subtitle)
+        .onAppear {
+            ingestSmartXformPayload(StageSmartActionQueue.shared.drain(.troveSmartOpenInXform))
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .troveSmartOpenInXform)) { n in
+            ingestSmartXformPayload(n.userInfo)
+        }
     }
 
     // MARK: subtitle
@@ -1279,6 +1285,14 @@ public struct XformView: View {
         f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "yyyy-MM-dd HH:mm"
         return f.string(from: Date())
+    }
+
+    // MARK: - Smart Action receiver
+
+    private func ingestSmartXformPayload(_ info: [AnyHashable: Any]?) {
+        guard let info,
+              let text = info[StageSmartKey.text] as? String, !text.isEmpty else { return }
+        model.setInput(text)
     }
 }
 

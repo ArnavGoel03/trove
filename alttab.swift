@@ -681,7 +681,7 @@ fileprivate struct AltTabOverlayHost: View {
                     .padding(.horizontal, 16).padding(.bottom, 14)
                     }
                 }
-                .onChange(of: state.cursor) { _, new in
+                .onChange(of: state.cursor) { new in
                     if new < items.count {
                         // red-team: scroll animation ignored Reduce Motion.
                         // Under the setting, snap instantly to the new target.

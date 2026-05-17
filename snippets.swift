@@ -356,6 +356,7 @@ struct SnippetsView: View {
 
     @State private var editorTarget: SnippetEditorTarget? = nil
     @State private var deleteCandidate: Snippet? = nil
+    @State private var pendingSnippetBody: String? = nil
 
     var body: some View {
         Group {
@@ -382,7 +383,8 @@ struct SnippetsView: View {
             SnippetEditorSheet(
                 store: store,
                 target: target,
-                onClose: { editorTarget = nil }
+                onClose: { editorTarget = nil; pendingSnippetBody = nil },
+                prefillBody: pendingSnippetBody
             )
             .frame(minWidth: 520, idealWidth: 600, minHeight: 420, idealHeight: 480)
         }
@@ -409,7 +411,18 @@ struct SnippetsView: View {
                 stage.flash(msg)
                 store.lastErrorMessage = nil
             }
+            ingestSmartSnippetsPayload(StageSmartActionQueue.shared.drain(.troveSmartOpenInSnippets))
         }
+        .onReceive(NotificationCenter.default.publisher(for: .troveSmartOpenInSnippets)) { n in
+            ingestSmartSnippetsPayload(n.userInfo)
+        }
+    }
+
+    private func ingestSmartSnippetsPayload(_ info: [AnyHashable: Any]?) {
+        guard let info,
+              let text = info[StageSmartKey.text] as? String, !text.isEmpty else { return }
+        pendingSnippetBody = text
+        editorTarget = .new
     }
 
     private var subtitle: String {
@@ -617,6 +630,7 @@ private struct SnippetEditorSheet: View {
     @ObservedObject var store: SnippetStore
     let target: SnippetEditorTarget
     let onClose: () -> Void
+    var prefillBody: String? = nil
 
     @EnvironmentObject var stage: Stage
 
@@ -742,7 +756,7 @@ private struct SnippetEditorSheet: View {
         loaded = true
         switch target {
         case .new:
-            name = ""; draftBody = ""; tagsText = ""
+            name = ""; draftBody = prefillBody ?? ""; tagsText = ""
         case .edit(let id):
             // Red-team #7: snippet may have been deleted between sheet presentation
             // and load. Mark the sheet as orphaned and let the user save a copy.

@@ -307,8 +307,19 @@ enum FinderPath {
         guard let script = NSAppleScript(source: src) else {
             return .error("Could not compile AppleScript")
         }
+        let group = DispatchGroup()
+        group.enter()
         var errInfo: NSDictionary?
-        let result = script.executeAndReturnError(&errInfo)
+        var descriptor: NSAppleEventDescriptor?
+        DispatchQueue.global(qos: .userInitiated).async {
+            var err: NSDictionary?
+            descriptor = script.executeAndReturnError(&err)
+            errInfo = err
+            group.leave()
+        }
+        if group.wait(timeout: .now() + 5.0) == .timedOut {
+            return .error("Finder is unresponsive — AppleScript timed out")
+        }
 
         if let info = errInfo {
             let num = (info[NSAppleScript.errorNumber] as? Int) ?? 0
@@ -330,7 +341,7 @@ enum FinderPath {
 
         // Keep the AppleScript result as String — `stringValue` honors UTF-16,
         // so non-ASCII path components (e.g. ~/Документы) round-trip cleanly.
-        guard let path = result.stringValue, !path.isEmpty else {
+        guard let path = descriptor?.stringValue, !path.isEmpty else {
             return .noWindow
         }
         return .ok(path)

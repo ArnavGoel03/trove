@@ -219,7 +219,12 @@ final class ProcModel: ObservableObject {
         didSet { if oldValue != sortKey { regroup() } }
     }
     @Published var interval: Double = 1.0      // seconds; 1 / 2 / 5
-    @Published var paused: Bool = false
+    @Published var paused: Bool = false {
+        didSet {
+            guard oldValue != paused else { return }
+            if paused { stop() } else { start() }
+        }
+    }
     @Published var lastError: String? = nil
 
     /// PID → row. Survives across ticks so sparkline histories accrue.
@@ -250,13 +255,9 @@ final class ProcModel: ObservableObject {
         tickTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.tick()
-                // Read interval on the main actor; if paused, sleep a short
-                // beat then re-check so resume is responsive.
                 let sleepNS: UInt64 = await MainActor.run { [weak self] in
                     guard let self = self else { return UInt64(0) }
-                    return self.paused
-                        ? UInt64(0.25 * 1_000_000_000)
-                        : UInt64(self.interval * 1_000_000_000)
+                    return UInt64(self.interval * 1_000_000_000)
                 }
                 if sleepNS == 0 { break }
                 try? await Task.sleep(nanoseconds: sleepNS)
@@ -478,8 +479,8 @@ func procSendSignal(_ pid: Int32, _ sig: Int32) -> ProcKillResult {
 /// Wait up to `timeout` seconds for a PID to disappear. Polls via `kill(pid, 0)`
 /// which is a noop that returns ESRCH once the process is gone.
 func procWaitForExit(_ pid: Int32, timeout: TimeInterval) async -> Bool {
-    let start = Date()
-    while Date().timeIntervalSince(start) < timeout {
+    let deadline = ContinuousClock.now + .seconds(timeout)
+    while ContinuousClock.now < deadline {
         // red-team: snap errno immediately after kill() so the !=0 comparison
         // can't accidentally trigger code (e.g. printf during debug) that
         // resets it before we read it.

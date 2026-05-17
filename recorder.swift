@@ -408,7 +408,7 @@ final class RecEngine: NSObject, ObservableObject {
 
     // ---- Pause/resume + timer -----------------------------------------------
 
-    private var startWall: Date?
+    private var startWall: ContinuousClock.Instant?
     private var accumulated: TimeInterval = 0
     private var tickTimer: Timer?
 
@@ -740,7 +740,7 @@ final class RecEngine: NSObject, ObservableObject {
 
         self.isRecording = true
         self.isPaused    = false
-        self.startWall   = Date()
+        self.startWall   = ContinuousClock.now
         RecEngineActivityTracker.setActive(true)
         startTickTimer()
         // Prevent system sleep during recording — SCStream and AVAssetWriter
@@ -764,14 +764,14 @@ final class RecEngine: NSObject, ObservableObject {
     func pause() {
         guard isRecording, !isPaused else { return }
         isPaused = true
-        if let started = startWall { accumulated += Date().timeIntervalSince(started) }
+        if let started = startWall { accumulated += (ContinuousClock.now - started).timeInterval }  // uses Duration.timeInterval from main.swift
         startWall = nil
     }
 
     func resume() {
         guard isRecording, isPaused else { return }
         isPaused = false
-        startWall = Date()
+        startWall = ContinuousClock.now
     }
 
     /// Stop and finalize. Always renames .tmp.mp4 → final.mp4 on success;
@@ -798,6 +798,14 @@ final class RecEngine: NSObject, ObservableObject {
         videoInput?.markAsFinished()
         systemAudioIn?.markAsFinished()
         micAudioIn?.markAsFinished()
+
+        // Fix #24: release the sleep-prevention assertion before finishWriting()
+        // so it isn't held during potentially-long file finalization.
+        if pmAssertionID != IOPMAssertionID(0) {
+            IOPMAssertionRelease(pmAssertionID)
+            pmAssertionID = IOPMAssertionID(0)
+            writePMShadow(id: IOPMAssertionID(0))
+        }
 
         if let writer = writer {
             await writer.finishWriting()
@@ -847,12 +855,7 @@ final class RecEngine: NSObject, ObservableObject {
         teardownMicrophoneSession()
         // red-team: clear finalize latch so a future start/stop cycle works
         self.isFinalizing = false
-        // Release IOPMAssertion now that recording has ended.
-        if pmAssertionID != IOPMAssertionID(0) {
-            IOPMAssertionRelease(pmAssertionID)
-            pmAssertionID = IOPMAssertionID(0)
-            writePMShadow(id: IOPMAssertionID(0))
-        }
+        // IOPMAssertion already released above (before finishWriting).
         RecEngineActivityTracker.setActive(false)
         // If applicationShouldTerminate returned .terminateLater, now signal.
         if !RecEngineActivityTracker.isActive {
@@ -962,14 +965,15 @@ final class RecEngine: NSObject, ObservableObject {
             guard let self = self else { return }
             Task { @MainActor in
                 if !self.isPaused, let s = self.startWall {
-                    self.elapsed = self.accumulated + Date().timeIntervalSince(s)
+                    self.elapsed = self.accumulated + (ContinuousClock.now - s).timeInterval
                 } else {
                     self.elapsed = self.accumulated
                 }
                 // File-size estimate from the writer's current output. We
                 // stat the file on a background task rather than blocking the
                 // main thread with attributesOfItem at 4 Hz.
-                if let url = self.tempURL {
+                // Fix #23: skip the stat when paused — file isn't growing.
+                if !self.isPaused, let url = self.tempURL {
                     let filePath = url.path
                     Task.detached(priority: .utility) { [weak self] in
                         if let attrs = try? FileManager.default.attributesOfItem(atPath: filePath),

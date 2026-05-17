@@ -1850,6 +1850,15 @@ public struct PDFToolsView: View {
         }
         .navigationTitle("PDF Tools")
         .navigationSubtitle(currentOp?.title ?? "100% local — PDFKit + Vision, no uploads")
+        .onAppear {
+            ingestSmartPDFPayload(StageSmartActionQueue.shared.drain(.troveSmartOpenInPDFTool))
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .troveSmartOpenInPDFTool)) { n in
+            ingestSmartPDFPayload(n.userInfo)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .troveOpenInPDFTool)) { n in
+            ingestPDFReopenPayload(n.userInfo)
+        }
         .toolbar {
             if m.working {
                 ToolbarItemGroup(placement: .primaryAction) {
@@ -1942,6 +1951,28 @@ public struct PDFToolsView: View {
 
     private var allRecents: [PDFOpsOutput] {
         recents.byOp.values.flatMap { $0 }.sorted { $0.createdAt > $1.createdAt }
+    }
+
+    // MARK: - Smart Action + Re-edit receivers
+
+    private func ingestSmartPDFPayload(_ info: [AnyHashable: Any]?) {
+        guard let info,
+              let urls = info[StageSmartKey.urls] as? [URL], !urls.isEmpty else { return }
+        let opStr = info[StageSmartKey.op] as? String
+        let op = PDFOpKind(rawValue: opStr ?? "") ?? .merge
+        m.clear()
+        m.addPDFFiles(urls)
+        currentOp = op
+    }
+
+    private func ingestPDFReopenPayload(_ info: [AnyHashable: Any]?) {
+        guard let info,
+              let url = info["url"] as? URL else { return }
+        let opStr = info["op"] as? String
+        let op = PDFOpKind(rawValue: opStr ?? "") ?? .merge
+        m.clear()
+        m.addPDFFiles([url])
+        currentOp = op
     }
 }
 
@@ -3204,7 +3235,7 @@ struct PDFSourceThumb: View {
         }
         .onAppear(perform: loadIfNeeded)
         // Refire if a re-validation flipped `invalid` so the border updates.
-        .onChange(of: url) { _, _ in
+        .onChange(of: url) { _ in
             image = nil; loadFailed = false; loadIfNeeded()
         }
         .accessibilityLabel(invalid ? "Couldn't load \(url.lastPathComponent)"

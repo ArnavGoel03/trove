@@ -10,6 +10,14 @@ import Combine
 import ServiceManagement
 import UniformTypeIdentifiers
 
+// ContinuousClock.Instant difference → TimeInterval bridge used across the codebase.
+extension Duration {
+    var timeInterval: TimeInterval {
+        let (secs, attosecs) = components
+        return TimeInterval(secs) + TimeInterval(attosecs) / 1e18
+    }
+}
+
 // ===========================================================================
 // MARK: - App entry + menu bar
 // ===========================================================================
@@ -282,6 +290,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // red-team: install the configurable global hotkey (⌘⇧2 → full-screen
         // screenshot to Stage by default). Settings UI lives in Customize.
+        // Pin NSWindow appearance to the user's chosen Trove theme so chrome
+        // doesn't follow macOS Light/Dark mode independently. The theme picker
+        // lives on the welcome sheet (first run) and in Settings → Theme.
+        TroveThemeStore.shared.applyAppearance()
+
         TroveGlobalHotkeys.shared.install()
 
         // Auto-check for updates if enabled (default ON). Throttled — checks
@@ -574,10 +587,36 @@ final class PasteboardWatcher {
         if handlers.isEmpty { stopTimer() }
     }
 
+    private var appActiveObserver: NSObjectProtocol?
+    private var appResignObserver: NSObjectProtocol?
+    private var appIsActive: Bool = true
+
     private func startIfNeeded() {
         guard timer == nil else { return }
         lastChangeCount = NSPasteboard.general.changeCount
-        let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+        // Throttle to 1s when app is hidden/inactive to save CPU.
+        if appActiveObserver == nil {
+            appActiveObserver = NotificationCenter.default.addObserver(
+                forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                self?.appIsActive = true
+                self?.restartTimer()
+            }
+            appResignObserver = NotificationCenter.default.addObserver(
+                forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                self?.appIsActive = false
+                self?.restartTimer()
+            }
+        }
+        restartTimer()
+    }
+
+    private func restartTimer() {
+        timer?.invalidate()
+        guard !handlers.isEmpty else { timer = nil; return }
+        let interval: TimeInterval = appIsActive ? 0.5 : 1.0
+        let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             guard let self else { return }
             let cc = NSPasteboard.general.changeCount
             guard cc != self.lastChangeCount else { return }
@@ -591,6 +630,8 @@ final class PasteboardWatcher {
     private func stopTimer() {
         timer?.invalidate()
         timer = nil
+        if let o = appActiveObserver { NotificationCenter.default.removeObserver(o); appActiveObserver = nil }
+        if let o = appResignObserver { NotificationCenter.default.removeObserver(o); appResignObserver = nil }
     }
 }
 
@@ -1512,6 +1553,10 @@ struct CustomizeView: View {
                 // rebindable, persists across launches).
                 HotkeySettingsCard()
 
+                // Theme — Dark default, plus Light / System / Linear / Cron /
+                // Custom. App keeps its theme regardless of macOS Light/Dark.
+                ThemeSettingsCard()
+
                 // Auto-update checker (default ON, throttled to 6h).
                 UpdateCheckerCard()
 
@@ -1841,7 +1886,7 @@ struct QuickSwitcherView: View {
                         }
                     }
                 }
-                .onChange(of: selected) { _, new in
+                .onChange(of: selected) { new in
                     proxy.scrollTo(new, anchor: .center)
                 }
                 .frame(maxHeight: 360)
@@ -1867,7 +1912,7 @@ struct QuickSwitcherView: View {
             allItems = buildAllItems()
             updateResults(for: query)
         }
-        .onChange(of: query) { _, newValue in
+        .onChange(of: query) { newValue in
             selected = 0
             updateResults(for: newValue)
         }
@@ -2549,27 +2594,45 @@ struct WelcomeSheet: View {
                     .padding(.top, 32)
                 Text("Welcome to Trove")
                     .font(.system(.title, design: .rounded).weight(.bold))
-                Text("32 local-only tools, zero telemetry.")
+                Text("Your private scratch pad. Stage, transform, and share — everything stays on your Mac.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 340)
             }
             .padding(.bottom, 24)
 
             // Hint bullets
             Card {
                 VStack(alignment: .leading, spacing: 14) {
-                    WelcomeHint(icon: "magnifyingglass", label: "Press ⌘K to find any tool")
-                    WelcomeHint(icon: "square.and.arrow.down", label: "Drop or paste anything into Stage")
-                    WelcomeHint(icon: "slider.horizontal.3", label: "Customize the sidebar in Settings ⌘,")
+                    WelcomeHint(icon: "tray.full.fill",
+                                label: "Stage anything — drag, paste ⌘⇧V, or capture ⌘⇧N")
+                    WelcomeHint(icon: "magnifyingglass",
+                                label: "⌘K opens Quick Switcher — jump to any tool instantly")
+                    WelcomeHint(icon: "slider.horizontal.3",
+                                label: "Sidebar is yours — hide panes you don't use in ⌘,")
+                    WelcomeHint(icon: "menubar.rectangle",
+                                label: "⌘W hides the window — Trove stays in your menu bar")
                 }
             }
             .padding(.horizontal, 24)
+
+            // Theme picker — user can pick their theme upfront. Dark is
+            // pre-selected with a "Recommended" badge. Changeable later in ⌘,.
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Pick a theme").font(.subheadline).fontWeight(.semibold)
+                ThemePickerGrid(compact: true)
+                Text("You can change this anytime in Settings ⌘,")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 16)
 
             Button {
                 onDismiss()
                 dismiss()
             } label: {
-                Text("Got it")
+                Text("Start using Trove")
                     .font(.headline)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 10)
@@ -2579,7 +2642,18 @@ struct WelcomeSheet: View {
             .keyboardShortcut(.escape, modifiers: [])
             .padding(.horizontal, 24)
             .padding(.top, 20)
-            .padding(.bottom, 28)
+
+            HStack(spacing: 4) {
+                if let privacyURL = URL(string: "https://gettrove.vercel.app/privacy") {
+                    Link("Privacy policy", destination: privacyURL)
+                        .font(.caption)
+                }
+                Text("  ·  No telemetry, ever.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.bottom, 24)
+            .padding(.top, 8)
         }
         .frame(width: 400)
     }
@@ -2699,62 +2773,54 @@ extension Int64 {
 // ===========================================================================
 
 extension Color {
-    // Helper: wraps NSColor dynamic-provider so SwiftUI Color adapts to
-    // light/dark mode automatically. Dark values match the existing tokens;
-    // light values use near-white backgrounds and near-black text.
-    private static func dynamic(
-        light: (r: CGFloat, g: CGFloat, b: CGFloat),
-        dark:  (r: CGFloat, g: CGFloat, b: CGFloat)
-    ) -> Color {
-        Color(NSColor(name: nil) { appearance in
-            let isDark = appearance.bestMatch(from: [.darkAqua, .vibrantDark]) != nil
-            let c = isDark ? dark : light
-            return NSColor(calibratedRed: c.r, green: c.g, blue: c.b, alpha: 1.0)
-        })
+    // Trove's color tokens now read from `TroveThemeStore.shared` so the app
+    // keeps its own theme regardless of macOS Light/Dark mode. User can switch
+    // theme on first run (welcome sheet) or in Settings → Theme. Default is
+    // `.dark` — the original Trove look. Reads UserDefaults directly so this
+    // stays `nonisolated` (no MainActor hop needed for static accessors).
+    private static func currentPalette() -> TrovePalette {
+        let raw = UserDefaults.standard.string(forKey: TroveThemeStore.keyTheme) ?? TroveTheme.dark.rawValue
+        let theme = TroveTheme(rawValue: raw) ?? .dark
+        switch theme {
+        case .dark:   return .dark
+        case .light:  return .light
+        case .linear: return .linear
+        case .cron:   return .cron
+        case .system:
+            // Resolve against the live app appearance. Falls back to dark when
+            // unable to determine.
+            return TrovePalette.forSystem(NSApp.effectiveAppearance)
+        case .custom:
+            // Custom theme reads its own JSON blob from UserDefaults each access.
+            if let data = UserDefaults.standard.data(forKey: TroveThemeStore.keyCustom),
+               let ct = try? JSONDecoder().decode(TroveCustomTheme.self, from: data) {
+                return ct.toPalette()
+            }
+            return .dark
+        }
     }
 
-    /// Page background — dark: #08080B / light: #F5F5F7.
-    static let troveBg = dynamic(
-        light: (r: 0.961, g: 0.961, b: 0.969),
-        dark:  (r: 0.031, g: 0.031, b: 0.043))
-    /// Elevated surface — dark: #0E0E12 / light: #FFFFFF.
-    static let troveBgElev = dynamic(
-        light: (r: 1.000, g: 1.000, b: 1.000),
-        dark:  (r: 0.055, g: 0.055, b: 0.071))
-    /// Card stroke — translucent: light uses black/8%, dark uses white/8%.
-    static let troveCardStroke  = Color(NSColor(name: nil) { a in
-        let isDark = a.bestMatch(from: [.darkAqua, .vibrantDark]) != nil
-        return isDark ? NSColor.white.withAlphaComponent(0.08)
-                      : NSColor.black.withAlphaComponent(0.08)
-    })
-    /// Card fill — translucent overlay; adapts automatically via `.thinMaterial`.
-    static let troveCardFill    = Color(NSColor(name: nil) { a in
-        let isDark = a.bestMatch(from: [.darkAqua, .vibrantDark]) != nil
-        return isDark ? NSColor.white.withAlphaComponent(0.035)
-                      : NSColor.black.withAlphaComponent(0.025)
-    })
+    /// Page background — varies per theme.
+    static var troveBg: Color       { currentPalette().bg }
+    /// Elevated surface — sidebar / inset.
+    static var troveBgElev: Color   { currentPalette().bgElev }
+    /// Card stroke — translucent border line.
+    static var troveCardStroke: Color { currentPalette().cardBorder }
+    /// Card fill — translucent overlay.
+    static var troveCardFill: Color { currentPalette().cardBorder.opacity(0.5) }
     /// Solid fallback when Reduce Transparency is on.
-    /// Dark: ~#0E0F14 / Light: #F0F0F5.
-    static let troveCardSolid = dynamic(
-        light: (r: 0.941, g: 0.941, b: 0.961),
-        dark:  (r: 0.055, g: 0.060, b: 0.082))
-    /// `--color-fg-dim` — dark: #A1A1AA / light: #3F3F46.
-    static let troveFgDim = dynamic(
-        light: (r: 0.247, g: 0.247, b: 0.275),
-        dark:  (r: 0.631, g: 0.631, b: 0.667))
-    /// `--color-fg-mute` — dark: #71717A / light: #71717A (same mid-grey).
-    static let troveFgMute = dynamic(
-        light: (r: 0.443, g: 0.443, b: 0.478),
-        dark:  (r: 0.443, g: 0.443, b: 0.478))
-    /// Hairline divider — dark: #1F1F24 / light: #E4E4E7.
-    static let troveLine = dynamic(
-        light: (r: 0.894, g: 0.894, b: 0.906),
-        dark:  (r: 0.122, g: 0.122, b: 0.141))
-    /// Warm orange accent — `--color-accent` (#FF7A45). Same in both modes.
+    static var troveCardSolid: Color { currentPalette().cardSolid }
+    /// Secondary text color.
+    static var troveFgDim: Color    { currentPalette().fgDim }
+    /// Tertiary / placeholder text color.
+    static var troveFgMute: Color   { currentPalette().fgMute }
+    /// Hairline divider.
+    static var troveLine: Color     { currentPalette().line }
+    /// Warm orange accent — `--color-accent` (#FF7A45). Same across all themes.
     static let troveAccent      = Color(red: 1.0,   green: 0.478, blue: 0.271)
-    /// Magenta accent — `--color-accent-2` (#B27CFF). Same in both modes.
+    /// Magenta accent — `--color-accent-2` (#B27CFF). Same across themes.
     static let troveAccentAlt   = Color(red: 0.698, green: 0.486, blue: 1.0)
-    /// Sky accent — `--color-accent-3` (#4CB8FF). Same in both modes.
+    /// Sky accent — `--color-accent-3` (#4CB8FF). Same across themes.
     static let troveAccentSky   = Color(red: 0.298, green: 0.722, blue: 1.0)
 }
 
@@ -3152,7 +3218,10 @@ final class Stage: ObservableObject {
 
     func pasteFromClipboard() {
         // Explicit user action — accept everything but oversized binary blobs.
-        guard let payload = ClipboardReader.snapshot(strict: false) else { return }
+        guard let payload = ClipboardReader.snapshot(strict: false) else {
+            flash("Nothing on clipboard to paste")
+            return
+        }
         ingest(payload)
     }
 
@@ -3167,7 +3236,23 @@ final class Stage: ObservableObject {
         switch payload {
         case .text(let s):  addText(s)
         case .image(let i): addImage(i)
-        case .files(let us): for u in us { addFile(u) }
+        case .files(let us):
+            let fm = FileManager.default
+            var skipped = 0
+            for u in us {
+                let res = try? u.resourceValues(forKeys: [.isRegularFileKey])
+                if res?.isRegularFile == true {
+                    addFile(u)
+                } else if fm.fileExists(atPath: u.path) {
+                    // directories / packages — still stage them
+                    addFile(u)
+                } else {
+                    skipped += 1
+                }
+            }
+            if skipped > 0 {
+                flash("\(skipped) clipboard item\(skipped == 1 ? "" : "s") not found — skipped")
+            }
         }
     }
 
@@ -3191,13 +3276,24 @@ final class Stage: ObservableObject {
         do {
             try png.write(to: url)
             items.append(StagedItem(kind: .image(url)))
+            enforceCapIfNeeded()
         } catch { /* ignore */ }
     }
 
-    func addText(_ s: String) { items.append(StagedItem(kind: .text(s))) }
-    func addFile(_ url: URL)  { items.append(StagedItem(kind: .file(url))) }
+    func addText(_ s: String) { items.append(StagedItem(kind: .text(s))); enforceCapIfNeeded() }
+    func addFile(_ url: URL)  { items.append(StagedItem(kind: .file(url))); enforceCapIfNeeded() }
     func remove(_ id: UUID)   { items.removeAll { $0.id == id } }
     func clear()              { items.removeAll() }
+
+    private func enforceCapIfNeeded() {
+        let cap = max(1, UserDefaults.standard.integer(forKey: "trove.stage.cap") == 0
+                        ? 100
+                        : UserDefaults.standard.integer(forKey: "trove.stage.cap"))
+        guard items.count > cap else { return }
+        let dropped = items.count - cap
+        items.removeFirst(dropped)
+        flash("Oldest staged item\(dropped == 1 ? "" : "s") dropped — Stage is at cap (\(cap))")
+    }
 
     func captureScreenshot() {
         // red-team: Esc-cancel produces no file → guarded by fileExists check below.
@@ -3432,11 +3528,25 @@ struct StageView: View {
         for p in providers.prefix(500) {
             if p.canLoadObject(ofClass: URL.self) {
                 _ = p.loadObject(ofClass: URL.self) { obj, _ in
-                    // Fix 8: reject non-regular-file URLs (e.g. /dev/urandom) before staging.
-                    guard let u = obj,
-                          (try? u.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
-                    else { return }
-                    DispatchQueue.main.async { stage.addFile(u) }
+                    guard let u = obj else { return }
+                    let keys: Set<URLResourceKey> = [.isRegularFileKey, .isDirectoryKey, .isPackageKey]
+                    let res = try? u.resourceValues(forKeys: keys)
+                    if res?.isRegularFile == true {
+                        // Normal file — stage directly.
+                        DispatchQueue.main.async { stage.addFile(u) }
+                    } else if res?.isPackage == true {
+                        // .app bundles and other packages — stage as a unit, don't expand.
+                        DispatchQueue.main.async { stage.addFile(u) }
+                    } else if res?.isDirectory == true {
+                        // Folder — expand to contained files.
+                        let expanded = troveExpandFolders([u])
+                        DispatchQueue.main.async {
+                            expanded.forEach { stage.addFile($0) }
+                            if !expanded.isEmpty {
+                                stage.flash("Added \(expanded.count) file\(expanded.count == 1 ? "" : "s") from folder")
+                            }
+                        }
+                    }
                 }
             } else if p.hasItemConformingToTypeIdentifier("public.image") {
                 // Fix 6: check data size BEFORE instantiating NSImage to avoid OOM.
@@ -3561,6 +3671,9 @@ struct StageCard: View {
     /// Position in the staged list — drives the `⌥N` indicator.
     let index: Int
     @State private var hover = false
+    /// Decoded thumbnail for .image items and workspace icon for .file items,
+    /// loaded off the main thread to avoid blocking the UI.
+    @State private var loadedImage: NSImage? = nil
 
     /// Red-team: a staged file URL can be moved/deleted out from under us between
     /// being added and being copied. Detect at render time so the user sees a
@@ -3664,6 +3777,22 @@ struct StageCard: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(kindLabel): \(titleText)")
         .accessibilityHint(previewText)
+        .task(id: item.id) {
+            switch item.kind {
+            case .image(let u):
+                let img = await Task.detached(priority: .userInitiated) {
+                    NSImage(contentsOf: u)
+                }.value
+                loadedImage = img
+            case .file(let u):
+                let img = await Task.detached(priority: .userInitiated) {
+                    NSWorkspace.shared.icon(forFile: u.path)
+                }.value
+                loadedImage = img
+            case .text:
+                break
+            }
+        }
     }
 
     /// Row background — black wash + leading tint gradient bleed.
@@ -3694,13 +3823,13 @@ struct StageCard: View {
         .frame(width: 36, height: 36)
     }
 
-    /// Icon glyph — for `.image` items we render a tiny thumbnail crop, so the
-    /// row carries genuine visual info (preserving the old grid's "I can see
-    /// what I copied" affordance in a row-shape).
+    /// Icon glyph — for `.image` items we render a tiny thumbnail crop; for
+    /// `.file` items we use the real Finder workspace icon. Both are loaded
+    /// off the main thread via `loadedImage` / `.task`.
     @ViewBuilder private var iconContent: some View {
         switch item.kind {
-        case .image(let u):
-            if let img = NSImage(contentsOf: u) {
+        case .image:
+            if let img = loadedImage {
                 Image(nsImage: img)
                     .resizable()
                     .interpolation(.medium)
@@ -3708,18 +3837,25 @@ struct StageCard: View {
                     .frame(width: 32, height: 32)
                     .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
             } else {
-                Image(systemName: "photo")
-                    .font(.system(size: 14))
-                    .foregroundStyle(.white.opacity(0.8))
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .scaleEffect(0.5)
             }
         case .text:
             Image(systemName: "text.alignleft")
                 .font(.system(size: 14))
                 .foregroundStyle(.white.opacity(0.8))
-        case .file(let u):
-            Image(systemName: u.hasDirectoryPath ? "folder.fill" : "doc.fill")
-                .font(.system(size: 14))
-                .foregroundStyle(.white.opacity(0.8))
+        case .file:
+            if let img = loadedImage {
+                Image(nsImage: img)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 28, height: 28)
+            } else {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .scaleEffect(0.5)
+            }
         }
     }
 
@@ -3737,7 +3873,7 @@ struct StageCard: View {
     private var previewText: String {
         switch item.kind {
         case .image(let u):
-            if let img = NSImage(contentsOf: u) {
+            if let img = loadedImage {
                 let sz = img.size
                 return "\(Int(sz.width)) × \(Int(sz.height)) · \(u.pathExtension.uppercased())"
             }

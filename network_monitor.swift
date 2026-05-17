@@ -374,7 +374,12 @@ final class NetModel: ObservableObject {
     @Published var direction: NetDirection = .both
     @Published var groupByApp: Bool = true
     @Published var interval: Double = 1.0   // 1 / 2 / 5
-    @Published var paused: Bool = false
+    @Published var paused: Bool = false {
+        didSet {
+            guard oldValue != paused else { return }
+            if paused { stop() } else { start() }
+        }
+    }
     @Published var lastError: String? = nil
     @Published var hasNettop: Bool = true
     @Published var selectedID: String? = nil
@@ -396,7 +401,7 @@ final class NetModel: ObservableObject {
     /// Red-team #6: bump on every config change so a stale in-flight sampler's
     /// result is discarded instead of being merged with mismatched dt.
     private var generation: UInt64 = 0
-    private var lastTickAt: Date? = nil
+    private var lastTickAt: ContinuousClock.Instant? = nil
     private var wakeObserver: NSObjectProtocol? = nil
 
     func start() {
@@ -427,9 +432,7 @@ final class NetModel: ObservableObject {
                 await self?.tick()
                 let sleepNS: UInt64 = await MainActor.run { [weak self] in
                     guard let self = self else { return 0 }
-                    return self.paused
-                        ? UInt64(0.25 * 1_000_000_000)
-                        : UInt64(self.interval * 1_000_000_000)
+                    return UInt64(self.interval * 1_000_000_000)
                 }
                 if sleepNS == 0 { break }
                 try? await Task.sleep(nanoseconds: sleepNS)
@@ -465,6 +468,7 @@ final class NetModel: ObservableObject {
     }
 
     @MainActor func tick() async {
+        // paused → stop() was already called; guard is a safety net.
         if paused { return }
         // red-team: hard single-in-flight guard. The previous "cancel & launch"
         // dance didn't actually stop the underlying synchronous nettop
@@ -475,8 +479,8 @@ final class NetModel: ObservableObject {
         // until the machine ran out of file descriptors or pids.
         if inFlight != nil { return }
         let myGen = generation
-        let now = Date()
-        let dt = lastTickAt.map { now.timeIntervalSince($0) } ?? interval
+        let now = ContinuousClock.now
+        let dt: TimeInterval = lastTickAt.map { (now - $0).timeInterval } ?? interval
         lastTickAt = now
 
         let task: Task<[NetSample], Error> = Task.detached(priority: .utility) {
@@ -488,7 +492,7 @@ final class NetModel: ObservableObject {
         do {
             let samples = try await task.value
             if myGen != generation { return }   // red-team #6
-            apply(samples, dt: dt, at: now)
+            apply(samples, dt: dt, at: Date())
             lastError = nil
         } catch {
             if myGen != generation { return }
@@ -1056,8 +1060,8 @@ public struct NetworkMonitorView: View {
         VStack(spacing: 0) {
             NetSearchBar(text: $m.search, direction: $m.direction)
                 .padding(.horizontal, 16).padding(.top, 12).padding(.bottom, 8)
-                .onChange(of: m.search)    { _, _ in m.bumpGeneration() }
-                .onChange(of: m.direction) { _, _ in m.bumpGeneration() }
+                .onChange(of: m.search)    { _ in m.bumpGeneration() }
+                .onChange(of: m.direction) { _ in m.bumpGeneration() }
             Divider()
             content
         }
@@ -1229,7 +1233,7 @@ public struct NetworkMonitorView: View {
             }
             .toggleStyle(.button)
             .help("Roll Helper / Renderer processes up under their parent app")
-            .onChange(of: m.groupByApp) { _, _ in m.bumpGeneration() }
+            .onChange(of: m.groupByApp) { _ in m.bumpGeneration() }
 
             Picker("Refresh", selection: $m.interval) {
                 Text("1s").tag(1.0)
@@ -1238,7 +1242,7 @@ public struct NetworkMonitorView: View {
             }
             .pickerStyle(.segmented)
             .help("Sampling interval")
-            .onChange(of: m.interval) { _, _ in m.bumpGeneration() }
+            .onChange(of: m.interval) { _ in m.bumpGeneration() }
 
             Button {
                 m.paused.toggle()

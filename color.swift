@@ -530,6 +530,12 @@ public struct ColorToolView: View {
         }
         .navigationTitle("Color")
         .navigationSubtitle(subtitle)
+        .onAppear {
+            ingestSmartColorPayload(StageSmartActionQueue.shared.drain(.troveSmartOpenInColor))
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .troveSmartOpenInColor)) { n in
+            ingestSmartColorPayload(n.userInfo)
+        }
         .onDrop(of: [.fileURL, .image], isTargeted: $dropTargeted) { providers in
             handleDrop(providers)
             return true
@@ -820,6 +826,12 @@ public struct ColorToolView: View {
                 try csv.data(using: .utf8)?.write(to: dest, options: .atomic)
                 NSWorkspace.shared.activateFileViewerSelecting([dest])
                 SharedStore.stage.flash("Saved palette to \(dest.deletingLastPathComponent().lastPathComponent)")
+                OutputsLibrary.shared.record(
+                    url: dest,
+                    producer: "color.palette",
+                    sourceLabel: store.paletteSourceName ?? "Palette",
+                    kind: "other"
+                )
             } catch {
                 SharedStore.stage.flash("Save failed: \(error.localizedDescription)")
             }
@@ -839,6 +851,12 @@ public struct ColorToolView: View {
             try csv.data(using: .utf8)?.write(to: dest, options: .atomic)
             NSWorkspace.shared.activateFileViewerSelecting([dest])
             SharedStore.stage.flash("Saved palette to Downloads")
+            OutputsLibrary.shared.record(
+                url: dest,
+                producer: "color.palette",
+                sourceLabel: store.paletteSourceName ?? "Palette",
+                kind: "other"
+            )
         } catch {
             SharedStore.stage.flash("Save failed: \(error.localizedDescription)")
         }
@@ -1184,6 +1202,15 @@ public struct ColorToolView: View {
                 }
             }
         }
+    }
+
+    // MARK: - Smart Action receiver
+
+    private func ingestSmartColorPayload(_ info: [AnyHashable: Any]?) {
+        guard let info,
+              let urls = info[StageSmartKey.urls] as? [URL],
+              let url = urls.first else { return }
+        loadPalette(from: url)
     }
 }
 

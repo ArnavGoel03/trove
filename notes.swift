@@ -737,7 +737,7 @@ private struct NoteSearchOverlay: View {
             }
             .padding(.horizontal, 14).padding(.vertical, 8)
             .background(.background.secondary)
-            .onChange(of: store.searchQuery) { _, newValue in
+            .onChange(of: store.searchQuery) { newValue in
                 debounceTask?.cancel()
                 debounceTask = Task { @MainActor in
                     try? await Task.sleep(nanoseconds: 80_000_000) // 80ms

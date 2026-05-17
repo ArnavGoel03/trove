@@ -126,8 +126,20 @@ public struct QRView: View {
         .navigationTitle("QR")
         .navigationSubtitle(subtitle)
         .toolbar { toolbar() }
-        .onChange(of: text) { _, _ in scheduleRegen() }
-        .onChange(of: correction) { _, _ in scheduleRegen() }
+        .onChange(of: text) { _ in scheduleRegen() }
+        .onChange(of: correction) { _ in scheduleRegen() }
+        .onAppear {
+            ingestSmartQRPayload(StageSmartActionQueue.shared.drain(.troveSmartOpenInQR))
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .troveSmartOpenInQR)) { n in
+            ingestSmartQRPayload(n.userInfo)
+        }
+    }
+
+    private func ingestSmartQRPayload(_ info: [AnyHashable: Any]?) {
+        guard let info,
+              let t = info[StageSmartKey.text] as? String, !t.isEmpty else { return }
+        text = t
     }
 
     private var subtitle: String {

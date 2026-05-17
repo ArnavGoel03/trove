@@ -658,6 +658,12 @@ public struct OCRView: View {
             }
         }
         .modifier(OCRTranslationModifier(vm: vm))
+        .onAppear {
+            ingestSmartOCRPayload(StageSmartActionQueue.shared.drain(.troveSmartOpenInOCR))
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .troveSmartOpenInOCR)) { n in
+            ingestSmartOCRPayload(n.userInfo)
+        }
         // red-team: prune orphaned tmp PNGs from prior launches so /tmp doesn't
         // grow without bound across long-lived user sessions. Background prio
         // because it's filesystem-bound and never blocks the UI critical path.
@@ -853,29 +859,37 @@ public struct OCRView: View {
     @ViewBuilder private var actionsCard: some View {
         Card {
             VStack(alignment: .leading, spacing: 14) {
-                HStack(spacing: 12) {
-                    Toggle(isOn: $vm.wantsTranslation) {
-                        Label("Translate to", systemImage: "character.bubble")
-                    }
-                    .toggleStyle(.switch)
-                    .onChange(of: vm.wantsTranslation) { _, on in
-                        if on, let r = vm.recognition, !r.isEmpty { vm.requestTranslation() }
-                    }
+                if #available(macOS 14, *) {
+                    HStack(spacing: 12) {
+                        Toggle(isOn: $vm.wantsTranslation) {
+                            Label("Translate to", systemImage: "character.bubble")
+                        }
+                        .toggleStyle(.switch)
+                        .onChange(of: vm.wantsTranslation) { on in
+                            if on, let r = vm.recognition, !r.isEmpty { vm.requestTranslation() }
+                        }
 
-                    Picker("", selection: $vm.translationTarget) {
-                        ForEach(OCRTargets.all) { t in
-                            Text(t.label).tag(t)
+                        Picker("", selection: $vm.translationTarget) {
+                            ForEach(OCRTargets.all) { t in
+                                Text(t.label).tag(t)
+                            }
                         }
-                    }
-                    .pickerStyle(.menu)
-                    .frame(maxWidth: 180)
-                    .disabled(!vm.wantsTranslation)
-                    .onChange(of: vm.translationTarget) { _, _ in
-                        if vm.wantsTranslation, let r = vm.recognition, !r.isEmpty {
-                            vm.requestTranslation()
+                        .pickerStyle(.menu)
+                        .frame(maxWidth: 180)
+                        .disabled(!vm.wantsTranslation)
+                        .onChange(of: vm.translationTarget) { _ in
+                            if vm.wantsTranslation, let r = vm.recognition, !r.isEmpty {
+                                vm.requestTranslation()
+                            }
                         }
+                        Spacer()
                     }
-                    Spacer()
+                } else {
+                    HStack(spacing: 12) {
+                        Label("Translate requires macOS 14+", systemImage: "character.bubble")
+                            .font(.callout).foregroundStyle(.secondary)
+                        Spacer()
+                    }
                 }
 
                 Divider()
@@ -1226,6 +1240,20 @@ public struct OCRView: View {
             }
         }
     }
+
+    // MARK: - Smart Action receiver
+
+    private func ingestSmartOCRPayload(_ info: [AnyHashable: Any]?) {
+        guard let info,
+              let urls = info[StageSmartKey.urls] as? [URL],
+              let url = urls.first else { return }
+        vm.capturedURL = url
+        vm.capturedImage = nil
+        vm.recognition = nil
+        vm.translatedText = ""
+        vm.working = true
+        Task { await vm.runRecognition(url: url) }
+    }
 }
 
 // ===========================================================================
@@ -1318,7 +1346,7 @@ private struct OCRTranslationTask: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .onChange(of: vm.translationConfigVersion) { _, _ in rebuild() }
+            .onChange(of: vm.translationConfigVersion) { _ in rebuild() }
             .onAppear { rebuild() }
             .translationTask(config) { session in
                 guard let r = vm.recognition, !r.isEmpty else { return }

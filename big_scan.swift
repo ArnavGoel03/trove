@@ -338,7 +338,7 @@ final class BigScanWalker {
 
     /// Run the deep walk. Throws `CancellationError` if the caller cancels.
     func run(progress: @escaping (Progress) -> Void) async throws -> BigScanResult {
-        let started = Date()
+        let started = ContinuousClock.now
         var prog = Progress()
 
         // Top-N heaps
@@ -647,7 +647,7 @@ final class BigScanWalker {
         let result = BigScanResult(
             root: options.root,
             computedAt: Date(),
-            elapsed: Date().timeIntervalSince(started),
+            elapsed: (ContinuousClock.now - started).timeInterval,
             filesScanned: prog.files,
             dirsScanned: prog.dirs,
             skippedNoAccess: prog.skipped,

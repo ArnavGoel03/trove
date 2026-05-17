@@ -126,9 +126,10 @@ final class UpdateChecker: ObservableObject {
         "https://api.github.com/repos/\(repoOwner)/\(repoName)/releases"
     }
 
-    private static let keyAutoCheck    = "updater.autoCheckEnabled"
-    private static let keyPrereleases  = "updater.includePrereleases"
-    private static let keyLastCheck    = "updater.lastCheckAt"
+    private static let keyAutoCheck     = "updater.autoCheckEnabled"
+    private static let keyPrereleases   = "updater.includePrereleases"
+    private static let keyLastCheck     = "updater.lastCheckAt"
+    private static let keyLastCheckUptime = "updater.lastCheckUptime"
 
     private init() {
         let d = UserDefaults.standard
@@ -154,6 +155,14 @@ final class UpdateChecker: ObservableObject {
     /// every error path is handled) silently degrades instead of bubbling.
     func checkOnLaunchIfEligible() {
         guard autoCheckEnabled else { return }
+        // Prefer uptime-based cooldown (immune to wall-clock jumps / NTP skew).
+        // Fall back to wall-clock for cold-boot resume where uptime restarts.
+        let currentUptime = ProcessInfo.processInfo.systemUptime
+        let savedUptime = UserDefaults.standard.double(forKey: Self.keyLastCheckUptime)
+        if savedUptime > 0, currentUptime > savedUptime,
+           currentUptime - savedUptime < 6 * 3600 {
+            return
+        }
         if let last = lastCheck, Date().timeIntervalSince(last) < 6 * 3600 {
             return
         }
@@ -403,6 +412,7 @@ final class UpdateChecker: ObservableObject {
         let now = Date()
         lastCheck = now
         UserDefaults.standard.set(now, forKey: Self.keyLastCheck)
+        UserDefaults.standard.set(ProcessInfo.processInfo.systemUptime, forKey: Self.keyLastCheckUptime)
     }
 }
 

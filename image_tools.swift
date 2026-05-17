@@ -946,6 +946,15 @@ public struct ImageToolsView: View {
         .navigationTitle("Image Tools")
         .navigationSubtitle(subtitle)
         .toolbar { toolbar() }
+        .onAppear {
+            ingestSmartImagePayload(StageSmartActionQueue.shared.drain(.troveSmartOpenInImageTools))
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .troveSmartOpenInImageTools)) { n in
+            ingestSmartImagePayload(n.userInfo)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .troveOpenInImageTools)) { n in
+            ingestImageReopenPayload(n.userInfo)
+        }
         // red-team: explicitly include `public.camera-raw-image` so a Finder
         // drag of a `.CR3` or `.ARW` matches even on systems where the RAW
         // UTI doesn't conform to `public.image` by default.
@@ -1521,6 +1530,20 @@ public struct ImageToolsView: View {
         if panel.runModal() == .OK, !panel.urls.isEmpty {
             m.addURLs(panel.urls)
         }
+    }
+
+    // MARK: - Smart Action + Re-edit receivers
+
+    private func ingestSmartImagePayload(_ info: [AnyHashable: Any]?) {
+        guard let info,
+              let urls = info[StageSmartKey.urls] as? [URL], !urls.isEmpty else { return }
+        m.addURLs(urls)
+    }
+
+    private func ingestImageReopenPayload(_ info: [AnyHashable: Any]?) {
+        guard let info,
+              let url = info["url"] as? URL else { return }
+        m.addURLs([url])
     }
 }
 

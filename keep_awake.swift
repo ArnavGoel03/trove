@@ -75,7 +75,7 @@ final class KeepAwakeAssertion {
     private var systemID:  IOPMAssertionID = IOPMAssertionID(0)
     private(set) var hasDisplay: Bool = false
     private(set) var hasSystem:  Bool = false
-    private(set) var startedAt:  Date? = nil
+    private(set) var startedAt:  ContinuousClock.Instant? = nil
     private(set) var reason:     String = "Trove · Keep Awake"
 
     // Shadow copies of the live IDs, guarded by an unfair lock. Written from
@@ -143,7 +143,7 @@ final class KeepAwakeAssertion {
             if rc == kIOReturnSuccess {
                 displayID = id
                 hasDisplay = true
-                startedAt = Date()
+                startedAt = ContinuousClock.now
                 self.reason = reason
             } else {
                 return false
@@ -668,8 +668,8 @@ enum KeepAwakeFormat {
         return f.string(from: d)
     }
 
-    static func uptime(since: Date) -> String {
-        let secs = Int(Date().timeIntervalSince(since))
+    static func uptime(since: ContinuousClock.Instant) -> String {
+        let secs = Int((ContinuousClock.now - since).timeInterval)
         let h = secs / 3600, m = (secs % 3600) / 60, s = secs % 60
         if h > 0 { return String(format: "%dh %02dm %02ds", h, m, s) }
         if m > 0 { return String(format: "%dm %02ds", m, s) }

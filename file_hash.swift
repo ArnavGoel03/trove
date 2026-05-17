@@ -362,6 +362,7 @@ public struct FileHashView: View {
     @StateObject private var vm = HashViewModel()
     @EnvironmentObject var stage: Stage
     @State private var dropTargeted = false
+    @State private var lastAutoCopiedSHA256: String = ""
 
     public init() {}
 
@@ -423,6 +424,20 @@ public struct FileHashView: View {
                 }
                 .disabled(vm.rows.isEmpty)
                 .help("Remove all rows and cancel running hashes")
+            }
+        }
+        .onReceive(vm.objectWillChange) { _ in
+            // Fix #26: auto-copy SHA256 when a single file finishes hashing.
+            // objectWillChange fires before the update; defer to next run loop.
+            DispatchQueue.main.async {
+                guard vm.rows.count == 1,
+                      case .done(_, _, let sha256) = vm.rows[0].state,
+                      sha256 != lastAutoCopiedSHA256 else { return }
+                lastAutoCopiedSHA256 = sha256
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                pb.setString(sha256, forType: .string)
+                stage.flash("SHA256 copied")
             }
         }
     }

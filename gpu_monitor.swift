@@ -705,6 +705,8 @@ final class GPUMonitorModel: ObservableObject {
     private let bufferCap = 60
     private var timer: Timer?
     private var thermalObserver: NSObjectProtocol?
+    private var appResignObserver: NSObjectProtocol?
+    private var appActiveObserver: NSObjectProtocol?
     private var statusItem: NSStatusItem?
     private let powerQueue = DispatchQueue(label: "trove.gpu.power")
     // Fix 16: pmsetTick removed — IOPSCopyPowerSourcesInfo is cheap enough to call every tick.
@@ -724,6 +726,12 @@ final class GPUMonitorModel: ObservableObject {
                 self.thermal = ProcessInfo.processInfo.thermalState
                 self.refreshAlertIcon()
         }
+        appResignObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in guard let self = self, !self.paused else { return }; self.stop() }
+        appActiveObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in guard let self = self, !self.paused else { return }; self.start() }
         // NOTE: `start()` used to fire here, which triggered an immediate
         // synchronous `tick()` — and `tick()` does IOKit / IORegistry
         // traversal + `MTLCopyAllDevices()`, all of which is OK off-main but
@@ -733,7 +741,9 @@ final class GPUMonitorModel: ObservableObject {
 
     deinit {
         timer?.invalidate()
-        if let o = thermalObserver { NotificationCenter.default.removeObserver(o) }
+        if let o = thermalObserver   { NotificationCenter.default.removeObserver(o) }
+        if let o = appResignObserver { NotificationCenter.default.removeObserver(o) }
+        if let o = appActiveObserver { NotificationCenter.default.removeObserver(o) }
         if let s = statusItem { NSStatusBar.system.removeStatusItem(s) }
         // red-team: drop the .floating window level so a torn-down model
         // doesn't leave the user's window stuck above all others.

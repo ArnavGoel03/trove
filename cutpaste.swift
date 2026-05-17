@@ -474,8 +474,16 @@ enum CutPasteFinderBridge {
         end tell
         """
         guard let text = runAppleScript(src), !text.isEmpty else { return [] }
-        return text.split(separator: "\u{0}", omittingEmptySubsequences: true).map {
-            URL(fileURLWithPath: String($0))
+        let badScalars = CharacterSet.controlCharacters.union(
+            CharacterSet(charactersIn: "\u{200E}\u{200F}\u{202A}\u{202B}\u{202C}\u{202D}\u{202E}")
+        )
+        return text.split(separator: "\u{0}", omittingEmptySubsequences: true).compactMap { raw -> URL? in
+            var p = (String(raw) as NSString).precomposedStringWithCanonicalMapping
+            p = String(p.unicodeScalars.filter { !badScalars.contains($0) })
+            guard !p.isEmpty else { return nil }
+            let u = URL(fileURLWithPath: p)
+            if u.path.contains("/.Trash/") || u.path.contains("/.Trashes/") { return nil }
+            return u
         }
     }
 
@@ -493,13 +501,27 @@ enum CutPasteFinderBridge {
         return URL(fileURLWithPath: text.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
-    /// Runs AppleScript synchronously. Returns nil on error and flips the
-    /// `appleScriptDenied` flag if the failure looks like a permission issue
-    /// (red-team #2).
+    /// Runs AppleScript with a 5-second timeout. Returns nil on error or
+    /// timeout, and flips the `appleScriptDenied` flag if the failure looks
+    /// like a permission issue (red-team #2).
     private static func runAppleScript(_ source: String) -> String? {
-        var errInfo: NSDictionary?
         guard let script = NSAppleScript(source: source) else { return nil }
-        let result = script.executeAndReturnError(&errInfo)
+        let group = DispatchGroup()
+        group.enter()
+        var errInfo: NSDictionary?
+        var result: NSAppleEventDescriptor?
+        DispatchQueue.global(qos: .userInitiated).async {
+            var err: NSDictionary?
+            result = script.executeAndReturnError(&err)
+            errInfo = err
+            group.leave()
+        }
+        if group.wait(timeout: .now() + 5.0) == .timedOut {
+            DispatchQueue.main.async {
+                SharedStore.stage.flash("Finder is unresponsive — AppleScript timed out", kind: .warning)
+            }
+            return nil
+        }
         if let err = errInfo {
             let num = (err[NSAppleScript.errorNumber] as? Int) ?? 0
             // -1743 = permission denied; -600 / -10004 = also permission-shaped.
@@ -515,7 +537,7 @@ enum CutPasteFinderBridge {
             }
             return nil
         }
-        return result.stringValue
+        return result?.stringValue
     }
 }
 
