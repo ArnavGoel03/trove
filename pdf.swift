@@ -2033,7 +2033,7 @@ struct PDFOpsCardButton: View {
                             .foregroundStyle(.secondary)
                             .padding(.horizontal, 6)
                             .padding(.vertical, 1)
-                            .background(.background.tertiary, in: Capsule())
+                            .background(Color.troveCardSolid.opacity(0.6), in: Capsule())
                     }
                 }
                 Text(op.title).font(.headline)
@@ -2045,7 +2045,7 @@ struct PDFOpsCardButton: View {
             }
             .padding(14)
             .frame(maxWidth: .infinity, minHeight: 110, alignment: .topLeading)
-            .background(.background.secondary, in: RoundedRectangle(cornerRadius: 10))
+            .background(Color.troveBgElev.opacity(0.8), in: RoundedRectangle(cornerRadius: 10))
             .overlay(
                 RoundedRectangle(cornerRadius: 10)
                     .strokeBorder(hover ? AnyShapeStyle(Color.accentColor.opacity(0.5))
@@ -2324,6 +2324,7 @@ struct PDFOpsDetailView: View {
                     }))
                     .frame(width: 140)
                     .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("PDF password")
             }
         }
         .padding(.vertical, 2)

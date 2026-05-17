@@ -46,8 +46,23 @@ struct TroveApp: App {
 
         .commands {
             // ─── Trove (app menu) ──────────────────────────────────────────
-            // SwiftUI auto-provides About / Settings… / Services / Hide /
-            // Quit. We add a manual "Check for Updates…" right under About.
+            // Replace the default About panel with a custom one that surfaces
+            // the privacy promise and a direct link to the site.
+            CommandGroup(replacing: .appInfo) {
+                Button("About Trove") {
+                    NSApp.orderFrontStandardAboutPanel(options: [
+                        .credits: NSAttributedString(
+                            string: "Local-only productivity. No telemetry, ever.\n\nMade by Arnav Goel.\nhttps://gettrove.vercel.app",
+                            attributes: [.font: NSFont.systemFont(ofSize: 11),
+                                         .foregroundColor: NSColor.secondaryLabelColor]
+                        ),
+                        NSApplication.AboutPanelOptionKey(rawValue: "Copyright"):
+                            "© 2026 Arnav Goel"
+                    ])
+                }
+            }
+
+            // We add a manual "Check for Updates…" right under About.
             CommandGroup(after: .appInfo) {
                 Button("Check for Updates…") {
                     Task { await UpdateChecker.shared.check(quiet: false) }
@@ -114,6 +129,11 @@ struct TroveApp: App {
                 Divider()
                 Button("Customize Sidebar…") { openSettingsWindow() }
                     .keyboardShortcut(",", modifiers: [.command, .shift])
+                Divider()
+                Button("Detach Stage as Floating Panel") {
+                    FloatingStageController.shared.toggle()
+                }
+                .keyboardShortcut("f", modifiers: [.command, .shift])
             }
 
             // ─── Help ──────────────────────────────────────────────────────
@@ -223,7 +243,7 @@ enum TCCDeepLink: String {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var statusItem: NSStatusItem?
     // Keep Awake menu bar one-tap toggle. Observes KeepAwakeCoordinator.masterOn
     // so the checkmark and status-item icon reflect state changes from any
@@ -254,6 +274,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                   accessibilityDescription: "Trove")
         let m = NSMenu()
         m.addItem(make("Show Trove",      #selector(showWin), "0"))
+        m.addItem(make("Detach Stage Panel", #selector(toggleFloatingStage)))
         m.addItem(.separator())
         // One-tap "Prevent Sleep" toggle: holds Keep Awake assertions when on,
         // releases them when off. Checkmark + status-item icon reflect state.
@@ -357,7 +378,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Fix 9: DiskSpeed orphan scratch sweep (unconditional at launch).
             DiskSpeedVolumes.purgeOrphanedScratchOnLaunch()
         }
+
+        // Wire self as window delegate so windowWillClose can show the
+        // one-time "still running in menu bar" hint. SwiftUI creates the
+        // window shortly after launch, so we listen for the first
+        // didBecomeMain notification and assign ourselves there.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(mainWindowDidBecomeMain(_:)),
+            name: NSWindow.didBecomeMainNotification,
+            object: nil
+        )
         #endif
+    }
+
+    @objc func mainWindowDidBecomeMain(_ note: Notification) {
+        if let win = note.object as? NSWindow, win.delegate == nil {
+            win.delegate = self
+        }
+        // Only need to set the delegate once.
+        NotificationCenter.default.removeObserver(
+            self,
+            name: NSWindow.didBecomeMainNotification,
+            object: nil
+        )
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        if !UserDefaults.standard.bool(forKey: "trove.hasShownMenuBarHint") {
+            UserDefaults.standard.set(true, forKey: "trove.hasShownMenuBarHint")
+            SharedStore.stage.flash(
+                "Trove is still running in the menu bar — click the tray icon anytime to reopen",
+                kind: .info
+            )
+        }
     }
 
     func applicationDidBecomeActive(_ note: Notification) {
@@ -459,6 +513,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func pst() { SharedStore.stage.pasteFromClipboard() }
     @objc func cpy() { SharedStore.stage.copyAllAsFiles() }
     @objc func clr() { MainActor.assumeIsolated { confirmClearStageViaAlert(SharedStore.stage) } }
+    @objc func toggleFloatingStage() {
+        MainActor.assumeIsolated { FloatingStageController.shared.toggle() }
+    }
 
     // Fix 10: hold the door open if recorder is mid-write on quit.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -1557,6 +1614,22 @@ struct CustomizeView: View {
                 // Custom. App keeps its theme regardless of macOS Light/Dark.
                 ThemeSettingsCard()
 
+                // Privacy summary — two network calls max, everything else local.
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "lock.shield.fill").foregroundStyle(.green)
+                        Text("Privacy").headerText()
+                    }
+                    Text("Trove makes only two network calls: a daily GitHub release check for app updates, and an exchange-rate fetch from ECB when you use the Calculator. No analytics, no telemetry, no install IDs. Clipboard, screenshots, OCR, files — everything stays on your Mac.")
+                        .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    if let url = URL(string: "https://gettrove.vercel.app/privacy") {
+                        Link("Read full privacy policy", destination: url).font(.caption)
+                    }
+                }
+                .padding(14)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.04)))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.06)))
+
                 // Auto-update checker (default ON, throttled to 6h).
                 UpdateCheckerCard()
 
@@ -1567,8 +1640,6 @@ struct CustomizeView: View {
             }
             .padding(24)
         }
-        .navigationTitle("Customize")
-        .navigationSubtitle("\(Pane.allCases.filter { $0.userHideable }.count - store.hidden.count) of \(Pane.allCases.filter { $0.userHideable }.count) optional tools visible")
     }
 }
 
@@ -1865,6 +1936,7 @@ struct QuickSwitcherView: View {
                         Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel("Clear search")
                 }
             }
             .padding(.horizontal, 16)

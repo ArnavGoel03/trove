@@ -325,7 +325,7 @@ public struct StageSmartActionsBar: View {
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
-            .background(.background.secondary,
+            .background(Color.troveBgElev.opacity(0.8),
                         in: RoundedRectangle(cornerRadius: 10))
             .overlay(
                 RoundedRectangle(cornerRadius: 10)

@@ -810,7 +810,7 @@ public struct OCRView: View {
                 }
             }
             .frame(minHeight: 130, maxHeight: 220)
-            .background(.background.secondary, in: RoundedRectangle(cornerRadius: 8))
+            .background(Color.troveBgElev.opacity(0.8), in: RoundedRectangle(cornerRadius: 8))
         }
     }
 
@@ -1297,6 +1297,7 @@ private struct OCRHistoryThumb: View {
                             .foregroundStyle(.white, Color.black.opacity(0.55))
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel("Clear search")
                     .padding(4)
                 }
             }
@@ -1327,7 +1328,7 @@ private struct OCRTranslationModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         #if canImport(Translation)
-        if #available(macOS 14.0, *) {
+        if #available(macOS 15.0, *) {
             content.modifier(OCRTranslationTask(vm: vm))
         } else {
             content
@@ -1339,7 +1340,7 @@ private struct OCRTranslationModifier: ViewModifier {
 }
 
 #if canImport(Translation)
-@available(macOS 14.0, *)
+@available(macOS 15.0, *)
 private struct OCRTranslationTask: ViewModifier {
     @ObservedObject var vm: OCRViewModel
     @State private var config: TranslationSession.Configuration?

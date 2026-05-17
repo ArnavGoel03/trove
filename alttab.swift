@@ -1034,6 +1034,7 @@ public struct AltTabView: View {
             HStack(spacing: 10) {
                 Image(systemName: engine.hotkeyOK ? "checkmark.circle.fill" : "xmark.octagon.fill")
                     .foregroundStyle(engine.hotkeyOK ? .green : .red)
+                    .accessibilityLabel(engine.hotkeyOK ? "Hotkey active" : "Hotkey conflict")
                 Text(engine.statusLine).font(.callout)
                 Spacer()
             }

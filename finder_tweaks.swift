@@ -977,7 +977,7 @@ private struct FinderTweakRow: View {
         .padding(.horizontal, 7)
         .padding(.vertical, 3)
         .background(
-            Capsule().fill(.background.tertiary)
+            Capsule().fill(Color.troveCardSolid.opacity(0.6))
         )
         .overlay(
             Capsule().strokeBorder(.separator.opacity(0.5), lineWidth: 0.5)
@@ -1011,7 +1011,7 @@ private struct FinderTweakRow: View {
                                     .foregroundStyle(.secondary)
                                     .padding(.horizontal, 6)
                                     .padding(.vertical, 2)
-                                    .background(Capsule().fill(.background.tertiary))
+                                    .background(Capsule().fill(Color.troveCardSolid.opacity(0.6)))
                             }
                         }
                         Text(tweak.explanation)

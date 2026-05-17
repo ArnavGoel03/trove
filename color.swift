@@ -1287,7 +1287,7 @@ struct ColorToolCopyPill: View {
                     .foregroundStyle(copied ? Color.green : Color.secondary)
             }
             .padding(.horizontal, 6).padding(.vertical, 4)
-            .background(.background.secondary, in: RoundedRectangle(cornerRadius: 5))
+            .background(Color.troveBgElev.opacity(0.8), in: RoundedRectangle(cornerRadius: 5))
         }
         .buttonStyle(.plain)
         .help("Copy \(label): \(payload)")

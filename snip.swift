@@ -921,6 +921,7 @@ private struct SnipRecentThumb: View {
                 .buttonStyle(.borderless)
                 .modifier(SnipPrimaryShortcut(isPrimary: isPrimary, key: "s"))
                 .help(isPrimary ? "Save… (⌘S)" : "Save…")
+                .accessibilityLabel("Save screenshot")
 
                 Menu {
                     Button {

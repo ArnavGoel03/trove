@@ -821,10 +821,12 @@ struct NetSparkline: View {
                 if mode != .outgoing {
                     line(inHistory,  in: g.size, max: maxBoth)
                         .stroke(Color.green, style: .init(lineWidth: 1.2, lineJoin: .round))
+                        .accessibilityLabel("Download rate sparkline")
                 }
                 if mode != .incoming {
                     line(outHistory, in: g.size, max: maxBoth)
                         .stroke(Color.orange, style: .init(lineWidth: 1.2, lineJoin: .round))
+                        .accessibilityLabel("Upload rate sparkline")
                 }
             }
         }
@@ -946,6 +948,7 @@ struct NetSearchBar: View {
                         Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel("Clear search")
                 }
             }
             .padding(.horizontal, 8).padding(.vertical, 5)

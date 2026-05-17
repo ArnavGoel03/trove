@@ -828,6 +828,7 @@ private struct NoteSearchOverlay: View {
                             Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
                         }
                         .buttonStyle(.plain)
+                        .accessibilityLabel("Clear search")
                     }
                     Button {
                         store.searchActive = false
@@ -862,7 +863,7 @@ private struct NoteSearchOverlay: View {
                 }
                 .padding(.horizontal, 14).padding(.vertical, 6)
             }
-            .background(.background.secondary)
+            .background(Color.troveBgElev.opacity(0.8))
             .onChange(of: store.searchQuery) { newValue in
                 debounceTask?.cancel()
                 debounceTask = Task { @MainActor in

@@ -1561,7 +1561,7 @@ struct LogLevelPill: View {
     let level: LogLevel
     var body: some View {
         Text(level.label.uppercased())
-            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+            .font(.system(.caption2, design: .monospaced).weight(.semibold))
             .padding(.horizontal, 5)
             .padding(.vertical, 1)
             .foregroundStyle(level.tint)

@@ -484,7 +484,7 @@ struct UpdateCheckerCard: View {
                                     .font(.body.weight(.medium))
                                 if info.prerelease == true {
                                     Text("PRE")
-                                        .font(.system(size: 9, weight: .bold))
+                                        .font(.system(.caption2, design: .default).weight(.bold))
                                         .padding(.horizontal, 5).padding(.vertical, 1)
                                         .background(.orange.opacity(0.25), in: Capsule())
                                 }
@@ -534,6 +534,12 @@ struct UpdateCheckerCard: View {
                         Text("Checked \(last.formatted(.relative(presentation: .named)))")
                             .font(.caption).foregroundStyle(.tertiary)
                     }
+                }
+
+                if let v = UpdateChecker.currentVersion(),
+                   let url = URL(string: "https://github.com/\(UpdateChecker.repoOwner)/\(UpdateChecker.repoName)/releases/tag/v\(v)") {
+                    Link("View release notes", destination: url)
+                        .font(.caption)
                 }
             }
         }

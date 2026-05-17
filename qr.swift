@@ -192,7 +192,7 @@ public struct QRView: View {
                         .frame(minHeight: 100, maxHeight: 180)
                         .scrollContentBackground(.hidden)
                         .padding(8)
-                        .background(.background.tertiary, in: RoundedRectangle(cornerRadius: 8))
+                        .background(Color.troveCardSolid.opacity(0.6), in: RoundedRectangle(cornerRadius: 8))
                         .overlay(
                             RoundedRectangle(cornerRadius: 8)
                                 .strokeBorder(.separator.opacity(0.5), lineWidth: 0.5)
