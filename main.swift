@@ -3863,6 +3863,18 @@ struct StageCard: View {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(s, forType: .string)
                 }
+                // AI bridge actions — only shown when an AI app is installed.
+                // Routes through pasteboard + activates Claude/ChatGPT.app.
+                if AIBridge.shared.hasInstalledTarget() {
+                    Divider()
+                    Menu("Send to AI") {
+                        Button("Rewrite clearer")     { AIBridge.shared.send(s, kind: .rephrase) }
+                        Button("Translate to English") { AIBridge.shared.send(s, kind: .translate) }
+                        Button("Summarize")            { AIBridge.shared.send(s, kind: .summarize) }
+                        Divider()
+                        Button("Send raw")             { AIBridge.shared.send(s, kind: .paste) }
+                    }
+                }
             }
             Button("Remove") { stage.remove(item.id) }
         }
