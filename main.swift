@@ -1614,6 +1614,29 @@ struct CustomizeView: View {
                 // Custom. App keeps its theme regardless of macOS Light/Dark.
                 ThemeSettingsCard()
 
+                // Stage compression card — auto-shrink oversized PNG/JPEG drops to
+                // WebP/HEIC silently with an undo toast. Cuts Clop ($14).
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "rectangle.compress.vertical").foregroundStyle(.tint)
+                        Text("Stage").headerText()
+                    }
+                    Toggle(isOn: Binding(
+                        get: { AutoCompress.shared.enabled },
+                        set: { AutoCompress.shared.enabled = $0 }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Auto-compress oversized images")
+                            Text("Re-encodes PNG/JPEG drops larger than 2 MB to WebP/HEIC if they shrink by at least 30%. Original is replaced; undo available via toast.")
+                                .font(.caption).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+                .padding(14)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.04)))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.06)))
+
                 // Privacy summary — two network calls max, everything else local.
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 6) {

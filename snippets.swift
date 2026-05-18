@@ -538,6 +538,16 @@ struct SnippetsView: View {
                             Button("Delete…", role: .destructive) {
                                 deleteCandidate = snip
                             }
+                            if AIBridge.shared.hasInstalledTarget() {
+                                Divider()
+                                Menu("Send to AI") {
+                                    Button("Rewrite clearer")      { AIBridge.shared.send(snip.body, kind: .rephrase) }
+                                    Button("Translate to English") { AIBridge.shared.send(snip.body, kind: .translate) }
+                                    Button("Summarize")            { AIBridge.shared.send(snip.body, kind: .summarize) }
+                                    Divider()
+                                    Button("Send raw")             { AIBridge.shared.send(snip.body, kind: .paste) }
+                                }
+                            }
                         }
                     }
                 }

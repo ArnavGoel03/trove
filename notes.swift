@@ -643,6 +643,17 @@ public struct NotesView: View {
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
                 .id(store.selected) // ensure cursor doesn't survive a tab switch incorrectly
+                .contextMenu {
+                    if AIBridge.shared.hasInstalledTarget() {
+                        Menu("Send to AI") {
+                            Button("Rewrite clearer")      { AIBridge.shared.send(store.tab(store.selected).body, kind: .rephrase) }
+                            Button("Translate to English") { AIBridge.shared.send(store.tab(store.selected).body, kind: .translate) }
+                            Button("Summarize")            { AIBridge.shared.send(store.tab(store.selected).body, kind: .summarize) }
+                            Divider()
+                            Button("Send raw")             { AIBridge.shared.send(store.tab(store.selected).body, kind: .paste) }
+                        }
+                    }
+                }
 
             if store.tab(store.selected).body.isEmpty {
                 Text(emptyHint)
