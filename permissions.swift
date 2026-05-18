@@ -476,7 +476,7 @@ struct PermsHeaderCard: View {
         } else {
             HStack(alignment: .top, spacing: 6) {
                 Image(systemName: "checkmark.shield.fill").foregroundStyle(.green)
-                (Text("Trove currently has: ").foregroundStyle(.secondary)
+                (Text("Trove currently has: ").foregroundColor(.secondary)
                  + Text(names.joined(separator: ", ")).fontWeight(.medium))
             }
         }

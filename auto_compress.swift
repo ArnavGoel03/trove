@@ -124,17 +124,41 @@ final class AutoCompress: ObservableObject {
         let msg = "Compressed \(originalFormat) \(before) → \(newFormat) \(after) (\(percent)% smaller)"
 
         await MainActor.run {
-            // Replace the original Stage entry with the compressed one so the
-            // user gets the smaller file going forward. Original is kept on
-            // disk; if the toast's Undo action fires, restore from there.
-            SharedStore.stage.flash(
-                msg,
-                kind: .success,
-                actionLabel: "Undo",
-                action: {
-                    try? FileManager.default.removeItem(at: dest)
+            // Fix 6: replace the Stage entry so the user gets the compressed file.
+            if let idx = SharedStore.stage.items.firstIndex(where: {
+                if case .image(let u) = $0.kind { return u == url }
+                if case .file(let u)  = $0.kind { return u == url }
+                return false
+            }) {
+                let original = SharedStore.stage.items[idx]
+                let newKind: ItemKind = {
+                    switch original.kind {
+                    case .image: return .image(dest)
+                    case .file:  return .file(dest)
+                    case .text(let s): return .text(s)
+                    }
+                }()
+                SharedStore.stage.items[idx] = StagedItem(kind: newKind)
+            }
+            SharedStore.stage.flash(msg, kind: .success, actionLabel: "Undo") {
+                // Undo: restore original URL in Stage, delete compressed sibling.
+                if let idx = SharedStore.stage.items.firstIndex(where: {
+                    if case .image(let u) = $0.kind { return u == dest }
+                    if case .file(let u)  = $0.kind { return u == dest }
+                    return false
+                }) {
+                    let cur = SharedStore.stage.items[idx]
+                    let restored: ItemKind = {
+                        switch cur.kind {
+                        case .image: return .image(url)
+                        case .file:  return .file(url)
+                        case .text(let s): return .text(s)
+                        }
+                    }()
+                    SharedStore.stage.items[idx] = StagedItem(kind: restored)
                 }
-            )
+                try? FileManager.default.removeItem(at: dest)
+            }
         }
     }
 

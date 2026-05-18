@@ -296,6 +296,49 @@ final class SnipEngine: ObservableObject {
         SharedStore.stage.flash("Re-staged snip")
     }
 
+    /// Replace the on-disk file for an existing SnipRecent with a new (annotated)
+    /// NSImage, then update the in-memory recents entry. Called by the annotation
+    /// editor on commit. Falls back to a new tmp file if the original is read-only.
+    func replaceImage(for recent: SnipRecent, with annotated: NSImage) {
+        guard let tiff = annotated.tiffRepresentation,
+              let bitmapRep = NSBitmapImageRep(data: tiff),
+              let pngData = bitmapRep.representation(using: .png, properties: [:]) else {
+            SharedStore.stage.flash("Couldn't encode annotated image")
+            return
+        }
+
+        var destURL = recent.url
+        // If the target is temp (not in Pictures/Trove), write in-place.
+        // If it's in a permanent folder, write a sibling with "-annotated" suffix.
+        let isPerm = recent.url.path.contains("/Trove/")
+        if isPerm {
+            let stem = recent.url.deletingPathExtension().lastPathComponent
+            let folder = recent.url.deletingLastPathComponent()
+            destURL = SnipFileDestination.uniqueURL(in: folder,
+                                                    basename: "\(stem)-annotated",
+                                                    ext: "png")
+        }
+
+        do {
+            try pngData.write(to: destURL, options: .atomic)
+            OutputsLibrary.shared.record(
+                url: destURL,
+                producer: "snip-annotate",
+                sourceLabel: destURL.lastPathComponent,
+                kind: "image"
+            )
+        } catch {
+            SharedStore.stage.flash("Annotated save failed: \(error.localizedDescription)")
+            return
+        }
+
+        // Update recents entry to point at the new file.
+        if let idx = recents.firstIndex(where: { $0.id == recent.id }) {
+            recents[idx] = SnipRecent(url: destURL, mode: recent.mode, createdAt: recent.createdAt)
+        }
+        SharedStore.stage.flash("Annotation saved")
+    }
+
     // MARK: - Countdown plumbing
 
     private func startCountdownTimer() {
@@ -798,6 +841,7 @@ private struct SnipCountdownOverlay: View {
 
 private struct SnipRecentsCard: View {
     @ObservedObject var engine: SnipEngine
+    @State private var annotationTarget: SnipRecent? = nil
     var body: some View {
         Card {
             VStack(alignment: .leading, spacing: 8) {
@@ -832,7 +876,8 @@ private struct SnipRecentsCard: View {
                                 // and the most-recent is the obvious primary.
                                 SnipRecentThumb(
                                     recent: recent,
-                                    isPrimary: recent.id == engine.recents.first?.id
+                                    isPrimary: recent.id == engine.recents.first?.id,
+                                    onAnnotate: { annotationTarget = recent }
                                 ) {
                                     engine.restage(recent)
                                 }
@@ -843,12 +888,31 @@ private struct SnipRecentsCard: View {
                 }
             }
         }
+        .sheet(item: $annotationTarget) { target in
+            annotationSheet(for: target)
+        }
+    }
+
+    @ViewBuilder
+    private func annotationSheet(for target: SnipRecent) -> some View {
+        let img = NSImage(contentsOf: target.url) ?? NSImage()
+        SnipAnnotationEditor(
+            image: img,
+            onCommit: { annotated in
+                annotationTarget = nil
+                engine.replaceImage(for: target, with: annotated)
+            },
+            onCancel: {
+                annotationTarget = nil
+            }
+        )
     }
 }
 
 private struct SnipRecentThumb: View {
     let recent: SnipRecent
     var isPrimary: Bool = false
+    var onAnnotate: (() -> Void)? = nil
     let onSelect: () -> Void
     @State private var hover = false
 
@@ -890,6 +954,10 @@ private struct SnipRecentThumb: View {
                 NSItemProvider(contentsOf: recent.url) ?? NSItemProvider()
             }
             .contextMenu {
+                if let onAnnotate = onAnnotate {
+                    Button { onAnnotate() } label: { Label("Annotate…", systemImage: "pencil.tip.crop.circle") }
+                    Divider()
+                }
                 Button { SnipRecentSaver.save(recent) } label: { Label("Save…", systemImage: "square.and.arrow.down") }
                 Button { SnipRecentSaver.quickSaveToDownloads(recent) } label: { Label("Save to Downloads", systemImage: "arrow.down.circle") }
                 Button { NSWorkspace.shared.activateFileViewerSelecting([recent.url]) } label: { Label("Reveal in Finder", systemImage: "magnifyingglass") }
@@ -922,6 +990,16 @@ private struct SnipRecentThumb: View {
                 .modifier(SnipPrimaryShortcut(isPrimary: isPrimary, key: "s"))
                 .help(isPrimary ? "Save… (⌘S)" : "Save…")
                 .accessibilityLabel("Save screenshot")
+
+                if let onAnnotate = onAnnotate {
+                    Button { onAnnotate() } label: {
+                        Image(systemName: "pencil.tip.crop.circle")
+                    }
+                    .buttonStyle(.borderless)
+                    .modifier(SnipPrimaryShortcut(isPrimary: isPrimary, key: "e"))
+                    .help(isPrimary ? "Annotate… (⌘E)" : "Annotate…")
+                    .accessibilityLabel("Annotate screenshot")
+                }
 
                 Menu {
                     Button {

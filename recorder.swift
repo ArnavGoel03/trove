@@ -786,6 +786,10 @@ final class RecEngine: NSObject, ObservableObject {
         guard isRecording, !isFinalizing else { return }
         isFinalizing = true
         isRecording = false
+        // Fix 9: accumulate the live (non-paused) segment before clearing startWall.
+        if !isPaused, let s = startWall {
+            accumulated += (ContinuousClock.now - s).timeInterval
+        }
         isPaused    = false
 
         stopTickTimer()
@@ -1479,6 +1483,15 @@ struct RecView: View {
             await Task.detached(priority: .background) {
                 _ = RecPaths.sweepStaleTmp(folder)
             }.value
+        }
+        // Listen for the menu-bar "Record Screen + Audio" trigger. Ensures
+        // tutorial preset (region + system audio + mic) and fires startRecording.
+        .onReceive(NotificationCenter.default.publisher(for: .troveStartRecordingNow)) { _ in
+            guard !vm.engine.isRecording else { return }
+            vm.applyPreset(.tutorial)
+            vm.systemAudioOn = true
+            vm.microphoneOn  = true
+            startRecording()
         }
     }
 

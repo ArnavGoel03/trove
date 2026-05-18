@@ -641,7 +641,7 @@ final class ImgToolsModel: ObservableObject {
     @Published var stripMetadata: Bool = true
 
     @Published var outputDir: URL = UserDefaults.standard.url(forKey: "image_tools.outputDir")
-        ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first! { // lint-ok: no-collection-force-unwrap
+        ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first ?? FileManager.default.homeDirectoryForCurrentUser {
         didSet { UserDefaults.standard.set(outputDir, forKey: "image_tools.outputDir") }
     }
     @Published var working: Bool = false

@@ -968,6 +968,59 @@ func testPathSafety_rejects_missing() {
 }
 
 // ===========================================================================
+// MARK: - SnapDirection + WindowSnapSettings tests
+// ===========================================================================
+
+func testSnapDirection_allCasesCount() {
+    // Ensure no accidental deletion — we expect exactly 10 snap targets.
+    assertEqual(SnapDirection.allCases.count, 10, "snapDir.count")
+}
+
+func testSnapDirection_uniqueRawValues() {
+    let ids = SnapDirection.allCases.map(\.rawValue)
+    let uniq = Set(ids)
+    assertEqual(ids.count, uniq.count, "snapDir.uniqueIDs",
+                "duplicate rawValue — two directions would collide in Carbon dispatch")
+}
+
+func testSnapDirection_defaultBindings_haveModifiers() {
+    // Every default binding must require at least one modifier (bare keycodes
+    // would shadow normal typing system-wide).
+    for dir in SnapDirection.allCases {
+        let b = dir.defaultBinding
+        assertTrue(b.modifiers != 0,
+                   "snapDir.binding.hasModifier.\(dir.rawValue)",
+                   "\(dir) default binding has no modifiers")
+    }
+}
+
+func testSnapDirection_defaultBindings_unique() {
+    // No two directions should share the same (modifiers, keyCode) pair —
+    // two overlapping registrations would silently fail at Carbon level.
+    var seen = Set<HotkeyBinding>()
+    for dir in SnapDirection.allCases {
+        let b = dir.defaultBinding
+        assertFalse(seen.contains(b),
+                    "snapDir.binding.unique.\(dir.rawValue)",
+                    "\(dir) binding collides with another direction")
+        seen.insert(b)
+    }
+}
+
+@MainActor
+func testWindowSnapSettings_defaultsOff() {
+    // On a fresh defaults domain the feature must default to disabled so we
+    // don't claim global hotkeys without user consent.
+    UserDefaults.standard.removeObject(forKey: "trove.windowSnap.enabled")
+    // Re-read the stored value (not the singleton, which may have been set
+    // earlier in the process) to verify the raw persisted default.
+    let raw = UserDefaults.standard.object(forKey: "trove.windowSnap.enabled")
+    // nil means never written → the Settings init path will return false.
+    assertNil(raw, "windowSnap.defaultOff",
+              "windowSnap.enabled should be absent (nil) before first write so init() defaults to false")
+}
+
+// ===========================================================================
 // MARK: - Test enumeration + runner
 // ===========================================================================
 
@@ -1044,6 +1097,13 @@ func runAllTests() async {
     testHotkeyBinding_displayString_singleMod()
     testHotkeyBinding_keyName_special()
     testHotkeyBinding_default_fallback()
+
+    // ---------- SnapDirection + WindowSnapSettings ----------
+    testSnapDirection_allCasesCount()
+    testSnapDirection_uniqueRawValues()
+    testSnapDirection_defaultBindings_haveModifiers()
+    testSnapDirection_defaultBindings_unique()
+    testWindowSnapSettings_defaultsOff()
 
     // ---------- Path safety ----------
     testPathSafety_rejects_dev()

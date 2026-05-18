@@ -43,6 +43,9 @@ final class AutoInstaller: NSObject, URLSessionDownloadDelegate {
         case relaunchFailed
         case alreadyInProgress
         case onMacAppStoreBuild
+        case invalidDownloadURL
+        case versionMismatch(String)
+        case foreignBundle(String)
 
         var errorDescription: String? {
             switch self {
@@ -55,6 +58,9 @@ final class AutoInstaller: NSObject, URLSessionDownloadDelegate {
             case .relaunchFailed:            return "Could not relaunch the updated app"
             case .alreadyInProgress:         return "An update is already in progress"
             case .onMacAppStoreBuild:        return "This copy was installed from the Mac App Store; updates come from there, not here"
+            case .invalidDownloadURL:        return "Update URL must be an https://github.com URL"
+            case .versionMismatch(let v):    return "Installed bundle reports version \(v), not the expected version — refusing to launch"
+            case .foreignBundle(let id):     return "Installed bundle has unexpected identifier \(id) — refusing to launch"
             }
         }
     }
@@ -136,6 +142,20 @@ final class AutoInstaller: NSObject, URLSessionDownloadDelegate {
         await setStatus("Installing…")
         try swapAppBundle(currentURL: bundleURL, newURL: newApp)
 
+        // Fix 2: verify swapped bundle reports the expected version (replay attack guard).
+        let swappedBundle = Bundle(url: bundleURL)
+        let installedVersion = swappedBundle?.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
+        guard installedVersion == expectedVersion else {
+            throw InstallError.versionMismatch(installedVersion)
+        }
+
+        // Fix 3: verify swapped bundle has Trove's bundle identifier (foreign-app guard).
+        let installedID = swappedBundle?.infoDictionary?["CFBundleIdentifier"] as? String ?? ""
+        let currentID   = Bundle.main.bundleIdentifier ?? ""
+        guard !currentID.isEmpty, installedID == currentID else {
+            throw InstallError.foreignBundle(installedID)
+        }
+
         // ── 8 & 9. Relaunch ────────────────────────────────────────────────
         await setStatus("Relaunching…")
         let destination = bundleURL  // where we just moved the new app
@@ -159,6 +179,12 @@ final class AutoInstaller: NSObject, URLSessionDownloadDelegate {
     // -----------------------------------------------------------------------
 
     private func downloadZip(from remoteURL: URL) async throws -> URL {
+        // Fix 5: validate URL scheme and host before making any network call.
+        guard remoteURL.scheme == "https",
+              let host = remoteURL.host,
+              host == "github.com" || host.hasSuffix(".github.com")
+        else { throw InstallError.invalidDownloadURL }
+
         // Remove any leftover zip from a previous failed attempt.
         try? FileManager.default.removeItem(at: Self.zipTmp)
 
@@ -300,6 +326,24 @@ final class AutoInstaller: NSObject, URLSessionDownloadDelegate {
             let detail = out.isEmpty ? "codesign exited \(code)" : out
             throw InstallError.codesignFailed(detail)
         }
+
+        // Fix 1: verify that the signing authority is a Developer ID Application
+        // cert (not a free-tier Apple Development / Mac Developer cert).
+        let escaped = appURL.path.replacingOccurrences(of: "\"", with: "\\\"")
+        let (displayOut, _): (String, Int32) = try await Task.detached {
+            runShell("/bin/sh",
+                     ["-c", "/usr/bin/codesign --display --verbose=4 \"\(escaped)\" 2>&1"],
+                     timeout: 15)
+        }.value
+
+        let hasDevID = displayOut
+            .components(separatedBy: .newlines)
+            .contains { $0.contains("Authority=Developer ID Application") }
+        guard hasDevID else {
+            throw InstallError.codesignFailed(
+                "Signature must be Developer ID Application (not a free-tier or MAS certificate)"
+            )
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -307,9 +351,12 @@ final class AutoInstaller: NSObject, URLSessionDownloadDelegate {
     // -----------------------------------------------------------------------
 
     private func assertNotMASBuild(_ appURL: URL) async throws {
+        // Fix 4: codesign --display --verbose=4 writes Authority lines to stderr;
+        // redirect 2>&1 through /bin/sh so we capture them.
+        let escaped = appURL.path.replacingOccurrences(of: "\"", with: "\\\"")
         let (out, _): (String, Int32) = try await Task.detached {
-            runShell("/usr/bin/codesign",
-                     ["--display", "--verbose=4", appURL.path],
+            runShell("/bin/sh",
+                     ["-c", "/usr/bin/codesign --display --verbose=4 \"\(escaped)\" 2>&1"],
                      timeout: 15)
         }.value
 

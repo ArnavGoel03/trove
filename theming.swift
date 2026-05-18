@@ -161,7 +161,7 @@ final class TroveThemeStore: ObservableObject {
     static let shared = TroveThemeStore()
 
     @Published var theme: TroveTheme = .dark { didSet { persistTheme() ; applyAppearance() } }
-    @Published var customTheme: TroveCustomTheme = .dark { didSet { persistCustom() } }
+    @Published var customTheme: TroveCustomTheme = .dark { didSet { persistCustom(); applyAppearance() } }
 
     var customIsLight: Bool { customTheme.isLight }
 
@@ -222,7 +222,7 @@ struct ThemePickerGrid: View {
     @ObservedObject private var store = TroveThemeStore.shared
     var compact: Bool = false   // welcome sheet uses compact tiles
     var body: some View {
-        let cols = compact ? 3 : 3
+        let cols = compact ? 2 : 3
         LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: cols), spacing: 10) {
             ForEach(TroveTheme.allCases) { t in
                 ThemeTile(theme: t, selected: store.theme == t, compact: compact) {

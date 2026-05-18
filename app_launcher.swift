@@ -36,6 +36,7 @@ final class AppLauncherIndex: ObservableObject {
 
     private var launchedAppObserver: NSObjectProtocol?
     private var terminatedAppObserver: NSObjectProtocol?
+    private var pendingRescan: Task<Void, Never>?
 
     private init() {
         // Background-index on startup so first cold launch doesn't block UI.
@@ -54,10 +55,16 @@ final class AppLauncherIndex: ObservableObject {
         launchedAppObserver = ws.addObserver(
             forName: NSWorkspace.didLaunchApplicationNotification,
             object: nil, queue: nil
-        ) { _ in
-            Task.detached(priority: .utility) {
-                let scanned = AppLauncherIndex.scanInstalledApps()
-                await MainActor.run { AppLauncherIndex.shared.entries = scanned }
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.pendingRescan?.cancel()
+                self.pendingRescan = Task.detached(priority: .utility) {
+                    try? await Task.sleep(for: .seconds(2))
+                    guard !Task.isCancelled else { return }
+                    let scanned = AppLauncherIndex.scanInstalledApps()
+                    await MainActor.run { AppLauncherIndex.shared.entries = scanned }
+                }
             }
         }
     }

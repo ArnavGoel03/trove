@@ -80,6 +80,8 @@ struct HotkeyBinding: Equatable, Hashable, Codable {
         case kVK_F4: return "F4"; case kVK_F5: return "F5"; case kVK_F6: return "F6"
         case kVK_F7: return "F7"; case kVK_F8: return "F8"; case kVK_F9: return "F9"
         case kVK_F10: return "F10"; case kVK_F11: return "F11"; case kVK_F12: return "F12"
+        case kVK_LeftArrow: return "←"; case kVK_RightArrow: return "→"
+        case kVK_UpArrow:   return "↑"; case kVK_DownArrow:  return "↓"
         default: return "Key(\(kc))"
         }
     }
@@ -163,7 +165,8 @@ final class TroveGlobalHotkeys: ObservableObject {
 
     private var installedHandler: EventHandlerRef?
     private var fullScreenHotkey: EventHotKeyRef?
-    private let signature: OSType = 0x54425821     // "TBX!"
+    private var snapHotkeys: [SnapDirection: EventHotKeyRef] = [:]
+    private let signature: OSType = 0x54524F56     // "TROV"
     private let idFullScreenToStage: UInt32 = 1
 
     private init() {}
@@ -189,28 +192,50 @@ final class TroveGlobalHotkeys: ObservableObject {
             UnregisterEventHotKey(h)
         }
 
+        // Unregister all snap hotkeys before re-registering.
+        for (dir, h) in snapHotkeys {
+            snapHotkeys[dir] = nil
+            UnregisterEventHotKey(h)
+        }
+        snapHotkeys.removeAll()
+
         let settings = HotkeySettings.shared
-        guard settings.fullScreenToStageEnabled else {
+        if settings.fullScreenToStageEnabled {
+            let id = EventHotKeyID(signature: signature, id: idFullScreenToStage)
+            var ref: EventHotKeyRef?
+            let regStatus = RegisterEventHotKey(
+                settings.fullScreenToStageBinding.keyCode,
+                settings.fullScreenToStageBinding.modifiers,
+                id,
+                GetApplicationEventTarget(),
+                0,
+                &ref
+            )
+            if regStatus == noErr {
+                fullScreenHotkey = ref
+                lastRegisterError = nil
+            } else {
+                lastRegisterError = Self.describe(regStatus: regStatus)
+            }
+        } else {
             lastRegisterError = nil
-            return
         }
 
-        let id = EventHotKeyID(signature: signature, id: idFullScreenToStage)
-        var ref: EventHotKeyRef?
-        let regStatus = RegisterEventHotKey(
-            settings.fullScreenToStageBinding.keyCode,
-            settings.fullScreenToStageBinding.modifiers,
-            id,
-            GetApplicationEventTarget(),
-            0,
-            &ref
-        )
-        if regStatus == noErr {
-            fullScreenHotkey = ref
-            lastRegisterError = nil
-        } else {
-            // red-team #4: map known Carbon error codes to humane messages.
-            lastRegisterError = Self.describe(regStatus: regStatus)
+        // Register window-snap hotkeys if enabled.
+        guard WindowSnapSettings.shared.enabled else { return }
+        for dir in SnapDirection.allCases {
+            let binding = dir.defaultBinding
+            let hkID = EventHotKeyID(signature: signature, id: dir.rawValue)
+            var ref: EventHotKeyRef?
+            let st = RegisterEventHotKey(
+                binding.keyCode, binding.modifiers, hkID,
+                GetApplicationEventTarget(), 0, &ref
+            )
+            if st == noErr, let ref = ref {
+                snapHotkeys[dir] = ref
+            }
+            // On conflict (eventHotKeyExistsErr) we silently skip — another app
+            // (e.g. Rectangle itself) owns the combo. No UI disruption needed.
         }
     }
 
@@ -284,7 +309,9 @@ final class TroveGlobalHotkeys: ObservableObject {
         case idFullScreenToStage:
             captureFullScreenToStage()
         default:
-            break
+            if let dir = SnapDirection(rawValue: id) {
+                WindowSnapper.snapFrontmost(to: dir)
+            }
         }
     }
 
@@ -360,6 +387,80 @@ final class TroveGlobalHotkeys: ObservableObject {
                     try? FileManager.default.removeItem(at: url)
                 }
             }
+        }
+    }
+}
+
+// ===========================================================================
+// MARK: - Window Snap directions + settings
+// ===========================================================================
+
+/// Rectangle-compatible snap targets. Each maps to a unique Carbon hotkey ID.
+enum SnapDirection: UInt32, CaseIterable {
+    case leftHalf          = 10
+    case rightHalf         = 11
+    case topHalf           = 12
+    case bottomHalf        = 13
+    case topLeftQuarter    = 14
+    case topRightQuarter   = 15
+    case bottomLeftQuarter = 16
+    case bottomRightQuarter = 17
+    case maximize          = 18
+    case center            = 19
+
+    /// Default Rectangle-style binding for each direction.
+    var defaultBinding: HotkeyBinding {
+        let ctrlOpt = UInt32(controlKey | optionKey)
+        switch self {
+        case .leftHalf:           return HotkeyBinding(modifiers: ctrlOpt, keyCode: UInt32(kVK_LeftArrow))
+        case .rightHalf:          return HotkeyBinding(modifiers: ctrlOpt, keyCode: UInt32(kVK_RightArrow))
+        case .topHalf:            return HotkeyBinding(modifiers: ctrlOpt, keyCode: UInt32(kVK_UpArrow))
+        case .bottomHalf:         return HotkeyBinding(modifiers: ctrlOpt, keyCode: UInt32(kVK_DownArrow))
+        case .topLeftQuarter:     return HotkeyBinding(modifiers: ctrlOpt, keyCode: UInt32(kVK_ANSI_U))
+        case .topRightQuarter:    return HotkeyBinding(modifiers: ctrlOpt, keyCode: UInt32(kVK_ANSI_I))
+        case .bottomLeftQuarter:  return HotkeyBinding(modifiers: ctrlOpt, keyCode: UInt32(kVK_ANSI_J))
+        case .bottomRightQuarter: return HotkeyBinding(modifiers: ctrlOpt, keyCode: UInt32(kVK_ANSI_K))
+        case .maximize:           return HotkeyBinding(modifiers: ctrlOpt, keyCode: UInt32(kVK_ANSI_F))
+        case .center:             return HotkeyBinding(modifiers: ctrlOpt, keyCode: UInt32(kVK_ANSI_C))
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .leftHalf:           return "Left half"
+        case .rightHalf:          return "Right half"
+        case .topHalf:            return "Top half"
+        case .bottomHalf:         return "Bottom half"
+        case .topLeftQuarter:     return "Top-left quarter"
+        case .topRightQuarter:    return "Top-right quarter"
+        case .bottomLeftQuarter:  return "Bottom-left quarter"
+        case .bottomRightQuarter: return "Bottom-right quarter"
+        case .maximize:           return "Maximize"
+        case .center:             return "Center"
+        }
+    }
+}
+
+@MainActor
+final class WindowSnapSettings: ObservableObject {
+    static let shared = WindowSnapSettings()
+
+    private static let enabledKey = "trove.windowSnap.enabled"
+
+    @Published var enabled: Bool {
+        didSet {
+            UserDefaults.standard.set(enabled, forKey: Self.enabledKey)
+            TroveGlobalHotkeys.shared.rebind()
+        }
+    }
+
+    private init() {
+        // Default OFF — don't claim global hotkeys without user opt-in.
+        let ud = UserDefaults.standard
+        if ud.object(forKey: Self.enabledKey) == nil {
+            self.enabled = false
+        } else {
+            self.enabled = ud.bool(forKey: Self.enabledKey)
         }
     }
 }
@@ -525,6 +626,54 @@ private struct HotkeyRecorderHost: NSViewRepresentable {
         if let m = coordinator.monitor {
             NSEvent.removeMonitor(m)
             coordinator.monitor = nil
+        }
+    }
+}
+
+// ===========================================================================
+// MARK: - Window Snap settings card
+// ===========================================================================
+
+/// Settings card that lets users toggle Rectangle-style global snap hotkeys.
+/// Lives in the Customize / Settings pane alongside HotkeySettingsCard.
+struct WindowSnapSettingsCard: View {
+    @ObservedObject private var settings = WindowSnapSettings.shared
+
+    var body: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 8) {
+                    Image(systemName: "rectangle.split.2x1").foregroundStyle(.tint)
+                    Text("Window Snap").font(.headline)
+                    Spacer()
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle(isOn: $settings.enabled) {
+                        Text("Rectangle-style snap hotkeys").font(.body.weight(.medium))
+                    }
+                    Text("Registers global shortcuts while Trove is running. Default OFF — enable only if you're not using Rectangle or similar.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if settings.enabled {
+                    LazyVGrid(
+                        columns: [GridItem(.flexible()), GridItem(.flexible())],
+                        spacing: 4
+                    ) {
+                        ForEach(SnapDirection.allCases, id: \.rawValue) { dir in
+                            HStack(spacing: 4) {
+                                Text(dir.defaultBinding.displayString)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                Text(dir.label)
+                                    .font(.caption)
+                                Spacer()
+                            }
+                        }
+                    }
+                    .padding(.top, 4)
+                }
+            }
         }
     }
 }

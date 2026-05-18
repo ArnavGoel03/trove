@@ -285,6 +285,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         keepAwakeItem = ka
         m.addItem(.separator())
         m.addItem(make("Capture Screenshot", #selector(cap)))
+        m.addItem(make("Record Screen + Audio", #selector(recScreen)))
         m.addItem(make("Paste Clipboard",    #selector(pst)))
         m.addItem(make("Copy All",           #selector(cpy)))
         m.addItem(make("Clear",              #selector(clr)))
@@ -517,6 +518,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         MainActor.assumeIsolated { FloatingStageController.shared.toggle() }
     }
 
+    /// One-tap menu-bar action: jump to the Recorder pane and auto-start a
+    /// recording with system audio + microphone enabled. The Recorder view
+    /// listens for `.troveStartRecordingNow` and kicks off the engine.
+    @objc func recScreen() {
+        MainActor.assumeIsolated {
+            UserDefaults.standard.set(Pane.recorder.rawValue, forKey: "trove.selectedPane")
+            NSApp.activate(ignoringOtherApps: true)
+            for w in NSApp.windows where w.title.contains("Trove") {
+                w.makeKeyAndOrderFront(nil); break
+            }
+            // Defer post slightly so RecorderView is mounted before the trigger fires.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                NotificationCenter.default.post(name: .troveStartRecordingNow, object: nil)
+            }
+        }
+    }
+
     // Fix 10: hold the door open if recorder is mid-write on quit.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if RecEngineActivityTracker.isActive {
@@ -565,6 +583,9 @@ extension Notification.Name {
     static let troveSystemWillSleep = Notification.Name("TroveSystemWillSleep")
     static let troveScreensChanged  = Notification.Name("TroveScreensChanged")
     static let troveWillTerminate   = Notification.Name("TroveWillTerminate")
+    /// Posted by the menu-bar "Record Screen + Audio" item. Recorder pane
+    /// listens and auto-starts a recording with system audio + microphone.
+    static let troveStartRecordingNow = Notification.Name("TroveStartRecordingNow")
     // Stage / History post this when they write to NSPasteboard.general; the
     // *other* store listens and bumps its `lastChangeCount` so the next
     // watcher tick doesn't echo-ingest our own write.
@@ -939,6 +960,7 @@ enum Pane: String, Hashable, CaseIterable {
     case diskSpeed  = "Disk Speed"
     case network    = "Network"
     case account    = "Account"
+    case mirror     = "Mirror"
     var icon: String {
         switch self {
         case .stage:      return "tray.full.fill"
@@ -973,6 +995,7 @@ enum Pane: String, Hashable, CaseIterable {
         case .diskSpeed:  return "speedometer"
         case .network:    return "network"
         case .account:    return "person.crop.circle"
+        case .mirror:     return "video"
         }
     }
 
@@ -991,6 +1014,7 @@ enum Pane: String, Hashable, CaseIterable {
         case .diskSpeed:                                            return "Storage"
         case .library:                                              return "App"
         case .account:                                              return "Profile"
+        case .mirror:                                               return "Capture"
         }
     }
 
@@ -1039,6 +1063,7 @@ enum Pane: String, Hashable, CaseIterable {
         case .diskSpeed:  return "Sequential + random read/write benchmark per volume."
         case .network:    return "Per-process network throughput (Little Snitch read-only)."
         case .account:    return "Sign in with Apple, system identity, preferences."
+        case .mirror:     return "Webcam preview. Quick appearance check before a video call. Local-only — no recording."
         }
     }
 }
@@ -1224,7 +1249,9 @@ final class ProfileSync: ObservableObject {
         "alttab.recency",
         "alttab.recencyList",
         "hotkey.fullScreenToStage.enabled",
-        "hotkey.fullScreenToStage.binding"
+        "hotkey.fullScreenToStage.binding",
+        "trove.theme.v1",
+        "trove.theme.custom.v1"
     ]
 
     func snapshot() -> Data? {
@@ -1609,6 +1636,10 @@ struct CustomizeView: View {
                 // Global hotkey configuration (⌘⇧2 → Stage screenshot by default,
                 // rebindable, persists across launches).
                 HotkeySettingsCard()
+
+                // Rectangle-style global window snap hotkeys (⌃⌥← etc.).
+                // Disabled by default — users who already run Rectangle skip this.
+                WindowSnapSettingsCard()
 
                 // Theme — Dark default, plus Light / System / Linear / Cron /
                 // Custom. App keeps its theme regardless of macOS Light/Dark.
@@ -2511,6 +2542,7 @@ struct RootView: View {
                 case .diskSpeed:  DiskSpeedView()
                 case .network:    NetworkMonitorView()
                 case .account:    AccountView()
+                case .mirror:     MirrorView()
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -3445,6 +3477,8 @@ final class Stage: ObservableObject {
                 UserDefaults.standard.set(Pane.stage.rawValue, forKey: "trove.selectedPane")
                 if FileManager.default.fileExists(atPath: url.path) {
                     self.items.append(StagedItem(kind: .image(url)))
+                    self.enforceCapIfNeeded()
+                    Task.detached { await AutoCompress.shared.maybeCompress(at: url) }
                 } else if !CGPreflightScreenCaptureAccess() {
                     // R5 fix #18: screencapture exits 0 with no file when Screen
                     // Recording is denied — surface the TCC deep-link instead of

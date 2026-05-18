@@ -549,6 +549,53 @@ enum WinSnapEngine {
 }
 
 // ===========================================================================
+// MARK: - WindowSnapper — public API for global hotkey dispatch
+// ===========================================================================
+
+/// Thin facade called by the Carbon hotkey handler in global_hotkeys.swift.
+/// Converts a SnapDirection to a WinSnapFraction and fires the snap engine.
+enum WindowSnapper {
+
+    /// Snap the frontmost external window to the given direction. If AX
+    /// permission is absent, flashes an actionable toast and returns.
+    @MainActor
+    static func snapFrontmost(to direction: SnapDirection) {
+        guard WinSnapAX.isTrusted() else {
+            SharedStore.stage.flash(
+                "Window Snap needs Accessibility access",
+                kind: .warning,
+                actionLabel: "Open Settings"
+            ) {
+                TCCDeepLink.accessibility.open()
+            }
+            return
+        }
+        let fraction = fraction(for: direction)
+        Task { @MainActor in
+            let msg = await WinSnapEngine.applyToFrontmost(fraction)
+            SharedStore.stage.flash(msg)
+        }
+    }
+
+    private static func fraction(for dir: SnapDirection) -> WinSnapFraction {
+        switch dir {
+        case .leftHalf:           return .leftHalf
+        case .rightHalf:          return .rightHalf
+        case .topHalf:            return .topHalf
+        case .bottomHalf:         return .bottomHalf
+        case .topLeftQuarter:     return .topLeft
+        case .topRightQuarter:    return .topRight
+        case .bottomLeftQuarter:  return .botLeft
+        case .bottomRightQuarter: return .botRight
+        case .maximize:           return .full
+        case .center:
+            // Center = 50% width/height, offset so it's centred on the screen.
+            return WinSnapFraction(x: 0.25, y: 0.25, w: 0.5, h: 0.5)
+        }
+    }
+}
+
+// ===========================================================================
 // MARK: - View model
 // ===========================================================================
 
