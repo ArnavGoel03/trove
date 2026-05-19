@@ -162,6 +162,8 @@ final class TroveGlobalHotkeys: ObservableObject {
     static let shared = TroveGlobalHotkeys()
 
     @Published var lastRegisterError: String?
+    // Fix #8: directions whose Carbon hotkey registration failed due to conflict.
+    @Published var snapConflicts: [SnapDirection] = []
 
     private var installedHandler: EventHandlerRef?
     private var fullScreenHotkey: EventHotKeyRef?
@@ -222,7 +224,11 @@ final class TroveGlobalHotkeys: ObservableObject {
         }
 
         // Register window-snap hotkeys if enabled.
-        guard WindowSnapSettings.shared.enabled else { return }
+        guard WindowSnapSettings.shared.enabled else {
+            snapConflicts = []
+            return
+        }
+        var conflicts: [SnapDirection] = []
         for dir in SnapDirection.allCases {
             let binding = dir.defaultBinding
             let hkID = EventHotKeyID(signature: signature, id: dir.rawValue)
@@ -233,10 +239,12 @@ final class TroveGlobalHotkeys: ObservableObject {
             )
             if st == noErr, let ref = ref {
                 snapHotkeys[dir] = ref
+            } else if st == -9874 {
+                // Fix #8: eventHotKeyExistsErr — collect for UI surfacing.
+                conflicts.append(dir)
             }
-            // On conflict (eventHotKeyExistsErr) we silently skip — another app
-            // (e.g. Rectangle itself) owns the combo. No UI disruption needed.
         }
+        snapConflicts = conflicts
     }
 
     /// red-team #4: humanise the Carbon OSStatus values RegisterEventHotKey
@@ -638,6 +646,7 @@ private struct HotkeyRecorderHost: NSViewRepresentable {
 /// Lives in the Customize / Settings pane alongside HotkeySettingsCard.
 struct WindowSnapSettingsCard: View {
     @ObservedObject private var settings = WindowSnapSettings.shared
+    @ObservedObject private var hotkeys = TroveGlobalHotkeys.shared
 
     var body: some View {
         Card {
@@ -655,6 +664,22 @@ struct WindowSnapSettingsCard: View {
                         .font(.caption).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                // Fix #8: surface hotkey conflicts so users know why a snap doesn't fire.
+                if !hotkeys.snapConflicts.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(hotkeys.snapConflicts, id: \.rawValue) { dir in
+                            HStack(spacing: 6) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundStyle(.orange)
+                                Text("\(dir.defaultBinding.displayString) is already used by another app (\(dir.label) snap inactive).")
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                        }
+                    }
+                    .padding(8)
+                    .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+                }
                 if settings.enabled {
                     LazyVGrid(
                         columns: [GridItem(.flexible()), GridItem(.flexible())],
@@ -664,7 +689,7 @@ struct WindowSnapSettingsCard: View {
                             HStack(spacing: 4) {
                                 Text(dir.defaultBinding.displayString)
                                     .font(.system(.caption, design: .monospaced))
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(hotkeys.snapConflicts.contains(dir) ? .orange : .secondary)
                                 Text(dir.label)
                                     .font(.caption)
                                 Spacer()

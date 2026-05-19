@@ -1484,13 +1484,22 @@ struct RecView: View {
                 _ = RecPaths.sweepStaleTmp(folder)
             }.value
         }
-        // Listen for the menu-bar "Record Screen + Audio" trigger. Ensures
-        // tutorial preset (region + system audio + mic) and fires startRecording.
-        .onReceive(NotificationCenter.default.publisher(for: .troveStartRecordingNow)) { _ in
+        // Listen for menu-bar Record submenu triggers. userInfo carries
+        // mix-and-match audio config: keys "mic" and "sys", both Bool.
+        // Falls back to system+mic if userInfo is missing (legacy callers).
+        .onReceive(NotificationCenter.default.publisher(for: .troveStartRecordingNow)) { note in
             guard !vm.engine.isRecording else { return }
-            vm.applyPreset(.tutorial)
-            vm.systemAudioOn = true
-            vm.microphoneOn  = true
+            let mic = (note.userInfo?["mic"] as? Bool) ?? true
+            let sys = (note.userInfo?["sys"] as? Bool) ?? true
+            // Pick preset by audio combo so the UI subtitle reflects it.
+            switch (mic, sys) {
+            case (false, false): vm.applyPreset(.quiet)
+            case (true,  true):  vm.applyPreset(.tutorial)
+            case (false, true):  vm.applyPreset(.demo)
+            case (true,  false): vm.applyPreset(.tutorial)  // no mic-only preset; tutorial then disable sys
+            }
+            vm.systemAudioOn = sys
+            vm.microphoneOn  = mic
             startRecording()
         }
     }

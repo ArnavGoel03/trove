@@ -18,6 +18,49 @@ final class MirrorViewModel: ObservableObject {
     private(set) var session = AVCaptureSession()
     private var currentInput: AVCaptureDeviceInput?
 
+    // Fix #6: serial queue prevents stop/start races when the camera Picker
+    // changes rapidly (stop on .utility can otherwise be overtaken by start on
+    // .userInitiated before the session is fully torn down).
+    private let sessionQueue = DispatchSerialQueue(label: "trove.mirror.session",
+                                                   qos: .userInitiated)
+
+    // Fix #7: runtime-error observer (USB camera unplugged, etc.)
+    private var runtimeErrorObserver: NSObjectProtocol?
+    // Fix #5: re-activation observer — re-checks permission after user visits System Settings.
+    private var activationObserver: NSObjectProtocol?
+
+    init() {
+        // Fix #7: observe AVCaptureSession runtime errors (e.g. USB unplug).
+        runtimeErrorObserver = NotificationCenter.default.addObserver(
+            forName: AVCaptureSession.runtimeErrorNotification,
+            object: session, queue: nil
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.configureAndStart()
+            }
+        }
+
+        // Fix #5: re-check camera permission when Trove comes back to foreground.
+        activationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil, queue: nil
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard self.permissionDenied else { return }
+                if AVCaptureDevice.authorizationStatus(for: .video) == .authorized {
+                    self.permissionDenied = false
+                    self.configureAndStart()
+                }
+            }
+        }
+    }
+
+    deinit {
+        if let o = runtimeErrorObserver { NotificationCenter.default.removeObserver(o) }
+        if let o = activationObserver   { NotificationCenter.default.removeObserver(o) }
+    }
+
     func start() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
@@ -37,35 +80,39 @@ final class MirrorViewModel: ObservableObject {
     }
 
     func stop() {
-        if session.isRunning {
-            let s = session
-            Task.detached(priority: .utility) { s.stopRunning() }
-        }
         isActive = false
+        // Fix #6: stop synchronously on the serial session queue so a
+        // subsequent start() (also dispatched to the same queue) cannot begin
+        // until the prior stopRunning() completes.
+        let s = session
+        sessionQueue.async { s.stopRunning() }
     }
 
     private func configureAndStart() {
         permissionDenied = false
         refreshDeviceList()
         guard let device = pickDevice() else { return }
-        session.beginConfiguration()
-        // Remove any prior input — switching cameras
-        if let prev = currentInput { session.removeInput(prev) }
-        do {
-            let input = try AVCaptureDeviceInput(device: device)
-            if session.canAddInput(input) {
-                session.addInput(input)
-                currentInput = input
-            }
-        } catch {
-            session.commitConfiguration()
-            return
-        }
-        session.sessionPreset = .high
-        session.commitConfiguration()
+        // Fix #6: all session mutations run on the serial sessionQueue.
         let s = session
-        Task.detached(priority: .userInitiated) { s.startRunning() }
-        isActive = true
+        let prevInput = currentInput
+        sessionQueue.async {
+            s.beginConfiguration()
+            if let prev = prevInput { s.removeInput(prev) }
+            do {
+                let input = try AVCaptureDeviceInput(device: device)
+                if s.canAddInput(input) {
+                    s.addInput(input)
+                    Task { @MainActor [weak self] in self?.currentInput = input }
+                }
+            } catch {
+                s.commitConfiguration()
+                return
+            }
+            s.sessionPreset = .high
+            s.commitConfiguration()
+            s.startRunning()
+            Task { @MainActor [weak self] in self?.isActive = true }
+        }
     }
 
     private func refreshDeviceList() {

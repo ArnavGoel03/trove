@@ -82,6 +82,9 @@ final class SnipAnnotationModel: ObservableObject {
     @Published var currentFontSize: CGFloat = 18
     @Published var blurRadius: CGFloat = 10
 
+    // Fix #2: shared CIContext to avoid creating one per blur render.
+    private lazy var ciContext = CIContext(options: nil)
+
     // Undo stack: each entry is a snapshot of the annotations array.
     // Capped at 20 states.
     private var undoStack: [[SnipAnnotation]] = []
@@ -213,7 +216,7 @@ final class SnipAnnotationModel: ObservableObject {
         filter.inputImage = ciImage
         filter.radius = Float(radius)
         guard let output = filter.outputImage,
-              let ciCtx = CIContext(options: nil).createCGImage(
+              let ciCtx = ciContext.createCGImage(
                   output,
                   from: ciImage.extent) else {
             NSColor.gray.withAlphaComponent(0.5).setFill()
@@ -230,7 +233,7 @@ final class SnipAnnotationModel: ObservableObject {
 
 struct SnipAnnotationCanvas: View {
     @ObservedObject var model: SnipAnnotationModel
-    // In-progress drag state.
+    // In-progress drag state (canvas-display coordinates).
     @State private var dragStart: CGPoint? = nil
     @State private var dragCurrent: CGPoint? = nil
     @State private var textInput: String = ""
@@ -257,12 +260,18 @@ struct SnipAnnotationCanvas: View {
                 .allowsHitTesting(false)
 
                 // In-progress annotation preview.
+                // Fix #1: pass geoSize so makePreviewAnnotation can convert to
+                // image-pixel space before handing off to drawAnnotationInCanvas,
+                // which then re-scales back to canvas-display space. Without the
+                // conversion, the preview appeared at 2× the cursor position on
+                // a 2x-scale (Retina) canvas.
                 if let start = dragStart, let current = dragCurrent,
                    model.currentTool != .pointer {
                     Canvas { ctx, size in
                         let scale = canvasScale(geo: geo)
                         if let preview = makePreviewAnnotation(start: start,
-                                                               current: current) {
+                                                               current: current,
+                                                               geoSize: geo.size) {
                             drawAnnotationInCanvas(ctx: ctx, ann: preview, scale: scale)
                         }
                     }
@@ -386,23 +395,39 @@ struct SnipAnnotationCanvas: View {
                       height: geo.size.height / imgSize.height)
     }
 
-    private func makePreviewAnnotation(start: CGPoint, current: CGPoint) -> SnipAnnotation? {
+    // Fix #1: convert drag coordinates (canvas-display space) to image-pixel
+    // space before building the preview annotation. drawAnnotationInCanvas then
+    // re-applies the canvas scale, so the round-trip lands at exactly the
+    // cursor position on screen — no double-scale.
+    private func makePreviewAnnotation(start: CGPoint, current: CGPoint,
+                                       geoSize: CGSize) -> SnipAnnotation? {
+        let imgSize = model.image.size
+        guard imgSize.width > 0, imgSize.height > 0,
+              geoSize.width > 0, geoSize.height > 0 else { return nil }
+        let sx = imgSize.width / geoSize.width
+        let sy = imgSize.height / geoSize.height
+        func toImg(_ p: CGPoint) -> CGPoint { CGPoint(x: p.x * sx, y: p.y * sy) }
+        func toImgRect(_ a: CGPoint, _ b: CGPoint) -> CGRect {
+            CGRect(x: min(a.x, b.x) * sx, y: min(a.y, b.y) * sy,
+                   width: abs(b.x - a.x) * sx, height: abs(b.y - a.y) * sy)
+        }
+
         switch model.currentTool {
         case .pointer: return nil
         case .arrow:
-            return .arrow(start: start, end: current, color: model.currentColor)
+            return .arrow(start: toImg(start), end: toImg(current), color: model.currentColor)
         case .rectangle:
-            let rect = rectFrom(start, current)
+            let rect = toImgRect(start, current)
             return .rectangle(rect: rect, color: model.currentColor,
                               strokeWidth: model.currentStrokeWidth)
         case .highlight:
-            return .highlight(rect: rectFrom(start, current), color: NSColor.systemYellow)
+            return .highlight(rect: toImgRect(start, current), color: NSColor.systemYellow)
         case .blur:
             // Preview blur as translucent gray (no live CI for perf).
-            return .highlight(rect: rectFrom(start, current),
+            return .highlight(rect: toImgRect(start, current),
                               color: NSColor.gray.withAlphaComponent(0.6))
         case .text:
-            return .rectangle(rect: rectFrom(start, current),
+            return .rectangle(rect: toImgRect(start, current),
                               color: model.currentColor.withAlphaComponent(0.5),
                               strokeWidth: 1.5)
         }
@@ -574,6 +599,9 @@ struct SnipAnnotationEditor: View {
     let onCommit: (NSImage) -> Void
     let onCancel: () -> Void
 
+    // Fix #4: gate dismiss behind a confirmation when annotations exist.
+    @State private var confirmDiscard = false
+
     init(image: NSImage, onCommit: @escaping (NSImage) -> Void, onCancel: @escaping () -> Void) {
         _model = StateObject(wrappedValue: SnipAnnotationModel(image: image))
         self.onCommit = onCommit
@@ -597,7 +625,7 @@ struct SnipAnnotationEditor: View {
 
             // Bottom action row.
             HStack {
-                Button("Cancel") { onCancel() }
+                Button("Cancel") { requestCancel() }
                     .keyboardShortcut(.escape, modifiers: [])
                 Spacer()
                 Text(model.currentTool.label)
@@ -616,5 +644,23 @@ struct SnipAnnotationEditor: View {
             .background(.bar)
         }
         .frame(minWidth: 600, minHeight: 500)
+        .confirmationDialog(
+            "Discard \(model.annotations.count) annotation\(model.annotations.count == 1 ? "" : "s")?",
+            isPresented: $confirmDiscard,
+            titleVisibility: .visible
+        ) {
+            Button("Discard", role: .destructive) { onCancel() }
+            Button("Keep Editing", role: .cancel) {}
+        } message: {
+            Text("Your annotations will be lost.")
+        }
+    }
+
+    private func requestCancel() {
+        if model.annotations.isEmpty {
+            onCancel()
+        } else {
+            confirmDiscard = true
+        }
     }
 }

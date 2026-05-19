@@ -285,7 +285,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         keepAwakeItem = ka
         m.addItem(.separator())
         m.addItem(make("Capture Screenshot", #selector(cap)))
-        m.addItem(make("Record Screen + Audio", #selector(recScreen)))
+        // Record submenu — mix-and-match audio sources. Each entry posts
+        // .troveStartRecordingNow with audio config in userInfo; RecView
+        // applies the config and starts the engine.
+        let recItem = NSMenuItem(title: "Record Screen", action: nil, keyEquivalent: "")
+        let recSub = NSMenu(title: "Record Screen")
+        recSub.addItem(make("Silent",                #selector(recSilent)))
+        recSub.addItem(make("With Microphone",       #selector(recMic)))
+        recSub.addItem(make("With System Audio",     #selector(recSys)))
+        recSub.addItem(make("With Mic + System",     #selector(recBoth)))
+        recItem.submenu = recSub
+        m.addItem(recItem)
         m.addItem(make("Paste Clipboard",    #selector(pst)))
         m.addItem(make("Copy All",           #selector(cpy)))
         m.addItem(make("Clear",              #selector(clr)))
@@ -518,19 +528,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         MainActor.assumeIsolated { FloatingStageController.shared.toggle() }
     }
 
-    /// One-tap menu-bar action: jump to the Recorder pane and auto-start a
-    /// recording with system audio + microphone enabled. The Recorder view
-    /// listens for `.troveStartRecordingNow` and kicks off the engine.
-    @objc func recScreen() {
+    /// Menu-bar recording entry points — four mix-and-match audio combos.
+    /// Each posts `.troveStartRecordingNow` with `userInfo: [mic: Bool, sys: Bool]`
+    /// so RecView can configure the engine accordingly.
+    @objc func recSilent() { triggerRecording(mic: false, sys: false) }
+    @objc func recMic()    { triggerRecording(mic: true,  sys: false) }
+    @objc func recSys()    { triggerRecording(mic: false, sys: true)  }
+    @objc func recBoth()   { triggerRecording(mic: true,  sys: true)  }
+
+    private func triggerRecording(mic: Bool, sys: Bool) {
         MainActor.assumeIsolated {
             UserDefaults.standard.set(Pane.recorder.rawValue, forKey: "trove.selectedPane")
             NSApp.activate(ignoringOtherApps: true)
             for w in NSApp.windows where w.title.contains("Trove") {
                 w.makeKeyAndOrderFront(nil); break
             }
-            // Defer post slightly so RecorderView is mounted before the trigger fires.
+            // Defer slightly so RecorderView is mounted before the notification fires.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                NotificationCenter.default.post(name: .troveStartRecordingNow, object: nil)
+                NotificationCenter.default.post(
+                    name: .troveStartRecordingNow,
+                    object: nil,
+                    userInfo: ["mic": mic, "sys": sys]
+                )
             }
         }
     }

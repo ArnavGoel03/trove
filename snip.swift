@@ -895,17 +895,44 @@ private struct SnipRecentsCard: View {
 
     @ViewBuilder
     private func annotationSheet(for target: SnipRecent) -> some View {
-        let img = NSImage(contentsOf: target.url) ?? NSImage()
-        SnipAnnotationEditor(
-            image: img,
-            onCommit: { annotated in
-                annotationTarget = nil
-                engine.replaceImage(for: target, with: annotated)
-            },
-            onCancel: {
-                annotationTarget = nil
+        // Fix #3: load the image off the main thread to avoid blocking the run
+        // loop when the annotation sheet opens for a large screenshot.
+        AsyncAnnotationLoader(url: target.url) { img in
+            SnipAnnotationEditor(
+                image: img,
+                onCommit: { annotated in
+                    annotationTarget = nil
+                    engine.replaceImage(for: target, with: annotated)
+                },
+                onCancel: {
+                    annotationTarget = nil
+                }
+            )
+        }
+    }
+}
+
+// Fix #3: loads NSImage off the main thread; shows a ProgressView until ready.
+private struct AsyncAnnotationLoader<Content: View>: View {
+    let url: URL
+    @ViewBuilder let content: (NSImage) -> Content
+    @State private var image: NSImage? = nil
+
+    var body: some View {
+        Group {
+            if let image {
+                content(image)
+            } else {
+                ProgressView("Loading…")
+                    .frame(minWidth: 600, minHeight: 500)
+                    .task {
+                        let loaded = await Task.detached(priority: .userInitiated) {
+                            NSImage(contentsOf: url)
+                        }.value
+                        image = loaded ?? NSImage()
+                    }
             }
-        )
+        }
     }
 }
 

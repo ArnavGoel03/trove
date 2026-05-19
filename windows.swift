@@ -211,7 +211,9 @@ enum WinSnapAX {
         var best: NSScreen?
         var bestArea: CGFloat = 0
         for s in NSScreen.screens {
-            let inter = s.frame.intersection(nsRect)
+            // Fix #9: use visibleFrame so menu bar / Dock area are excluded
+            // when picking which display a window belongs to.
+            let inter = s.visibleFrame.intersection(nsRect)
             let a = inter.width * inter.height
             if a > bestArea { bestArea = a; best = s }
         }

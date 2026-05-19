@@ -48,9 +48,11 @@ final class AppLauncherIndex: ObservableObject {
             }
         }
 
-        // Refresh index when an app is installed or removed. NSWorkspace fires
-        // didLaunchApplicationNotification on every launch — we only care about
-        // *new* bundle paths, so cheap rescan and dedupe.
+        // Refresh index on app launch so newly installed apps are discoverable.
+        // NSWorkspace doesn't expose a dedicated "didInstall" notification, so
+        // we use didLaunchApplicationNotification and debounce with a 2-second
+        // delay to coalesce burst launches (e.g. login-item storm). The scan
+        // is background-detached and cheap for the common case of ≤200 apps.
         let ws = NSWorkspace.shared.notificationCenter
         launchedAppObserver = ws.addObserver(
             forName: NSWorkspace.didLaunchApplicationNotification,

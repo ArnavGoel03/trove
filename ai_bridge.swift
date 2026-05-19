@@ -49,6 +49,9 @@ final class AIBridge {
         ("com.openai.ChatGPT",              "ChatGPT"),
     ]
 
+    // Fix #13: in-flight guard — prevents double-paste if the user taps "Send" twice.
+    private var isSending = false
+
     private init() {}
 
     // MARK: - Public API
@@ -56,14 +59,30 @@ final class AIBridge {
     /// Send `text` to the configured AI app. Copies a framed prompt to the
     /// pasteboard and brings the AI app to front. User pastes; AI responds.
     func send(_ text: String, kind: SendKind) {
+        // Fix #13: bail if a send is already in flight.
+        guard !isSending else { return }
+
+        // Fix #11: reject text that would produce an unreasonably large pasteboard write.
+        guard text.utf8.count <= 500_000 else {
+            SharedStore.stage.flash(
+                "Text too large to send (\(text.utf8.count / 1024) KB > 500 KB)",
+                kind: .warning
+            )
+            return
+        }
+
+        isSending = true
         let prompt = framed(text: text, kind: kind)
         // Copy to pasteboard (replace prior contents).
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(prompt, forType: .string)
+        // Fix #12: post the sentinel so ClipHistory doesn't ingest this write.
+        NotificationCenter.default.post(name: .troveDidWritePasteboard, object: nil)
 
         // Find + activate the chosen AI app.
         guard let target = findTarget() else {
+            isSending = false
             SharedStore.stage.flash(
                 "No AI app installed (Claude or ChatGPT). Install one to use this feature.",
                 kind: .warning
@@ -73,8 +92,9 @@ final class AIBridge {
 
         let config = NSWorkspace.OpenConfiguration()
         config.activates = true
-        NSWorkspace.shared.openApplication(at: target.url, configuration: config) { _, error in
-            Task { @MainActor in
+        NSWorkspace.shared.openApplication(at: target.url, configuration: config) { [weak self] _, error in
+            Task { @MainActor [weak self] in
+                self?.isSending = false
                 if let error {
                     SharedStore.stage.flash(
                         "Couldn't open \(target.name): \(error.localizedDescription)",
