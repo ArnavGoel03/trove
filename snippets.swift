@@ -487,6 +487,18 @@ struct SnippetsView: View {
         .searchable(text: $store.search, prompt: "Search snippets")
         .navigationTitle("Snippets")
         .navigationSubtitle(subtitle)
+        // P0 fix: wire menu-bar routes (File > New Snippet ⌘N, File > Import,
+        // File > Export). Previously the menu posted these notifications
+        // into the void — the pane switch happened but nothing else fired.
+        .onReceive(NotificationCenter.default.publisher(for: .troveSnippetsNewItem)) { _ in
+            editorTarget = .new
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .troveSnippetsImport)) { _ in
+            isImporting = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .troveSnippetsExport)) { _ in
+            triggerExport()
+        }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 // P1: batch send to Stage when items are selected.
@@ -885,7 +897,9 @@ private struct SnippetsEmpty: View {
             Image(systemName: "doc.text.below.ecg")
                 .font(.system(size: 60, weight: .light))
                 .foregroundStyle(.tertiary)
-            Text("No snippets yet").headerText()
+            // A11y sweep revert: empty-state title — not a structural
+            // heading, shouldn't appear in the VoiceOver heading rotor.
+            Text("No snippets yet").font(.headline)
             Text("Save email signatures, prompt scaffolds, and boilerplate once. Click any saved snippet to copy it instantly, or send it to Stage.")
                 .font(.callout)
                 .foregroundStyle(.secondary)

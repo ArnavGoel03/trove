@@ -190,23 +190,33 @@ struct TroveApp: App {
                 .keyboardShortcut("f", modifiers: [.command, .shift])
                 Divider()
                 Menu("Theme") {
-                    Button("Dark")    { TroveThemeStore.shared.theme = .dark }
-                    Button("Light")   { TroveThemeStore.shared.theme = .light }
-                    Button("Match System") { TroveThemeStore.shared.theme = .system }
+                    // P1 fix: prefix the active theme with a check glyph
+                    // matching the Accent submenu pattern. Read the raw
+                    // UserDefaults key TroveThemeStore persists to.
+                    let active = UserDefaults.standard.string(forKey: TroveThemeStore.keyTheme) ?? "dark"
+                    Button(active == "dark"   ? "✓ Dark"   : "Dark")    { TroveThemeStore.shared.theme = .dark }
+                    Button(active == "light"  ? "✓ Light"  : "Light")   { TroveThemeStore.shared.theme = .light }
+                    Button(active == "system" ? "✓ Match System" : "Match System") { TroveThemeStore.shared.theme = .system }
                     Divider()
-                    Button("Linear")  { TroveThemeStore.shared.theme = .linear }
-                    Button("Cron")    { TroveThemeStore.shared.theme = .cron }
+                    Button(active == "linear" ? "✓ Linear" : "Linear")  { TroveThemeStore.shared.theme = .linear }
+                    Button(active == "cron"   ? "✓ Cron"   : "Cron")    { TroveThemeStore.shared.theme = .cron }
                     Divider()
-                    Button("Custom…") {
+                    Button(active == "custom" ? "✓ Custom…" : "Custom…") {
                         TroveThemeStore.shared.theme = .custom
                         openSettingsWindow()
                     }
                 }
                 Menu("Accent") {
-                    Button("Neutral") { UserDefaults.standard.set("white", forKey: "trove.accent") }
-                    Button("Magenta") { UserDefaults.standard.set("magenta", forKey: "trove.accent") }
-                    Button("Sky")     { UserDefaults.standard.set("sky", forKey: "trove.accent") }
-                    Button("Warm")    { UserDefaults.standard.set("warm", forKey: "trove.accent") }
+                    // P1 fix: prefix the active accent's label with a check
+                    // glyph so the user can see at-a-glance which is on. A
+                    // raw read of UserDefaults is safe in CommandMenu —
+                    // changes propagate through @AppStorage subscribers in
+                    // the views automatically.
+                    let active = UserDefaults.standard.string(forKey: "trove.accent") ?? "white"
+                    Button(active == "white"   ? "✓ Neutral"  : "Neutral")  { UserDefaults.standard.set("white",   forKey: "trove.accent") }
+                    Button(active == "magenta" ? "✓ Magenta"  : "Magenta")  { UserDefaults.standard.set("magenta", forKey: "trove.accent") }
+                    Button(active == "sky"     ? "✓ Sky"      : "Sky")      { UserDefaults.standard.set("sky",     forKey: "trove.accent") }
+                    Button(active == "warm"    ? "✓ Warm"     : "Warm")     { UserDefaults.standard.set("warm",    forKey: "trove.accent") }
                 }
                 Divider()
                 Button("Customize Sidebar…") { openSettingsWindow() }
@@ -238,58 +248,58 @@ struct TroveApp: App {
                     // but drop the shortcut binding so only Edit owns ⌘⇧N.
                     Button("Screenshot to Stage") { SharedStore.stage.captureScreenshot() }
                     Button("Region to OCR…") {
-                        switchToPane(.ocr)
+                        switchToPaneGuarded(.ocr)
                         NotificationCenter.default.post(name: .troveCaptureRegionToOCR, object: nil)
                     }
                     .keyboardShortcut("4", modifiers: [.command, .option])
                     Button("Region to Snip…") {
-                        switchToPane(.snip)
+                        switchToPaneGuarded(.snip)
                         NotificationCenter.default.post(name: .troveCaptureRegionToSnip, object: nil)
                     }
                     .keyboardShortcut("5", modifiers: [.command, .option])
                     Divider()
                     Button("Pick Color from Screen") {
-                        switchToPane(.color)
+                        switchToPaneGuarded(.color)
                         NotificationCenter.default.post(name: .troveColorPickFromScreen, object: nil)
                     }
                     .keyboardShortcut("p", modifiers: [.command, .shift])
                     Button("Mirror Webcam Panel") {
-                        switchToPane(.mirror)
+                        switchToPaneGuarded(.mirror)
                         NotificationCenter.default.post(name: .troveMirrorOpenFloating, object: nil)
                     }
                 }
                 Divider()
                 Menu("Quick…") {
-                    Button("Calculator") { switchToPane(.calc) }
+                    Button("Calculator") { switchToPaneGuarded(.calc) }
                         .keyboardShortcut("=", modifiers: [.command, .shift])
-                    Button("QR Generator") { switchToPane(.qr) }
-                    Button("Text Tools") { switchToPane(.xform) }
-                    Button("Hash Files") { switchToPane(.fileHash) }
-                    Button("Color Tools") { switchToPane(.color) }
-                    Button("Rename Files") { switchToPane(.rename) }
-                    Button("Image Tools") { switchToPane(.imageTools) }
-                    Button("PDF Tools") { switchToPane(.pdfTools) }
+                    Button("QR Generator") { switchToPaneGuarded(.qr) }
+                    Button("Text Tools") { switchToPaneGuarded(.xform) }
+                    Button("Hash Files") { switchToPaneGuarded(.fileHash) }
+                    Button("Color Tools") { switchToPaneGuarded(.color) }
+                    Button("Rename Files") { switchToPaneGuarded(.rename) }
+                    Button("Image Tools") { switchToPaneGuarded(.imageTools) }
+                    Button("PDF Tools") { switchToPaneGuarded(.pdfTools) }
                 }
                 Menu("System") {
-                    Button("Window Snap") { switchToPane(.winsnap) }
-                    Button("App Switcher") { switchToPane(.alttab) }
-                    Button("Move Files (Cut/Paste)") { switchToPane(.cutpaste) }
-                    Button("Finder Tweaks") { switchToPane(.finder) }
-                    Button("Process List") { switchToPane(.procs) }
-                    Button("Permissions") { switchToPane(.perms) }
+                    Button("Window Snap") { switchToPaneGuarded(.winsnap) }
+                    Button("App Switcher") { switchToPaneGuarded(.alttab) }
+                    Button("Move Files (Cut/Paste)") { switchToPaneGuarded(.cutpaste) }
+                    Button("Finder Tweaks") { switchToPaneGuarded(.finder) }
+                    Button("Process List") { switchToPaneGuarded(.procs) }
+                    Button("Permissions") { switchToPaneGuarded(.perms) }
                     Divider()
-                    Button("System Log") { switchToPane(.log) }
-                    Button("GPU Monitor") { switchToPane(.gpu) }
-                    Button("Network Monitor") { switchToPane(.network) }
-                    Button("Disk Speed Test") { switchToPane(.diskSpeed) }
+                    Button("System Log") { switchToPaneGuarded(.log) }
+                    Button("GPU Monitor") { switchToPaneGuarded(.gpu) }
+                    Button("Network Monitor") { switchToPaneGuarded(.network) }
+                    Button("Disk Speed Test") { switchToPaneGuarded(.diskSpeed) }
                 }
                 Menu("Storage") {
-                    Button("Disk Overview")     { switchToPane(.overview) }
-                    Button("Deep Scan…")        { switchToPane(.scan) }
-                    Button("Clean Dev Caches…") { switchToPane(.clean) }
-                    Button("Sweep Downloads…")  { switchToPane(.sweep) }
+                    Button("Disk Overview")     { switchToPaneGuarded(.overview) }
+                    Button("Deep Scan…")        { switchToPaneGuarded(.scan) }
+                    Button("Clean Dev Caches…") { switchToPaneGuarded(.clean) }
+                    Button("Sweep Downloads…")  { switchToPaneGuarded(.sweep) }
                     Divider()
-                    Button("Open Trove Library") { switchToPane(.library) }
+                    Button("Open Trove Library") { switchToPaneGuarded(.library) }
                 }
                 Divider()
                 Menu("Keep Awake") {
@@ -313,14 +323,14 @@ struct TroveApp: App {
                     Button("Release Assertion") {
                         KeepAwakeCoordinator.shared.toggleMaster(false)
                     }
-                    Button("Open Keep Awake Pane") { switchToPane(.keepAwake) }
+                    Button("Open Keep Awake Pane") { switchToPaneGuarded(.keepAwake) }
                 }
                 Divider()
                 Button("Run Disk Speed Test Now") {
-                    switchToPane(.diskSpeed)
+                    switchToPaneGuarded(.diskSpeed)
                     NotificationCenter.default.post(name: .troveDiskSpeedRunNow, object: nil)
                 }
-                Button("Audit Permissions") { switchToPane(.perms) }
+                Button("Audit Permissions") { switchToPaneGuarded(.perms) }
             }
 
             // ─── Help ──────────────────────────────────────────────────────
@@ -330,7 +340,7 @@ struct TroveApp: App {
                     NotificationCenter.default.post(name: .troveOpenKeyboardShortcuts, object: nil)
                 }
                 .keyboardShortcut("/", modifiers: .command)
-                Button("What's New") {
+                Button("What's New in Trove…") {
                     if let url = URL(string: "https://github.com/\(UpdateChecker.repoOwner)/\(UpdateChecker.repoName)/releases") {
                         NSWorkspace.shared.open(url)
                     }
@@ -362,8 +372,10 @@ struct TroveApp: App {
                         NSWorkspace.shared.open(url)
                     }
                 }
-                Button("Send Feedback") {
-                    if let url = URL(string: "mailto:arnavgoel0303@gmail.com?subject=Trove%20feedback") {
+                Button("Send Feedback…") {
+                    // P2 consistency fix: unified on the branded address
+                    // (matches the App-menu Send Feedback entry).
+                    if let url = URL(string: "mailto:hello@gettrove.vercel.app?subject=Trove%20feedback") {
                         NSWorkspace.shared.open(url)
                     }
                 }
@@ -2805,6 +2817,19 @@ struct AccentPickerCard: View {
     UserDefaults.standard.set(pane.rawValue, forKey: "trove.selectedPane")
 }
 
+/// P1 fix: guarded variant for menu items so a Tools-menu click on a
+/// hidden pane doesn't silently route to a blank sidebar slot. Flashes the
+/// same "X is hidden — show it in Settings" toast the View menu uses, and
+/// no-ops on the switch.
+@MainActor private func switchToPaneGuarded(_ pane: Pane) {
+    if PaneVisibilityStore.shared.isVisible(pane) {
+        switchToPane(pane)
+    } else {
+        SharedStore.stage.flash("\(pane.rawValue) is hidden — show it in Settings",
+                                kind: .warning)
+    }
+}
+
 struct RootView: View {
     // Persist the active pane across launches. red-team: store the rawValue
     // (a String) not the enum directly — @AppStorage can't bridge a custom
@@ -4837,7 +4862,12 @@ struct StageCard: View {
             switch item.kind {
             case .image(let u):
                 Button("Quick Look") { TroveQuickLook.shared.show(u) }
-                    .keyboardShortcut(.space, modifiers: [])
+                    // P1 fix: .keyboardShortcut(.space) inside a contextMenu
+                    // bleeds outside the menu — Space then triggers Quick
+                    // Look anywhere in the pane scope, eating space-bar in
+                    // any future TextField. Use ⌘Y (canonical macOS Quick
+                    // Look shortcut, same as Finder + Files app).
+                    .keyboardShortcut("y", modifiers: .command)
                 Divider()
                 Button("Save…") { stageContextSaveAs(url: u) }
                 Button("Save to Downloads") { stageContextSaveToDownloads(url: u) }
@@ -4859,7 +4889,12 @@ struct StageCard: View {
                 }
             case .file(let u):
                 Button("Quick Look") { TroveQuickLook.shared.show(u) }
-                    .keyboardShortcut(.space, modifiers: [])
+                    // P1 fix: .keyboardShortcut(.space) inside a contextMenu
+                    // bleeds outside the menu — Space then triggers Quick
+                    // Look anywhere in the pane scope, eating space-bar in
+                    // any future TextField. Use ⌘Y (canonical macOS Quick
+                    // Look shortcut, same as Finder + Files app).
+                    .keyboardShortcut("y", modifiers: .command)
                 Divider()
                 Button("Save…") { stageContextSaveAs(url: u) }
                 Button("Save to Downloads") { stageContextSaveToDownloads(url: u) }

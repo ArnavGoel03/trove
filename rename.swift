@@ -1284,7 +1284,8 @@ public struct RenameView: View {
                         .font(.system(size: 38, weight: .light))
                         .foregroundStyle(dropTargeted ? AnyShapeStyle(Color.accentColor)
                                                      : AnyShapeStyle(HierarchicalShapeStyle.tertiary))
-                    Text("No files added yet").headerText()
+                    // A11y sweep revert: empty-state title isn't a heading.
+                    Text("No files added yet").font(.headline)
                     Text("Drop files here, or pick them from Finder. Mass rename with find/replace, regex, sequence, date, EXIF, or case — applied atomically and fully undoable.")
                         .font(.callout).foregroundStyle(.secondary)
                         .frame(maxWidth: 440)

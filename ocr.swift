@@ -728,6 +728,13 @@ public struct OCRView: View {
         }
         .navigationTitle("OCR")
         .navigationSubtitle(navSubtitle)
+        // P0 fix: wire Edit + Tools menu "Capture Region → OCR" (⌘⌥4) — was
+        // a dead route until now; the menu switched panes but capture never
+        // started, so the user had to click the toolbar button manually.
+        .onReceive(NotificationCenter.default.publisher(for: .troveCaptureRegionToOCR)) { _ in
+            guard !vm.working else { return }
+            vm.capture()
+        }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button { vm.capture() } label: {

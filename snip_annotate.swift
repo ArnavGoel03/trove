@@ -410,8 +410,10 @@ struct SnipAnnotationCanvas: View {
 
     private var textPromptSheet: some View {
         VStack(spacing: 16) {
+            // A11y sweep revert: sheet dialog title isn't a structural
+            // heading — macOS focuses the dialog automatically.
             Text("Enter annotation text")
-                .headerText()
+                .font(.headline)
             TextField("Text…", text: $textInput)
                 .textFieldStyle(.roundedBorder)
                 .frame(minWidth: 280)

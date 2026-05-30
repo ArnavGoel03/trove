@@ -466,6 +466,11 @@ public struct AccountView: View {
         .frame(maxWidth: .infinity, alignment: .topLeading)
         .navigationTitle("Account")
         .navigationSubtitle(subtitle)
+        // P0 fix: wire File > Export My Trove Data menu item — was a dead
+        // route. The pane switched but exportData() never ran.
+        .onReceive(NotificationCenter.default.publisher(for: .troveExportAllData)) { _ in
+            exportData()
+        }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {

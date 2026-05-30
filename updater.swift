@@ -378,7 +378,7 @@ final class UpdateChecker: ObservableObject {
     /// Suffix conventions:
     ///   * `1.1.0`         — Stable release
     ///   * `1.1.0-beta.N`  — Beta release (opt-in via Settings → Updates)
-    nonisolated static let fallbackVersion = "1.1.0-beta.8"
+    nonisolated static let fallbackVersion = "1.1.0-beta.9"
 
     /// Reads `CFBundleShortVersionString` from the running bundle, but prefers
     /// the source-tracked `fallbackVersion` whenever the bundle version looks

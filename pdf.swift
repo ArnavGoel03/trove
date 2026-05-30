@@ -3589,6 +3589,19 @@ fileprivate struct PDFOpsSplitPreview: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
+                // P1 fix: zero-page sources (corrupt PDF, image-only PDF
+                // where PDFKit succeeded but pageCount == 0) previously
+                // rendered as a blank card with no explanation.
+                if pageCount == 0 {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(Color.troveWarning)
+                        Text("Could not read pages from this PDF — it may be corrupt or password-protected.")
+                            .font(.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.vertical, 12)
+                }
                 ScrollView {
                     let cols = [GridItem(.adaptive(minimum: 100), spacing: 10)]
                     LazyVGrid(columns: cols, spacing: 12) {
@@ -3654,14 +3667,21 @@ fileprivate struct PDFOpsSplitPreview: View {
     /// Page indexes that fall outside [1, totalPages] or unparsable tokens are
     /// silently skipped — the UI's "p3 → #1" badge makes this legible without
     /// throwing a validation error.
+    /// P1 fix: previously `split(separator: "-")` left leading/trailing
+    /// whitespace inside the parts ("10 - 20" → ["10 ", " 20"]) which
+    /// `Int(_:)` rejects; trim each part explicitly. Also rejects negative
+    /// start tokens ("-5" was silently dropped before with no feedback).
     nonisolated static func parseRangeGroups(_ s: String, totalPages: Int) -> [Int: Int] {
         var out: [Int: Int] = [:]
         let groups = s.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
         for (gi, raw) in groups.enumerated() where !raw.isEmpty {
-            if raw.contains("-") {
-                let parts = raw.split(separator: "-").map { Int($0.trimmingCharacters(in: .whitespaces)) ?? 0 }
+            if raw.contains("-"), !raw.hasPrefix("-") {
+                let parts = raw.split(separator: "-")
+                    .map { Int($0.trimmingCharacters(in: .whitespaces)) ?? 0 }
                 guard parts.count == 2, parts[0] >= 1, parts[1] >= parts[0] else { continue }
-                for p in parts[0]...parts[1] where p <= totalPages { out[p - 1] = gi }
+                let upper = min(parts[1], totalPages)
+                if parts[0] > totalPages { continue }
+                for p in parts[0]...upper { out[p - 1] = gi }
             } else if let p = Int(raw), p >= 1, p <= totalPages {
                 out[p - 1] = gi
             }
@@ -3847,7 +3867,14 @@ fileprivate struct PDFOpsCompressPreview: View {
             try? await Task.sleep(nanoseconds: 180_000_000) // 180ms debounce
             if Task.isCancelled { return }
             guard let r = probeRenderer else { return }
-            guard let img = await r.thumbnail(at: 0, target: 320) else { return }
+            // P1 fix: previously rendered the page at 320px target — the
+            // actual compress op renders at 150 DPI (~1240×1754 for A4),
+            // so the JPEG-encode of a 320px thumb was ~15× too small a
+            // byte count per page, biasing every projection optimistic.
+            // 1100px target matches the compress op's per-page raster size
+            // closely enough that the projection is in the right
+            // order-of-magnitude even for non-A4 pages.
+            guard let img = await r.thumbnail(at: 0, target: 1100) else { return }
             let bytes = Self.encodedJPEGBytes(img: img, quality: q)
             await MainActor.run {
                 if Task.isCancelled { return }

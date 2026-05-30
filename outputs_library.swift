@@ -938,8 +938,11 @@ private struct OutputsRow: View {
         }
         .contextMenu {
             Button("Quick Look") { TroveQuickLook.shared.show(entry.url) }
-                .keyboardShortcut(.space, modifiers: [])
-                .disabled(iniCloud)
+                // P1 fix: ⌘Y matches Finder; .space bled the shortcut to
+                // any text field that appears in the pane later.
+                // .disabled(iniCloud) dropped — QLPreviewPanel renders
+                // iCloud placeholders natively and triggers download.
+                .keyboardShortcut("y", modifiers: .command)
             Divider()
             Button("Open") { safeOpen() }
                 .disabled(iniCloud)

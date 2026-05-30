@@ -14,6 +14,74 @@ will surface whatever's newest on the chosen channel.
 
 ---
 
+## [1.1.0-beta.9] — Unreleased
+
+### Fixed
+
+- **P0 — Menu bar dead routes.** All 9 menu-triggered notifications (added
+  in beta.7's overhaul) silently no-opped because no view listened for
+  them. Wired `.onReceive` for every one:
+  - `troveSnippetsNewItem`        → SnippetsView opens new-snippet editor
+  - `troveSnippetsImport`         → SnippetsView opens .fileImporter
+  - `troveSnippetsExport`         → SnippetsView calls triggerExport()
+  - `troveExportAllData`          → AccountView calls exportData()
+  - `troveCaptureRegionToOCR`     → OCRView calls vm.capture() (guarded)
+  - `troveCaptureRegionToSnip`    → SnipView calls engine.startSnip() (guarded)
+  - `troveColorPickFromScreen`    → ColorToolView triggers NSColorSampler
+  - `troveMirrorOpenFloating`     → MirrorView opens floating panel
+  - `troveDiskSpeedRunNow`        → DiskSpeedView starts benchmark run (guarded)
+- **P1 — Tools menu bypassed pane visibility.** `switchToPane(.X)` in
+  Tools-menu items routed unconditionally, so clicking "PDF Tools" on a
+  user who had hidden the PDF pane silently jumped to a blank sidebar
+  slot. New `switchToPaneGuarded(_:)` helper does the same hidden-pane
+  flash as the View menu's ⌘1–⌘4. All 30 Tools-menu calls swept to the
+  guarded variant.
+- **P1 — PDF Compress estimate ~15× too small.** `scheduleProbe()`
+  rendered a 320 px thumbnail, JPEG-encoded that, and multiplied by
+  pageCount — but the actual compress op rasterizes at ≈ 1240 px per
+  page (150 DPI for A4). Bumped target to 1100 px so the projection sits
+  in the right order of magnitude.
+- **P1 — `parseRangeGroups` mis-parsed whitespace + leading minus.**
+  `"10 - 20"` produced `["10 ", " 20"]` which `Int(_:)` rejected, so the
+  range silently dropped. Trim each part; reject leading-minus tokens
+  explicitly so `"-5"` doesn't masquerade as a range.
+- **P1 — PDF Split / Rotate previews didn't explain zero-page sources.**
+  Corrupt or image-only PDFs where `pageCount == 0` rendered a blank card
+  with no explanation. Now surface a warning row: "Could not read pages
+  from this PDF — it may be corrupt or password-protected."
+- **P1 — QuickLook `.keyboardShortcut(.space)` scope bleed.** SwiftUI
+  registers `.keyboardShortcut` on a context-menu Button as an app-wide
+  accelerator for the surrounding scope, NOT only when the menu is open.
+  Space-bar in Stage/Library/History panes would trigger Quick Look on
+  every press, including inside any TextField. Switched to ⌘Y — the
+  canonical macOS Quick Look chord (Finder + Files use it), no scope
+  bleed, no future-TextField conflict.
+- **P1 — QuickLook `.disabled(iniCloud)`.** QLPreviewPanel renders iCloud
+  placeholders natively and triggers download via `NSFileCoordinator`.
+  Disabling the button forced a manual "go to Finder, download, come
+  back" round-trip that the system already handles. Removed.
+- **P0 — A11y sweep regressions (round 2).** The `.headerText()` sweep
+  branded three more sites with `.isHeader` traits they shouldn't carry:
+  empty-state "No snippets yet" / "No files added yet" (informational
+  copy, not landmarks) and the snip annotate dialog title (macOS focuses
+  the sheet automatically — adding the header trait is redundant +
+  pollutes the rotor). All reverted to literal `.font(.headline)`.
+- **P2 — Menu naming + email consistency.** Help menu "What's New" now
+  reads "What's New in Trove…" to match the App menu entry. Help menu
+  "Send Feedback" address unified to the branded `hello@gettrove.vercel.app`
+  to match the App menu's entry (Help previously routed to a personal
+  Gmail).
+- **P1 — Theme + Accent submenu lacked active-selection feedback.** Both
+  submenus now prefix the active option with a `✓` glyph so the user can
+  tell at a glance which theme / accent is on.
+
+### Verified
+
+`lint-trove`: clean. `swiftc -DTROVE_TESTING -parse-as-library`: clean.
+`test-trove`: 233/233 PASS.
+
+---
+
 ## [1.1.0-beta.8] — Unreleased
 
 ### Added

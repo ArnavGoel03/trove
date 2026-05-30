@@ -1051,6 +1051,14 @@ public struct DiskSpeedView: View {
         .navigationSubtitle(vm.running
             ? "\(vm.currentStage.rawValue) · pass \(vm.currentRepeat)/\(DiskSpeedRepeats)"
             : "\(vm.results.count) result\(vm.results.count == 1 ? "" : "s")")
+        // P0 fix: wire Tools > Run Disk Speed Test Now menu item — was a
+        // dead route. The pane needed a volume selected to actually run;
+        // we pass the SharedStore Stage as the flash recipient (matches
+        // every other start() call site).
+        .onReceive(NotificationCenter.default.publisher(for: .troveDiskSpeedRunNow)) { _ in
+            guard !vm.running else { return }
+            vm.start(stage: SharedStore.stage)
+        }
         .background(
             // red-team: Space to start/cancel. A zero-frame button with
             // .keyboardShortcut(.space) avoids stealing space from text fields

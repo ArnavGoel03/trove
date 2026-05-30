@@ -607,6 +607,14 @@ public struct SnipView: View {
         .navigationTitle("Snip")
         .navigationSubtitle(subtitle)
         .toolbar { toolbarContent }
+        // P0 fix: wire Edit + Tools menu "Capture Region → Snip" (⌘⌥5) —
+        // was a dead route. Honor the pane's own delay/mode/destination
+        // settings (the menu is just an entry point; the engine handles
+        // the rest, including countdown overlay).
+        .onReceive(NotificationCenter.default.publisher(for: .troveCaptureRegionToSnip)) { _ in
+            guard !engine.isCountingDown else { return }
+            engine.startSnip()
+        }
     }
 
     private var subtitle: String {

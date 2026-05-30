@@ -655,6 +655,28 @@ public struct ColorToolView: View {
         .onReceive(NotificationCenter.default.publisher(for: .troveSmartOpenInColor)) { n in
             ingestSmartColorPayload(n.userInfo)
         }
+        // P0 fix: wire Tools > Pick Color from Screen menu item — was
+        // a dead route. Mirrors the inline pick logic from the
+        // "Pick from screen" button: clears prior pending value, launches
+        // NSColorSampler, hops back to main, surfaces denial vs cancel.
+        .onReceive(NotificationCenter.default.publisher(for: .troveColorPickFromScreen)) { _ in
+            store.pickerError = nil
+            store.pendingPickedValue = nil
+            ColorToolPicker.pick { value in
+                DispatchQueue.main.async {
+                    guard let value = value else {
+                        if CGPreflightScreenCaptureAccess() {
+                            store.pickerError = nil
+                        } else {
+                            store.pickerError = "denied"
+                        }
+                        return
+                    }
+                    store.pickerError = nil
+                    store.pendingPickedValue = value
+                }
+            }
+        }
         .onDrop(of: [.fileURL, .image], isTargeted: $dropTargeted) { providers in
             handleDrop(providers)
             return true

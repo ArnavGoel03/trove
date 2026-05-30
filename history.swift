@@ -859,7 +859,8 @@ private struct HistoryRow: View {
             switch entry.kind {
             case .image(let u), .file(let u):
                 Button("Quick Look") { TroveQuickLook.shared.show(u) }
-                    .keyboardShortcut(.space, modifiers: [])
+                    // P1 fix: ⌘Y (Finder canonical) — .space bled scope.
+                    .keyboardShortcut("y", modifiers: .command)
                 Divider()
             case .text: EmptyView()
             }

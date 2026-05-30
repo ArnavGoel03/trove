@@ -382,6 +382,12 @@ struct MirrorView: View {
         .onDisappear {
             vm.stop()
         }
+        // P0 fix: wire Tools > Mirror Webcam Panel menu item — was a dead
+        // route. Opens the always-on-top floating panel directly so the
+        // user can use the mirror while focused on another app.
+        .onReceive(NotificationCenter.default.publisher(for: .troveMirrorOpenFloating)) { _ in
+            floatingCtrl.open(vm: vm)
+        }
         .navigationTitle("Mirror")
         // P2: navigationSubtitle shows camera name when active.
         .navigationSubtitle(navSubtitle)
