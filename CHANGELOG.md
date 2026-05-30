@@ -14,6 +14,56 @@ will surface whatever's newest on the chosen channel.
 
 ---
 
+## [1.1.0-beta.11] — Unreleased
+
+### Added
+
+- **macOS Shortcuts / AppIntents integration** (`app_intents.swift`,
+  ~430 lines). Zero coverage before this — Trove is now scriptable from
+  macOS Shortcuts, queryable by Spotlight, and usable as a Focus Filter
+  action. The strategic audit pegged this as the single biggest missing
+  capability vs Raycast / Alfred / Bartender; this closes the gap. 11
+  intents ship in this bump:
+  - **Navigation:** `OpenPaneIntent` (32 panes, picker-friendly enum).
+  - **Stage:** `AddTextToStageIntent`, `AddFileToStageIntent`,
+    `PasteClipboardToStageIntent`, `CaptureScreenshotToStageIntent`,
+    `CopyStageAsFilesIntent`, `CopyStageAsTextIntent`, `ClearStageIntent`,
+    `GetStageCountIntent`.
+  - **Compute / Capture / Files:** `EvaluateExpressionIntent` (returns the
+    last-line value; supports the multi-line Soulver-class calc engine
+    with variables / units / currency / line refs), `GenerateQRCodeIntent`
+    (returns IntentFile PNG with bounded 64–4096 px size), `HashFileIntent`
+    (returns multi-line MD5 / SHA-1 / SHA-256 / SHA-512 block in one
+    streaming pass).
+  - `TroveAppShortcuts: AppShortcutsProvider` ships 5 default phrases
+    (Paste to Stage / Capture Screenshot / Add Text to Stage / Calculate /
+    Generate QR Code) so the user gets a working Shortcuts catalogue on
+    first launch without configuring anything.
+- Every intent runs in the background by default (`openAppWhenRun = false`)
+  so a Shortcuts step that calls "Add Text to Stage" doesn't steal focus
+  from the user's current app. The one exception is `OpenPaneIntent`,
+  which opens Trove and brings it forward (the user's intent is to NAVIGATE
+  to the pane).
+- Every intent reuses an existing in-app code path — no new business
+  logic introduced. The file is pure plumbing.
+
+### Notes
+
+- **Deliberately not shipped (this bump):** Snippets / History entity
+  intents would require a `SnippetIndex` / `ClipboardIndex` actor for
+  cross-process read access, since `SnippetStore` and `ClipHistory` are
+  per-view `@StateObject`s today. Follow-up.
+- **Deliberately not shipped:** PDF tools intents — PDF ops are
+  interactive (multi-source drops, range strings, watermark options) and
+  a single-parameter intent would underserve the real workflow. Better as
+  a follow-up with custom `AppEntity` parameter types.
+
+### Verified
+
+`lint-trove`: clean. `test-trove`: 233/233 PASS.
+
+---
+
 ## [1.1.0-beta.10] — Unreleased
 
 ### Fixed
