@@ -713,8 +713,9 @@ private struct HistoryList: View {
                     Image(systemName: "magnifyingglass")
                         .font(.system(size: 36, weight: .light))
                         .foregroundStyle(.tertiary)
+                    // A11y sweep revert: empty-state title isn't a heading.
                     Text("No matches for \u{201C}\(store.search)\u{201D}")
-                        .headerText()
+                        .font(.headline)
                     Text("Try a different query, or clear the search to see all \(store.entries.count) captured item\(store.entries.count == 1 ? "" : "s").")
                         .font(.callout)
                         .foregroundStyle(.secondary)

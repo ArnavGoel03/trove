@@ -1779,27 +1779,31 @@ struct XformStepParamEditor: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            // A11y sweep revert: these are TextField labels (form fields),
+            // not section headings. The .isHeader trait would have made
+            // each label a stop in the VoiceOver heading rotor, pulling
+            // them out of their inline label context.
             switch step.kind {
             case .linesAddPrefix:
-                Text("Prefix").headerText()
+                Text("Prefix").font(.headline)
                 TextField("e.g. >>> ", text: bindingForParam1())
                     .textFieldStyle(.roundedBorder)
             case .linesAddSuffix:
-                Text("Suffix").headerText()
+                Text("Suffix").font(.headline)
                 TextField("e.g. ;", text: bindingForParam1())
                     .textFieldStyle(.roundedBorder)
             case .regexExtract:
-                Text("Regex (NSRegularExpression syntax)").headerText()
+                Text("Regex (NSRegularExpression syntax)").font(.headline)
                 TextField("pattern, e.g. \\d+", text: bindingForParam1())
                     .textFieldStyle(.roundedBorder)
                     .font(.system(.body, design: .monospaced))
                 Text("Matches are joined with newlines.").font(.caption).foregroundStyle(.secondary)
             case .regexReplace:
-                Text("Regex").headerText()
+                Text("Regex").font(.headline)
                 TextField("pattern", text: bindingForParam1())
                     .textFieldStyle(.roundedBorder)
                     .font(.system(.body, design: .monospaced))
-                Text("Replacement").headerText()
+                Text("Replacement").font(.headline)
                 TextField("template, $1 backrefs supported", text: bindingForParam2())
                     .textFieldStyle(.roundedBorder)
                     .font(.system(.body, design: .monospaced))

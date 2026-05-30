@@ -1125,10 +1125,11 @@ public struct NetworkMonitorView: View {
                     Image(systemName: "magnifyingglass")
                         .font(.system(size: 36, weight: .light))
                         .foregroundStyle(.tertiary)
+                    // A11y sweep revert: empty-state title.
                     Text(m.search.isEmpty
                          ? "No \(m.direction == .incoming ? "inbound" : "outbound") traffic right now"
                          : "No processes match \"\(m.search)\"")
-                        .headerText()
+                        .font(.headline)
                     Text("Try clearing the filter or switching the direction toggle back to Both.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
@@ -1148,8 +1149,9 @@ public struct NetworkMonitorView: View {
                     Image(systemName: "network")
                         .font(.system(size: 36, weight: .light))
                         .foregroundStyle(.tertiary)
+                    // A11y sweep revert: empty-state title.
                     Text("No network traffic yet")
-                        .headerText()
+                        .font(.headline)
                     Text("Trove is listening via nettop. Idle apps produce no rows — anything that sends or receives bytes will appear here, grouped by app and sorted by throughput.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
@@ -1217,7 +1219,8 @@ public struct NetworkMonitorView: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                    Text("Network monitoring unavailable").headerText()
+                    // A11y sweep revert: error-state title.
+                    Text("Network monitoring unavailable").font(.headline)
                 }
                 Text("`/usr/bin/nettop` was not found on this Mac. The Network pane uses nettop to read per-process byte counters; it ships with macOS but is missing on some stripped-down installs.")
                     .foregroundStyle(.secondary)

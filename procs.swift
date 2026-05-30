@@ -747,7 +747,10 @@ fileprivate struct ProcDetailSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
-                Text(detail.comm).headerText()
+                // A11y sweep revert: dynamic value string (process command name)
+                // shouldn't appear in the VoiceOver heading rotor — it mutates
+                // per-process and isn't a stable structural landmark.
+                Text(detail.comm).font(.headline)
                 Text("PID \(detail.pid)")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
@@ -839,8 +842,9 @@ public struct ProcView: View {
                     Image(systemName: "magnifyingglass")
                         .font(.system(size: 36, weight: .light))
                         .foregroundStyle(.tertiary)
+                    // A11y sweep revert: empty-state title isn't a heading.
                     Text("No processes match \"\(m.search)\"")
-                        .headerText()
+                        .font(.headline)
                     Text("Try a PID, a partial app name, or a launch-arg fragment. Clear the filter to see the top hogs.")
                         .font(.callout)
                         .foregroundStyle(.secondary)

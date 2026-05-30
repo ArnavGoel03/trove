@@ -3476,6 +3476,13 @@ fileprivate struct PDFOpsMergePreview: View {
     let sources: [PDFOpsSource]
     @State private var thumbs: [URL: NSImage] = [:]
     @State private var pageCounts: [URL: Int] = [:]
+    // P1 fix: previously created a fresh `PDFOpsThumbRenderer(url:)` inside
+    // every `loadThumb` invocation, so if a user dropped the same file
+    // twice into a merge list (or re-rendered after eviction), two
+    // independent renderer actors each opened the file + held a separate
+    // PDFDocument. Now keep one renderer per URL for the lifetime of the
+    // view — actor serialization handles concurrent access.
+    @State private var renderers: [URL: PDFOpsThumbRenderer] = [:]
 
     var body: some View {
         Card {
@@ -3543,7 +3550,15 @@ fileprivate struct PDFOpsMergePreview: View {
 
     private func loadThumb(_ url: URL) async {
         if thumbs[url] != nil { return }
-        let r = PDFOpsThumbRenderer(url: url)
+        // Reuse or create the per-URL renderer so the doc is opened once
+        // even if `loadThumb` is called repeatedly (e.g., row redraws).
+        let r: PDFOpsThumbRenderer
+        if let existing = renderers[url] {
+            r = existing
+        } else {
+            r = PDFOpsThumbRenderer(url: url)
+            await MainActor.run { renderers[url] = r }
+        }
         async let img = r.thumbnail(at: 0, target: 240)
         async let count = r.count()
         let (i, c) = await (img, count)
@@ -3562,9 +3577,16 @@ fileprivate struct PDFOpsSplitPreview: View {
     let mode: PDFOpsModel.SplitMode
     let ranges: String
 
+    // P1 fix: bounded thumb cache. Previously @State `[Int: NSImage]` grew
+    // unbounded as the user scrolled a 500-page PDF — each thumbnail at
+    // 80×104 ARGB is ~33 KB so the whole grid pinned ~16 MB. Cap at 120
+    // entries (covers ~4 screens of cells at typical density) + FIFO-evict
+    // the lowest-index entries when over the cap (they're least likely to
+    // be back on screen given LazyVGrid's downward scroll pattern).
     @State private var thumbs: [Int: NSImage] = [:]
     @State private var pageCount: Int = 0
     @State private var renderer: PDFOpsThumbRenderer? = nil
+    fileprivate static let thumbsCap = 120
 
     /// Per-page → group index (0-based output index). Pages with no group are
     /// dropped from the output entirely; we mark them dimmed.
@@ -3659,7 +3681,17 @@ fileprivate struct PDFOpsSplitPreview: View {
         if thumbs[idx] != nil { return }
         guard let r = renderer else { return }
         if let img = await r.thumbnail(at: idx, target: 200) {
-            await MainActor.run { thumbs[idx] = img }
+            await MainActor.run {
+                // P1 fix: bounded cache. Evict the lowest-index entries
+                // when we'd exceed the cap; they're least likely to be
+                // back on screen given LazyVGrid's downward scroll pattern.
+                if thumbs.count >= Self.thumbsCap {
+                    let toDrop = thumbs.keys.sorted()
+                        .prefix(thumbs.count - Self.thumbsCap + 1)
+                    for k in toDrop where k != idx { thumbs.removeValue(forKey: k) }
+                }
+                thumbs[idx] = img
+            }
         }
     }
 
@@ -3698,9 +3730,13 @@ fileprivate struct PDFOpsRotatePreview: View {
     let allPages: Bool
     let rangeText: String
 
+    // P1 fix: bounded thumb cache, same cap + eviction policy as
+    // PDFOpsSplitPreview. A 500-page rotate preview otherwise pinned
+    // ~16 MB of thumbnail bitmaps in @State indefinitely.
     @State private var thumbs: [Int: NSImage] = [:]
     @State private var pageCount: Int = 0
     @State private var renderer: PDFOpsThumbRenderer? = nil
+    fileprivate static let thumbsCap = 120
 
     private var affected: Set<Int> {
         if allPages { return Set(0..<pageCount) }
@@ -3749,9 +3785,21 @@ fileprivate struct PDFOpsRotatePreview: View {
                         .overlay(ProgressView().controlSize(.small))
                 }
             }
-            .frame(width: 86, height: 108)
+            // P1 fix: rotationEffect rotates in place WITHOUT reflowing the
+            // frame, so 90°/270° on a portrait thumbnail (108pt tall) clipped
+            // because the rotated content was 108pt wide but the container
+            // was still 86pt wide. Use a square container sized to the longer
+            // dimension so any rotation angle fits without clipping. Slight
+            // padding when the page is naturally portrait, but no clipping.
+            .frame(width: 108, height: 108)
             .rotationEffect(.degrees(rotates ? Double(degrees) : 0))
-            .animation(.easeInOut(duration: 0.18), value: degrees)
+            // P2 fix: respect Reduce Motion — disable the rotation animation
+            // when the system pref is on. The audit flagged this; the other
+            // hover animations in the file already gate on this env value.
+            .animation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+                       ? nil
+                       : .easeInOut(duration: 0.18),
+                       value: degrees)
             HStack(spacing: 4) {
                 Text("p\(idx + 1)").font(.caption2).foregroundStyle(.secondary)
                 if rotates {
@@ -3767,7 +3815,14 @@ fileprivate struct PDFOpsRotatePreview: View {
         if thumbs[idx] != nil { return }
         guard let r = renderer else { return }
         if let img = await r.thumbnail(at: idx, target: 200) {
-            await MainActor.run { thumbs[idx] = img }
+            await MainActor.run {
+                if thumbs.count >= Self.thumbsCap {
+                    let toDrop = thumbs.keys.sorted()
+                        .prefix(thumbs.count - Self.thumbsCap + 1)
+                    for k in toDrop where k != idx { thumbs.removeValue(forKey: k) }
+                }
+                thumbs[idx] = img
+            }
         }
     }
 }

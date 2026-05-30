@@ -14,6 +14,47 @@ will surface whatever's newest on the chosen channel.
 
 ---
 
+## [1.1.0-beta.10] — Unreleased
+
+### Fixed
+
+- **P1 — PDF Rotate preview clipped 90°/270° rotations.** `rotationEffect`
+  rotates in place WITHOUT reflowing the container frame, so a portrait
+  page rotated 90° was clipped to the original portrait frame. Switched
+  each rotate cell to a square 108×108 container so any rotation angle
+  fits without clipping. Added Reduce Motion respect to the rotation
+  animation (other hover animations in the file already had it).
+- **P1 — PDF Merge preview opened the source PDF twice per render.**
+  `loadThumb(_:)` created a fresh `PDFOpsThumbRenderer` per call, so two
+  copies of the same source in a merge list each held a separate
+  `PDFDocument`. Added a per-URL renderer cache keyed by the source URL
+  so the doc opens once even on redraws.
+- **P1 — PDF Split + Rotate previews held an unbounded thumb cache.**
+  `@State` `[Int: NSImage]` grew as the user scrolled a multi-hundred-page
+  PDF — at ~33 KB per 80×104 ARGB bitmap, a 500-page doc pinned ~16 MB
+  indefinitely. Cap at 120 entries (covers ~4 screens at typical density);
+  FIFO-evict the lowest-index entries when over the cap.
+- **P0 a11y sweep — 9 more `.headerText()` regressions reverted.** Sites
+  that mutate dynamically (`Text(detail.comm)` in procs) or that are
+  empty-state / error-state titles or TextField labels — not structural
+  landmarks — should not pollute the VoiceOver heading rotor. Reverted:
+  - `history.swift:717` — "No matches for X" empty-state
+  - `notes.swift:1012` — "No matches for X" empty-state
+  - `procs.swift:843` — "No processes match X" empty-state
+  - `procs.swift:750` — `Text(detail.comm)` dynamic value
+  - `network_monitor.swift:1131` — "No inbound/outbound traffic" empty-state
+  - `network_monitor.swift:1152` — "No network traffic yet" empty-state
+  - `network_monitor.swift:1220` — "Network monitoring unavailable" error
+  - `text_transforms.swift:1784/1788/1792/1798/1802` — five form-field labels
+    (Prefix / Suffix / Regex / Regex / Replacement) that sit above their
+    bound TextField, not section headings
+
+### Verified
+
+`lint-trove`: clean. `test-trove`: 233/233 PASS.
+
+---
+
 ## [1.1.0-beta.9] — Unreleased
 
 ### Fixed

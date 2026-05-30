@@ -1008,8 +1008,9 @@ private struct NoteSearchOverlay: View {
                         Image(systemName: "magnifyingglass")
                             .font(.system(size: 28, weight: .light))
                             .foregroundStyle(.tertiary)
+                        // A11y sweep revert: empty-state title isn't a heading.
                         Text("No matches for \"\(store.searchQuery)\"")
-                            .headerText()
+                            .font(.headline)
                         Text("Searched the body and title of all five tabs. Try a different word, or clear the search.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
