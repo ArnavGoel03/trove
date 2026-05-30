@@ -391,22 +391,96 @@ enum PDFOpsLoader {
 }
 
 // ===========================================================================
-// MARK: - Recent outputs (last 5 per op)
+// MARK: - Recent outputs (last 5 per op, persisted across launches)
 // ===========================================================================
+
+/// Lightweight Codable mirror of PDFOpsOutput, used solely for JSON persistence.
+private struct PDFOpsRecentEntry: Codable {
+    var urlPath: String
+    var bytes: Int64
+    var sourceLabel: String
+    var opKind: String   // PDFOpKind.rawValue
+    var note: String
+    var createdAt: Double  // timeIntervalSince1970
+
+    enum CodingKeys: String, CodingKey { case urlPath, bytes, sourceLabel, opKind, note, createdAt }
+
+    init(urlPath: String, bytes: Int64, sourceLabel: String,
+         opKind: String, note: String, createdAt: Double) {
+        self.urlPath = urlPath; self.bytes = bytes; self.sourceLabel = sourceLabel
+        self.opKind = opKind; self.note = note; self.createdAt = createdAt
+    }
+
+    /// P1 fix: tolerant decoder. Without this, adding any new field to the
+    /// record in a future version would silently empty the entire PDF recents
+    /// list (stored as `[PDFOpsRecentEntry]` in UserDefaults — synthesized
+    /// decode is all-or-nothing on the array).
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.urlPath     = try c.decode(String.self, forKey: .urlPath)
+        self.bytes       = (try? c.decodeIfPresent(Int64.self,  forKey: .bytes))       ?? 0
+        self.sourceLabel = (try? c.decodeIfPresent(String.self, forKey: .sourceLabel)) ?? ""
+        self.opKind      = (try? c.decodeIfPresent(String.self, forKey: .opKind))      ?? ""
+        self.note        = (try? c.decodeIfPresent(String.self, forKey: .note))        ?? ""
+        self.createdAt   = (try? c.decodeIfPresent(Double.self, forKey: .createdAt))   ?? Date().timeIntervalSince1970
+    }
+}
 
 @MainActor
 final class PDFOpsRecents: ObservableObject {
     @Published private(set) var byOp: [PDFOpKind: [PDFOpsOutput]] = [:]
+
+    private static let persistKey = "trove.pdf.recents.v1"
+
+    init() {
+        // Restore persisted recents on startup.
+        guard let data = UserDefaults.standard.data(forKey: Self.persistKey),
+              let entries = try? JSONDecoder().decode([PDFOpsRecentEntry].self, from: data)
+        else { return }
+        var rebuilt: [PDFOpKind: [PDFOpsOutput]] = [:]
+        for e in entries {
+            guard let kind = PDFOpKind(rawValue: e.opKind) else { continue }
+            let url = URL(fileURLWithPath: e.urlPath)
+            // Skip entries whose output file no longer exists — stale after
+            // the user cleaned Downloads or moved the file.
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            var out = PDFOpsOutput(
+                url: url, bytes: e.bytes,
+                sourceLabel: e.sourceLabel, opKind: kind
+            )
+            out.note = e.note
+            rebuilt[kind, default: []].append(out)
+        }
+        byOp = rebuilt
+    }
 
     func add(_ out: PDFOpsOutput) {
         var list = byOp[out.opKind] ?? []
         list.insert(out, at: 0)
         if list.count > 5 { list.removeLast(list.count - 5) }
         byOp[out.opKind] = list
+        persist()
     }
 
     func recents(for op: PDFOpKind) -> [PDFOpsOutput] {
         byOp[op] ?? []
+    }
+
+    /// Flatten all recents and write to UserDefaults. Called after every mutation.
+    private func persist() {
+        let all: [PDFOpsRecentEntry] = byOp.values.flatMap { $0 }.map { o in
+            PDFOpsRecentEntry(
+                urlPath: o.url.path,
+                bytes: o.bytes,
+                sourceLabel: o.sourceLabel,
+                opKind: o.opKind.rawValue,
+                note: o.note,
+                createdAt: o.createdAt.timeIntervalSince1970
+            )
+        }
+        if let data = try? JSONEncoder().encode(all) {
+            UserDefaults.standard.set(data, forKey: Self.persistKey)
+        }
     }
 }
 
@@ -478,10 +552,130 @@ final class PDFOpsModel: ObservableObject {
     @Published var wmRotation: Double = -30
     @Published var wmColor: Color = .red
     @Published var wmImageURL: URL? = nil
+    /// P1: live watermark preview — rendered off-main, published here.
+    @Published var wmPreviewImage: NSImage? = nil
+    /// Monotonic counter to invalidate stale preview renders.
+    private(set) var wmPreviewGeneration: Int = 0
+    /// Debounce handle for the live preview task.
+    private var wmPreviewTask: Task<Void, Never>? = nil
 
     enum WMKind: String, CaseIterable, Identifiable {
         case text = "Text", image = "Image"
         var id: String { rawValue }
+    }
+
+    /// P1: schedule a debounced live watermark preview render.
+    /// Call from .onChange on every watermark parameter.
+    func scheduleWatermarkPreview() {
+        wmPreviewTask?.cancel()
+        wmPreviewGeneration &+= 1
+        let gen = wmPreviewGeneration
+        // Capture params needed for off-main render.
+        guard let src = sources.first else { wmPreviewImage = nil; return }
+        let kind = wmKind
+        let text = wmText
+        let opacity = wmOpacity
+        let fontSize = wmFontSize
+        let rotation = wmRotation
+        let color = NSColor(wmColor)
+        let imgURL = wmImageURL
+        wmPreviewTask = Task.detached(priority: .utility) { [weak self] in
+            // Small debounce (150ms) so slider drags don't flood the queue.
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard !Task.isCancelled else { return }
+            let preview = Self.renderWatermarkPreview(
+                sourceURL: src.url,
+                kind: kind,
+                text: text,
+                opacity: opacity,
+                fontSize: fontSize,
+                rotation: rotation,
+                color: color,
+                imgURL: imgURL
+            )
+            await MainActor.run { [weak self] in
+                guard let self, self.wmPreviewGeneration == gen else { return }
+                self.wmPreviewImage = preview
+            }
+        }
+    }
+
+    /// Render watermark onto the first page of sourceURL at low resolution (144 DPI),
+    /// returned as an NSImage suitable for the preview thumbnail.
+    /// nonisolated static so it can be called from Task.detached.
+    nonisolated private static func renderWatermarkPreview(
+        sourceURL: URL,
+        kind: WMKind,
+        text: String,
+        opacity: Double,
+        fontSize: Double,
+        rotation: Double,
+        color: NSColor,
+        imgURL: URL?
+    ) -> NSImage? {
+        let (doc, _) = PDFOpsLoader.load(sourceURL)
+        guard let doc, doc.pageCount > 0, let page = doc.page(at: 0) else { return nil }
+        let bounds = page.bounds(for: .mediaBox)
+        guard bounds.width > 0, bounds.height > 0 else { return nil }
+        // Render at 144 DPI for a crisp preview without OOM risk.
+        let previewScale: CGFloat = 144.0 / 72.0
+        let maxPx: CGFloat = 800
+        let longSide = max(bounds.width, bounds.height) * previewScale
+        let scale = longSide > maxPx ? previewScale * (maxPx / longSide) : previewScale
+        let pxW = max(1, Int(bounds.width * scale))
+        let pxH = max(1, Int(bounds.height * scale))
+        let cs = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(data: nil, width: pxW, height: pxH,
+                                   bitsPerComponent: 8, bytesPerRow: 0, space: cs,
+                                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        // White background.
+        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: pxW, height: pxH))
+        // Render page content.
+        ctx.saveGState()
+        ctx.scaleBy(x: scale, y: scale)
+        ctx.translateBy(x: -bounds.minX, y: -bounds.minY)
+        page.draw(with: .mediaBox, to: ctx)
+        ctx.restoreGState()
+        // Composite watermark.
+        if kind == .text, !text.isEmpty {
+            // Draw centered rotated text over the page.
+            let cx = CGFloat(pxW) / 2
+            let cy = CGFloat(pxH) / 2
+            let nsStr = NSAttributedString(string: text, attributes: [
+                .font: NSFont.boldSystemFont(ofSize: CGFloat(fontSize) * scale),
+                .foregroundColor: color.withAlphaComponent(CGFloat(opacity)),
+            ])
+            let strSize = nsStr.size()
+            ctx.saveGState()
+            ctx.translateBy(x: cx, y: cy)
+            let radians = CGFloat(rotation) * .pi / 180
+            ctx.rotate(by: radians)
+            // NSString drawing requires NSGraphicsContext.
+            let nsCtx = NSGraphicsContext(cgContext: ctx, flipped: false)
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = nsCtx
+            nsStr.draw(at: NSPoint(x: -strSize.width / 2, y: -strSize.height / 2))
+            NSGraphicsContext.restoreGraphicsState()
+            ctx.restoreGState()
+        } else if kind == .image, let u = imgURL, let stamp = Self.loadImageHonoringEXIF(u) {
+            let pageW = bounds.width * scale
+            let targetW = pageW * 0.6
+            let stampScl = targetW / max(stamp.size.width, 1)
+            let stampW = stamp.size.width * stampScl
+            let stampH = stamp.size.height * stampScl
+            let stampX = (CGFloat(pxW) - stampW) / 2
+            let stampY = (CGFloat(pxH) - stampH) / 2
+            ctx.saveGState()
+            ctx.setAlpha(CGFloat(opacity))
+            if let cg = stamp.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                ctx.draw(cg, in: CGRect(x: stampX, y: stampY, width: stampW, height: stampH))
+            }
+            ctx.restoreGState()
+        }
+        guard let cg = ctx.makeImage() else { return nil }
+        return NSImage(cgImage: cg, size: NSSize(width: pxW, height: pxH))
     }
 
     // Crop
@@ -496,7 +690,17 @@ final class PDFOpsModel: ObservableObject {
     @Published var passwordInput: String = ""
 
     // Render-to-image
-    @Published var renderDPI: Int = 144  // 72, 144, 300
+    @Published var renderDPI: Int = 144  // 72, 144, 300 presets
+    // P1 FIX: freeform render DPI field (72–600). When the user types a custom
+    // value it overrides the preset picker. renderDPI is authoritative for the
+    // engine; renderDPIText drives the freeform TextField.
+    @Published var renderDPIText: String = "144" {
+        didSet {
+            if let v = Int(renderDPIText), v >= 72, v <= 600 {
+                renderDPI = v
+            }
+        }
+    }
 
     // Images → PDF
     @Published var imgSources: [PDFOpsSource] = []  // image files
@@ -1010,8 +1214,14 @@ final class PDFOpsModel: ObservableObject {
                 autoreleasepool {
                     guard let page = doc.page(at: i) else { return }
                     let bounds = page.bounds(for: .mediaBox)
-                    // Render the page to a bitmap at a sensible DPI (150).
-                    let scale: CGFloat = 150.0 / 72.0
+                    // P1 FIX: probe page dimensions and cap the raster scale
+                    // dynamically so huge pages (e.g. engineering drawings at
+                    // A0 = 3370×2384 pt) don't OOM at 150 DPI. Cap at 4096 px
+                    // on the long side — more than sufficient for compress.
+                    let maxRasterPx: CGFloat = 4096
+                    let pageMax = max(bounds.width, bounds.height, 1)
+                    let nominalScale: CGFloat = 150.0 / 72.0
+                    let scale: CGFloat = min(nominalScale, maxRasterPx / pageMax)
                     let pxW = max(1, Int(bounds.width * scale))
                     let pxH = max(1, Int(bounds.height * scale))
                     let cs = CGColorSpaceCreateDeviceRGB()
@@ -1307,23 +1517,65 @@ final class PDFOpsModel: ObservableObject {
                     }
                     page.addAnnotation(textAnn)
                 } else if let stamp = stampImage {
-                    // Image watermark: center, fit to ~60% page width.
-                    let pageW = bounds.width
-                    let target = pageW * 0.6
-                    let scale = target / max(stamp.size.width, 1)
-                    let w = stamp.size.width * scale
-                    let h = stamp.size.height * scale
-                    let r = CGRect(x: (bounds.width - w) / 2,
-                                   y: (bounds.height - h) / 2, width: w, height: h)
-                    let ann = PDFAnnotation(bounds: r, forType: .stamp, withProperties: nil)
-                    // Render the image with the requested opacity into a fresh NSImage.
-                    let img = NSImage(size: r.size, flipped: false) { rect in
-                        stamp.draw(in: rect, from: .zero, operation: .sourceOver,
-                                   fraction: CGFloat(snap.opacity))
-                        return true
+                    // P0 FIX: PDFAnnotation STAMP_IMAGE is a private PDFKit key
+                    // that is NOT serialized when saving — the logo is silently
+                    // dropped from the output file. Instead, bake the watermark
+                    // directly into the page's CGContext by re-rendering the page
+                    // into a new CGContext and compositing the stamp on top, then
+                    // replacing the page with the rasterized result (same approach
+                    // as runCompress). This guarantees the watermark survives save.
+                    //
+                    // Scale: match the compress raster scale (150 DPI), cap huge
+                    // pages the same way runCompress does.
+                    let scale: CGFloat = 150.0 / 72.0
+                    let pxW = max(1, Int(bounds.width * scale))
+                    let pxH = max(1, Int(bounds.height * scale))
+                    let cs = CGColorSpaceCreateDeviceRGB()
+                    guard let ctx = CGContext(data: nil,
+                                              width: pxW, height: pxH,
+                                              bitsPerComponent: 8,
+                                              bytesPerRow: 0,
+                                              space: cs,
+                                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                    else { continue }
+                    // White background.
+                    ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+                    ctx.fill(CGRect(x: 0, y: 0, width: pxW, height: pxH))
+                    // Render existing page content.
+                    ctx.saveGState()
+                    ctx.scaleBy(x: scale, y: scale)
+                    ctx.translateBy(x: -bounds.minX, y: -bounds.minY)
+                    page.draw(with: .mediaBox, to: ctx)
+                    ctx.restoreGState()
+                    // Composite stamp image centered at ~60% page width with
+                    // user-specified opacity.
+                    let pageW = bounds.width * scale
+                    let targetW = pageW * 0.6
+                    let stampScale = targetW / max(stamp.size.width, 1)
+                    let stampW = stamp.size.width * stampScale
+                    let stampH = stamp.size.height * stampScale
+                    let stampX = (CGFloat(pxW) - stampW) / 2
+                    let stampY = (CGFloat(pxH) - stampH) / 2
+                    let stampRect = CGRect(x: stampX, y: stampY, width: stampW, height: stampH)
+                    ctx.saveGState()
+                    ctx.setAlpha(CGFloat(snap.opacity))
+                    if let cgStamp = stamp.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                        ctx.draw(cgStamp, in: stampRect)
                     }
-                    ann.setValue(img, forAnnotationKey: .init(rawValue: "STAMP_IMAGE"))
-                    page.addAnnotation(ann)
+                    ctx.restoreGState()
+                    // Wrap the composited bitmap as a JPEG page and replace.
+                    guard let composited = ctx.makeImage() else { continue }
+                    let bmp = NSBitmapImageRep(cgImage: composited)
+                    guard let jpegData = bmp.representation(using: .jpeg,
+                                                            properties: [.compressionFactor: NSNumber(value: 0.85)])
+                    else { continue }
+                    guard let nsimg = NSImage(data: jpegData),
+                          let newPage = PDFPage(image: nsimg) else { continue }
+                    newPage.setBounds(bounds, for: .mediaBox)
+                    // Replace the existing page in-document. PDFDocument has no
+                    // "replace page at index" API, so we remove and re-insert.
+                    doc.removePage(at: i)
+                    doc.insert(newPage, at: i)
                 }
             }
             let base = src.url.deletingPathExtension().lastPathComponent
@@ -1945,7 +2197,7 @@ public struct PDFToolsView: View {
                 if !allRecents.isEmpty {
                     Card {
                         VStack(alignment: .leading, spacing: 10) {
-                            Text("Recent outputs").font(.headline)
+                            Text("Recent outputs").headerText()
                             ForEach(allRecents.prefix(5), id: \.id) { o in
                                 HStack(spacing: 10) {
                                     Image(systemName: o.opKind.icon)
@@ -2036,7 +2288,7 @@ struct PDFOpsCardButton: View {
                             .background(Color.troveCardSolid.opacity(0.6), in: Capsule())
                     }
                 }
-                Text(op.title).font(.headline)
+                Text(op.title).headerText()
                 Text(op.blurb)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -2091,6 +2343,7 @@ struct PDFOpsDetailView: View {
                 if op == .imagesToPDF ? !model.imgSources.isEmpty : !model.sources.isEmpty {
                     sourcesList
                     parameters
+                    livePreview
                     runRow
                 }
                 if !model.outputs.isEmpty { outputsCard }
@@ -2196,11 +2449,19 @@ struct PDFOpsDetailView: View {
                     model.addImageFiles(resolved)
                 } else {
                     model.addPDFFiles(resolved)
-                    // If user dropped a single PDF for an organize op, prime the order.
+                    // P1 FIX: PDFDocument(url:) can block >1s on large files —
+                    // do it off-main so the drop handler returns immediately.
                     if op == .organize, let first = model.sources.first,
-                       model.organizeOrder.isEmpty,
-                       let doc = PDFDocument(url: first.url) {
-                        model.organizeOrder = Array(0..<doc.pageCount)
+                       model.organizeOrder.isEmpty {
+                        let u = first.url
+                        let ord = model.organizeOrder  // capture before Task
+                        Task.detached(priority: .userInitiated) {
+                            let doc = PDFDocument(url: u)
+                            let n = doc?.pageCount ?? 0
+                            await MainActor.run {
+                                if ord.isEmpty { model.organizeOrder = Array(0..<n) }
+                            }
+                        }
                     }
                 }
             }
@@ -2227,10 +2488,18 @@ struct PDFOpsDetailView: View {
             model.addImageFiles(panel.urls)
         } else {
             model.addPDFFiles(panel.urls)
+            // P1 FIX: PDFDocument(url:) off-main (same as drop path).
             if op == .organize, let first = model.sources.first,
-               model.organizeOrder.isEmpty,
-               let doc = PDFDocument(url: first.url) {
-                model.organizeOrder = Array(0..<doc.pageCount)
+               model.organizeOrder.isEmpty {
+                let u = first.url
+                let ord = model.organizeOrder
+                Task.detached(priority: .userInitiated) {
+                    let doc = PDFDocument(url: u)
+                    let n = doc?.pageCount ?? 0
+                    await MainActor.run {
+                        if ord.isEmpty { model.organizeOrder = Array(0..<n) }
+                    }
+                }
             }
         }
     }
@@ -2243,7 +2512,7 @@ struct PDFOpsDetailView: View {
             Card {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
-                        Text("Images (\(model.imgSources.count))").font(.headline)
+                        Text("Images (\(model.imgSources.count))").headerText()
                         Spacer()
                         Text("Drag to reorder").font(.caption).foregroundStyle(.secondary)
                     }
@@ -2264,7 +2533,7 @@ struct PDFOpsDetailView: View {
             Card {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
-                        Text("PDFs (\(model.sources.count))").font(.headline)
+                        Text("PDFs (\(model.sources.count))").headerText()
                         Spacer()
                         Text(op == .merge ? "Drag to reorder merge order" : "Drag to reorder")
                             .font(.caption).foregroundStyle(.secondary)
@@ -2331,12 +2600,49 @@ struct PDFOpsDetailView: View {
     }
 
     // -------------------------------------------------------------------
+    // Live preview (no run/save required to see the result)
+    // -------------------------------------------------------------------
+    @ViewBuilder private var livePreview: some View {
+        switch op {
+        case .merge:
+            if model.sources.count >= 1 {
+                PDFOpsMergePreview(sources: model.sources)
+            }
+        case .split:
+            if let src = model.sources.first, !src.invalid {
+                PDFOpsSplitPreview(url: src.url,
+                                   mode: model.splitMode,
+                                   ranges: model.splitRanges)
+            }
+        case .rotate:
+            if let src = model.sources.first, !src.invalid {
+                PDFOpsRotatePreview(url: src.url,
+                                    degrees: model.rotateDegrees,
+                                    allPages: model.rotateAllPages,
+                                    rangeText: model.rotateRange)
+            }
+        case .compress:
+            if let src = model.sources.first, !src.invalid {
+                PDFOpsCompressPreview(url: src.url,
+                                      quality: model.compressQuality,
+                                      sourceBytes: src.bytes)
+            }
+        case .watermark:
+            // Watermark already has its own preview (model.wmPreviewImage)
+            // rendered inside wmParams. Skip here to avoid duplication.
+            EmptyView()
+        default:
+            EmptyView()
+        }
+    }
+
+    // -------------------------------------------------------------------
     // Parameters (per-op controls)
     // -------------------------------------------------------------------
     @ViewBuilder private var parameters: some View {
         Card {
             VStack(alignment: .leading, spacing: 14) {
-                Text("Options").font(.headline)
+                Text("Options").headerText()
                 switch op {
                 case .merge:        Text("Order in the list above is the merge order.").font(.callout).foregroundStyle(.secondary)
                 case .split:        splitParams
@@ -2448,25 +2754,32 @@ struct PDFOpsDetailView: View {
         VStack(alignment: .leading, spacing: 10) {
             Picker("Kind", selection: $model.wmKind) {
                 ForEach(PDFOpsModel.WMKind.allCases) { Text($0.rawValue).tag($0) }
-            }.pickerStyle(.segmented)
+            }
+            .pickerStyle(.segmented)
+            .onChange(of: model.wmKind) { _ in model.scheduleWatermarkPreview() }
             if model.wmKind == .text {
                 HStack {
                     Text("Text").frame(width: 90, alignment: .leading)
-                    TextField("CONFIDENTIAL", text: $model.wmText).textFieldStyle(.roundedBorder)
+                    TextField("CONFIDENTIAL", text: $model.wmText)
+                        .textFieldStyle(.roundedBorder)
+                        .onChange(of: model.wmText) { _ in model.scheduleWatermarkPreview() }
                 }
                 HStack {
                     Text("Color").frame(width: 90, alignment: .leading)
                     ColorPicker("", selection: $model.wmColor, supportsOpacity: false)
+                        .onChange(of: model.wmColor) { _ in model.scheduleWatermarkPreview() }
                     Spacer()
                 }
                 HStack {
                     Text("Font size").frame(width: 90, alignment: .leading)
                     Slider(value: $model.wmFontSize, in: 18...160)
+                        .onChange(of: model.wmFontSize) { _ in model.scheduleWatermarkPreview() }
                     Text("\(Int(model.wmFontSize))").font(.callout.monospacedDigit()).frame(width: 36, alignment: .trailing)
                 }
                 HStack {
                     Text("Rotation").frame(width: 90, alignment: .leading)
                     Slider(value: $model.wmRotation, in: -90...90)
+                        .onChange(of: model.wmRotation) { _ in model.scheduleWatermarkPreview() }
                     Text("\(Int(model.wmRotation))°").font(.callout.monospacedDigit()).frame(width: 36, alignment: .trailing)
                 }
             } else {
@@ -2476,12 +2789,47 @@ struct PDFOpsDetailView: View {
                         .lineLimit(1)
                         .foregroundStyle(model.wmImageURL == nil ? .secondary : .primary)
                 }
+                .onChange(of: model.wmImageURL) { _ in model.scheduleWatermarkPreview() }
             }
             HStack {
                 Text("Opacity").frame(width: 90, alignment: .leading)
                 Slider(value: $model.wmOpacity, in: 0.05...1.0)
+                    .onChange(of: model.wmOpacity) { _ in model.scheduleWatermarkPreview() }
                 Text(String(format: "%.2f", model.wmOpacity))
                     .font(.callout.monospacedDigit()).frame(width: 44, alignment: .trailing)
+            }
+
+            // P1: live preview — first page with watermark applied.
+            if model.sources.first != nil {
+                Divider()
+                HStack(alignment: .top, spacing: 12) {
+                    Text("Preview").font(.callout).foregroundStyle(.secondary)
+                        .frame(width: 90, alignment: .leading)
+                        .padding(.top, 4)
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(Color.troveBgElev)
+                        if let prev = model.wmPreviewImage {
+                            Image(nsImage: prev)
+                                .resizable()
+                                .interpolation(.medium)
+                                .scaledToFit()
+                                .padding(4)
+                        } else {
+                            VStack(spacing: 4) {
+                                ProgressView().controlSize(.small)
+                                Text("Rendering…")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .frame(width: 160, height: 200)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.troveLine, lineWidth: 0.5))
+                }
+                .onAppear { model.scheduleWatermarkPreview() }
+                .onChange(of: model.sources.count) { _ in model.scheduleWatermarkPreview() }
             }
         }
     }
@@ -2516,14 +2864,31 @@ struct PDFOpsDetailView: View {
     }
 
     // Render to image
+    // P1 FIX: freeform DPI field (72–600) alongside presets.
     private var renderParams: some View {
-        HStack {
-            Text("DPI").frame(width: 90, alignment: .leading)
-            Picker("", selection: $model.renderDPI) {
-                Text("72").tag(72)
-                Text("144").tag(144)
-                Text("300").tag(300)
-            }.pickerStyle(.segmented).frame(maxWidth: 260)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("DPI").frame(width: 90, alignment: .leading)
+                Picker("", selection: $model.renderDPI) {
+                    Text("72").tag(72)
+                    Text("144").tag(144)
+                    Text("300").tag(300)
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 260)
+                .onChange(of: model.renderDPI) { v in
+                    model.renderDPIText = "\(v)"
+                }
+            }
+            HStack {
+                Text("Custom DPI").frame(width: 90, alignment: .leading)
+                TextField("72–600", text: $model.renderDPIText)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 80)
+                    .font(.system(.body, design: .monospaced))
+                Text("Range: 72–600")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -2582,7 +2947,7 @@ struct PDFOpsDetailView: View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text("Outputs (\(model.outputs.count))").font(.headline)
+                    Text("Outputs (\(model.outputs.count))").headerText()
                     Spacer()
                     if model.outputs.count > 1 {
                         Button { saveAllOutputs() } label: {
@@ -2598,6 +2963,24 @@ struct PDFOpsDetailView: View {
                     outputRow(o, isPrimary: o.id == model.outputs.first?.id)
                 }
             }
+        }
+    }
+
+    /// Builds a single "Continue with…" menu item. Posts the same
+    /// `.troveOpenInPDFTool` payload that Library's reEditMenu uses; the
+    /// PDFView listener at the top of body handles op-switching + adding
+    /// the URL as a source for the new op. One code path, two entry points.
+    @ViewBuilder
+    private func pdfContinueButton(url: URL, label: String, op: String, icon: String) -> some View {
+        Button {
+            NotificationCenter.default.post(
+                name: .troveOpenInPDFTool,
+                object: nil,
+                userInfo: ["url": url, "op": op]
+            )
+            SharedStore.stage.flash("Continuing in \(label)")
+        } label: {
+            Label(label, systemImage: icon)
         }
     }
 
@@ -2647,6 +3030,29 @@ struct PDFOpsDetailView: View {
                 Divider()
                 Button { copyOutputPath(o) } label: {
                     Label("Copy Path", systemImage: "doc.on.doc")
+                }
+                Divider()
+                // P1 cross-pane chain — every output becomes input to the
+                // next op in one click. Mirrors the Library reEditMenu but
+                // sits right where the user just finished, so chaining
+                // (merge → organize → watermark → save) needs zero pane-
+                // hunting. Routes through `.troveOpenInPDFTool` which the
+                // top-level PDFView already listens for + auto-switches op
+                // + adds the URL as a fresh source.
+                Menu {
+                    pdfContinueButton(url: o.url, label: "Merge with another PDF", op: "merge",       icon: "arrow.triangle.merge")
+                    pdfContinueButton(url: o.url, label: "Split into pages",        op: "split",       icon: "scissors")
+                    pdfContinueButton(url: o.url, label: "Organize / rearrange",    op: "organize",    icon: "square.grid.3x3")
+                    pdfContinueButton(url: o.url, label: "Compress further",        op: "compress",    icon: "arrow.down.right.and.arrow.up.left")
+                    pdfContinueButton(url: o.url, label: "Rotate pages",            op: "rotate",      icon: "rotate.right")
+                    pdfContinueButton(url: o.url, label: "Add page numbers",        op: "pageNumbers", icon: "number")
+                    pdfContinueButton(url: o.url, label: "Watermark",               op: "watermark",   icon: "drop.halffull")
+                    pdfContinueButton(url: o.url, label: "Crop",                    op: "crop",        icon: "crop")
+                    pdfContinueButton(url: o.url, label: "Password-protect",        op: "protect",     icon: "lock")
+                    pdfContinueButton(url: o.url, label: "OCR text layer",          op: "ocr",         icon: "doc.text.viewfinder")
+                    pdfContinueButton(url: o.url, label: "Re-save via PDFKit",      op: "repair",      icon: "bandage")
+                } label: {
+                    Label("Continue with…", systemImage: "arrow.right.circle")
                 }
             } label: {
                 Image(systemName: "ellipsis.circle")
@@ -2801,7 +3207,7 @@ struct PDFOpsDetailView: View {
     private var failuresCard: some View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
-                Text("Issues (\(model.failures.count))").font(.headline)
+                Text("Issues (\(model.failures.count))").headerText()
                 ForEach(model.failures) { f in
                     HStack(alignment: .top, spacing: 10) {
                         Image(systemName: "exclamationmark.triangle.fill")
@@ -2968,7 +3374,8 @@ struct PDFOpsThumbCell: View {
                     }
                 }
                 .frame(width: 120, height: 150)
-                .background(Color.white)
+                // P2: use color token instead of raw Color.white
+                .background(Color.troveBgElev)
                 .overlay(
                     RoundedRectangle(cornerRadius: 4)
                         .strokeBorder(.separator, lineWidth: 0.5)
@@ -3021,12 +3428,402 @@ struct ReorderDropDelegate: DropDelegate {
 
 /// Preview-before-save modal. Renders a PDF via `PDFView` (PDFKit) or an
 /// image via `Image(nsImage:)` so the user can inspect the operation's
-/// output BEFORE committing to a destination. Outputs already live in a
-/// temp location at this point — the sheet's "Save…" / "Save to Downloads"
-/// buttons forward to the existing handlers in `PDFOpsDetailView`.
-///
-/// Non-PDF non-image outputs (extremely unusual — Trove's PDF Tools always
-/// produce one of these) fall through to a minimal "Open externally" hint.
+// ===========================================================================
+// MARK: - Live previews (no run/save required to see the result)
+// ===========================================================================
+//
+// One struct per op kind that benefits from a visual preview. Each reuses
+// `PDFOpsThumbRenderer` (actor-serialized PDFKit access) so opening a PDF
+// once gives us thumbnails for every page without re-opening per cell.
+// Previews update live as the user tweaks parameters above — no run, no
+// save, no Preview.app trip.
+
+/// MERGE — horizontal strip of first-page thumbnails in the current source
+/// order. Reorder via the source list above; the strip reflects it live.
+fileprivate struct PDFOpsMergePreview: View {
+    let sources: [PDFOpsSource]
+    @State private var thumbs: [URL: NSImage] = [:]
+    @State private var pageCounts: [URL: Int] = [:]
+
+    var body: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Merge preview").headerText()
+                    Spacer()
+                    let total = sources.compactMap { pageCounts[$0.url] }.reduce(0, +)
+                    if total > 0 {
+                        Text("\(total) page\(total == 1 ? "" : "s")")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: 14) {
+                        ForEach(Array(sources.enumerated()), id: \.element.id) { idx, s in
+                            mergeCard(idx: idx, src: s)
+                            if idx < sources.count - 1 {
+                                Image(systemName: "arrow.right")
+                                    .font(.title3).foregroundStyle(Color.troveFgMute)
+                                    .padding(.top, 50)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+                .frame(height: 170)
+            }
+        }
+    }
+
+    private func mergeCard(idx: Int, src: PDFOpsSource) -> some View {
+        VStack(spacing: 6) {
+            ZStack(alignment: .bottomTrailing) {
+                Group {
+                    if let img = thumbs[src.url] {
+                        Image(nsImage: img).resizable().aspectRatio(contentMode: .fit)
+                    } else {
+                        RoundedRectangle(cornerRadius: 6).fill(Color.troveCardSolid)
+                            .overlay(ProgressView().controlSize(.small))
+                    }
+                }
+                .frame(width: 90, height: 120)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.troveLine, lineWidth: 0.5))
+                // Index badge — shows merge position so reordering above is
+                // immediately legible.
+                Text("\(idx + 1)")
+                    .font(.caption2.weight(.bold))
+                    .padding(.horizontal, 5).padding(.vertical, 1)
+                    .background(Color.troveAccent.opacity(0.9), in: Capsule())
+                    .foregroundStyle(.white)
+                    .padding(4)
+            }
+            Text(src.url.lastPathComponent)
+                .font(.caption).lineLimit(1).truncationMode(.middle)
+                .frame(maxWidth: 100)
+            if let n = pageCounts[src.url] {
+                Text("\(n) page\(n == 1 ? "" : "s")")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .task(id: src.url) { await loadThumb(src.url) }
+    }
+
+    private func loadThumb(_ url: URL) async {
+        if thumbs[url] != nil { return }
+        let r = PDFOpsThumbRenderer(url: url)
+        async let img = r.thumbnail(at: 0, target: 240)
+        async let count = r.count()
+        let (i, c) = await (img, count)
+        await MainActor.run {
+            if let i { thumbs[url] = i }
+            pageCounts[url] = c
+        }
+    }
+}
+
+/// SPLIT — full thumbnail grid of the source PDF with vertical-gap dividers
+/// drawn between split groups. Parses `splitRanges` ("1-3, 5, 7-9") into
+/// groups so the user sees exactly which pages will land in which output.
+fileprivate struct PDFOpsSplitPreview: View {
+    let url: URL
+    let mode: PDFOpsModel.SplitMode
+    let ranges: String
+
+    @State private var thumbs: [Int: NSImage] = [:]
+    @State private var pageCount: Int = 0
+    @State private var renderer: PDFOpsThumbRenderer? = nil
+
+    /// Per-page → group index (0-based output index). Pages with no group are
+    /// dropped from the output entirely; we mark them dimmed.
+    private var groupOf: [Int: Int] {
+        switch mode {
+        case .everyPage:
+            return Dictionary(uniqueKeysWithValues: (0..<pageCount).map { ($0, $0) })
+        case .ranges:
+            return Self.parseRangeGroups(ranges, totalPages: pageCount)
+        }
+    }
+
+    var body: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Split preview").headerText()
+                    Spacer()
+                    let outputs = Set(groupOf.values).count
+                    if outputs > 0 {
+                        Text("\(outputs) output PDF\(outputs == 1 ? "" : "s") · \(groupOf.count) of \(pageCount) page\(pageCount == 1 ? "" : "s")")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                ScrollView {
+                    let cols = [GridItem(.adaptive(minimum: 100), spacing: 10)]
+                    LazyVGrid(columns: cols, spacing: 12) {
+                        ForEach(0..<pageCount, id: \.self) { idx in
+                            splitCell(idx: idx)
+                        }
+                    }
+                    .padding(6)
+                }
+                .frame(minHeight: 220, maxHeight: 360)
+                .background(Color.troveBgElev.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
+            }
+        }
+        .task(id: url) {
+            let r = PDFOpsThumbRenderer(url: url)
+            renderer = r
+            let n = await r.count()
+            await MainActor.run { pageCount = n }
+        }
+    }
+
+    private func splitCell(idx: Int) -> some View {
+        let g = groupOf[idx]
+        return VStack(spacing: 3) {
+            Group {
+                if let img = thumbs[idx] {
+                    Image(nsImage: img).resizable().aspectRatio(contentMode: .fit)
+                } else {
+                    RoundedRectangle(cornerRadius: 5).fill(Color.troveCardSolid)
+                        .overlay(ProgressView().controlSize(.small))
+                }
+            }
+            .frame(width: 80, height: 104)
+            .clipShape(RoundedRectangle(cornerRadius: 5))
+            .overlay(
+                RoundedRectangle(cornerRadius: 5)
+                    .strokeBorder(g == nil ? Color.troveLine : Color.troveAccent.opacity(0.6),
+                                  lineWidth: g == nil ? 0.5 : 2)
+            )
+            .opacity(g == nil ? 0.35 : 1)
+            HStack(spacing: 4) {
+                Text("p\(idx + 1)").font(.caption2).foregroundStyle(.secondary)
+                if let g {
+                    Text("→ #\(g + 1)").font(.caption2.weight(.semibold))
+                        .foregroundStyle(Color.troveAccent)
+                } else {
+                    Text("dropped").font(.caption2).foregroundStyle(Color.troveFgMute)
+                }
+            }
+        }
+        .task(id: idx) { await loadThumb(idx) }
+    }
+
+    private func loadThumb(_ idx: Int) async {
+        if thumbs[idx] != nil { return }
+        guard let r = renderer else { return }
+        if let img = await r.thumbnail(at: idx, target: 200) {
+            await MainActor.run { thumbs[idx] = img }
+        }
+    }
+
+    /// Parse "1-3, 5, 7-9" → [page → group] (1-based pages, 0-based group).
+    /// Page indexes that fall outside [1, totalPages] or unparsable tokens are
+    /// silently skipped — the UI's "p3 → #1" badge makes this legible without
+    /// throwing a validation error.
+    nonisolated static func parseRangeGroups(_ s: String, totalPages: Int) -> [Int: Int] {
+        var out: [Int: Int] = [:]
+        let groups = s.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        for (gi, raw) in groups.enumerated() where !raw.isEmpty {
+            if raw.contains("-") {
+                let parts = raw.split(separator: "-").map { Int($0.trimmingCharacters(in: .whitespaces)) ?? 0 }
+                guard parts.count == 2, parts[0] >= 1, parts[1] >= parts[0] else { continue }
+                for p in parts[0]...parts[1] where p <= totalPages { out[p - 1] = gi }
+            } else if let p = Int(raw), p >= 1, p <= totalPages {
+                out[p - 1] = gi
+            }
+        }
+        return out
+    }
+}
+
+/// ROTATE — thumbnail grid with the rotation applied per cell. Pages outside
+/// the rotation range (when "Apply to all pages" is off) show un-rotated.
+fileprivate struct PDFOpsRotatePreview: View {
+    let url: URL
+    let degrees: Int
+    let allPages: Bool
+    let rangeText: String
+
+    @State private var thumbs: [Int: NSImage] = [:]
+    @State private var pageCount: Int = 0
+    @State private var renderer: PDFOpsThumbRenderer? = nil
+
+    private var affected: Set<Int> {
+        if allPages { return Set(0..<pageCount) }
+        // Reuse the same range-parser as split — semantics match.
+        return Set(PDFOpsSplitPreview.parseRangeGroups(rangeText, totalPages: pageCount).keys)
+    }
+
+    var body: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Rotate preview").headerText()
+                    Spacer()
+                    Text("\(affected.count) of \(pageCount) page\(pageCount == 1 ? "" : "s") · \(degrees)°")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                ScrollView {
+                    let cols = [GridItem(.adaptive(minimum: 110), spacing: 10)]
+                    LazyVGrid(columns: cols, spacing: 12) {
+                        ForEach(0..<pageCount, id: \.self) { idx in
+                            rotateCell(idx: idx)
+                        }
+                    }
+                    .padding(6)
+                }
+                .frame(minHeight: 200, maxHeight: 340)
+                .background(Color.troveBgElev.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
+            }
+        }
+        .task(id: url) {
+            let r = PDFOpsThumbRenderer(url: url)
+            renderer = r
+            let n = await r.count()
+            await MainActor.run { pageCount = n }
+        }
+    }
+
+    private func rotateCell(idx: Int) -> some View {
+        let rotates = affected.contains(idx)
+        return VStack(spacing: 3) {
+            Group {
+                if let img = thumbs[idx] {
+                    Image(nsImage: img).resizable().aspectRatio(contentMode: .fit)
+                } else {
+                    RoundedRectangle(cornerRadius: 5).fill(Color.troveCardSolid)
+                        .overlay(ProgressView().controlSize(.small))
+                }
+            }
+            .frame(width: 86, height: 108)
+            .rotationEffect(.degrees(rotates ? Double(degrees) : 0))
+            .animation(.easeInOut(duration: 0.18), value: degrees)
+            HStack(spacing: 4) {
+                Text("p\(idx + 1)").font(.caption2).foregroundStyle(.secondary)
+                if rotates {
+                    Text("\(degrees)°").font(.caption2.weight(.semibold))
+                        .foregroundStyle(Color.troveAccent)
+                }
+            }
+        }
+        .task(id: idx) { await loadThumb(idx) }
+    }
+
+    private func loadThumb(_ idx: Int) async {
+        if thumbs[idx] != nil { return }
+        guard let r = renderer else { return }
+        if let img = await r.thumbnail(at: idx, target: 200) {
+            await MainActor.run { thumbs[idx] = img }
+        }
+    }
+}
+
+/// COMPRESS — projected output size + one rendered page at the chosen
+/// quality so the user can eyeball quality vs file-size trade-offs. The
+/// per-page estimate is built from a quick re-encode of the first page
+/// at the requested quality on a debounced detached task; total projected
+/// size = per-page bytes × pageCount.
+fileprivate struct PDFOpsCompressPreview: View {
+    let url: URL
+    let quality: Double
+    let sourceBytes: Int64
+
+    @State private var pageImage: NSImage? = nil
+    @State private var pageCount: Int = 0
+    @State private var projectedBytes: Int64 = 0
+    @State private var renderer: PDFOpsThumbRenderer? = nil
+    @State private var probeTask: Task<Void, Never>? = nil
+
+    var body: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text("Compress preview").headerText()
+                    Spacer()
+                    if projectedBytes > 0 {
+                        let pct = Int(((1.0 - Double(projectedBytes) / Double(max(sourceBytes, 1))) * 100).rounded())
+                        Text("\(sourceBytes.human) → ~\(projectedBytes.human) (\(pct)% smaller)")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(pct > 30 ? Color.troveSuccess : Color.troveFgDim)
+                    } else if pageCount > 0 {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+                HStack(alignment: .top, spacing: 16) {
+                    VStack(spacing: 4) {
+                        Group {
+                            if let img = pageImage {
+                                Image(nsImage: img).resizable().aspectRatio(contentMode: .fit)
+                            } else {
+                                RoundedRectangle(cornerRadius: 6).fill(Color.troveCardSolid)
+                                    .overlay(ProgressView().controlSize(.small))
+                            }
+                        }
+                        .frame(width: 180, height: 240)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.troveLine, lineWidth: 0.5))
+                        Text("Sample · page 1 at quality \(String(format: "%.2f", quality))")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Trove rasterizes embedded images at JPEG quality \(String(format: "%.2f", quality)) and re-emits the PDF. Vector content (text, paths) is preserved at full fidelity.")
+                            .font(.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if pageCount > 0 {
+                            Text("\(pageCount) page\(pageCount == 1 ? "" : "s") · estimate scales linearly with page count")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+        .task(id: url) {
+            let r = PDFOpsThumbRenderer(url: url)
+            renderer = r
+            let n = await r.count()
+            await MainActor.run { pageCount = n }
+        }
+        .onChange(of: quality) { _ in scheduleProbe() }
+        .task(id: url) { scheduleProbe() }
+    }
+
+    /// Debounce the JPEG re-encode so the slider isn't I/O-bound. Cancels the
+    /// previous probe before starting a new one.
+    private func scheduleProbe() {
+        probeTask?.cancel()
+        let q = self.quality
+        let pageURL = self.url
+        let pageNum = self.pageCount
+        probeTask = Task {
+            try? await Task.sleep(nanoseconds: 180_000_000) // 180ms debounce
+            if Task.isCancelled { return }
+            // Render page 1 at the target raster scale (matches the compress op).
+            guard let r = renderer else { return }
+            guard let img = await r.thumbnail(at: 0, target: 320) else { return }
+            // Re-encode to JPEG at quality and measure.
+            let bytes = Self.encodedJPEGBytes(img: img, quality: q)
+            await MainActor.run {
+                self.pageImage = img
+                let per = Int64(bytes)
+                self.projectedBytes = per * Int64(max(pageNum, 1))
+                _ = pageURL  // silence unused warning
+            }
+        }
+    }
+
+    nonisolated private static func encodedJPEGBytes(img: NSImage, quality: Double) -> Int {
+        guard let tiff = img.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let data = rep.representation(using: .jpeg,
+                                            properties: [.compressionFactor: quality])
+        else { return 0 }
+        return data.count
+    }
+}
+
 struct PDFOutputPreviewSheet: View {
     let output: PDFOpsOutput
     let onSave: () -> Void

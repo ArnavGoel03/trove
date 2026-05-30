@@ -331,6 +331,8 @@ final class BigScanWalker {
         var bigFilesMinBytes: Int64
         var dupesMinBytes: Int64
         var includeDuplicates: Bool
+        /// P1: directory base-names to skip during the walk (e.g. node_modules, .git).
+        var excludedDirNames: Set<String> = []
     }
 
     let options: Options
@@ -440,6 +442,17 @@ final class BigScanWalker {
             if pathIsTCCWalled(path) {
                 walker.skipDescendants()
                 continue
+            }
+
+            // P1: exclude user-specified directory names (node_modules, .git, build…).
+            // Check the last path component — no attribute read needed.
+            if !options.excludedDirNames.isEmpty {
+                let baseName = (path as NSString).lastPathComponent
+                if options.excludedDirNames.contains(baseName) {
+                    prog.skipped += 1
+                    walker.skipDescendants()
+                    continue
+                }
             }
 
             let rv: URLResourceValues
@@ -969,6 +982,21 @@ public struct BigScanView: View {
     @State private var oldAge: BigScanOldAge = .y1
     @State private var dupesMinMB: Double = 1
 
+    // P1: compute duplicates only when explicitly requested (expensive hashing)
+    @State private var computeDuplicates: Bool = false
+
+    // P1: exclude common noise dirs from scan
+    @State private var excludedDirNames: Set<String> = ["node_modules", ".git", "build", ".build", "DerivedData"]
+    @State private var showExcludeEditor: Bool = false
+
+    // P1: sort + filter controls for big/old file lenses
+    @State private var fileSortAscending: Bool = false
+    @State private var fileFilterText: String = ""
+
+    // P1: show-more caps for big/old lenses (start at 50, raise to 200)
+    @State private var bigFilesShowCount: Int = 50
+    @State private var oldFilesShowCount: Int = 50
+
     // ---- Scan state ----
     @State private var result: BigScanResult?
     @State private var loading: Bool = false
@@ -1013,6 +1041,8 @@ public struct BigScanView: View {
         // EXPLICITLY no .onAppear { scan() } — spec forbids auto-scan.
         // Reseed from cache on root change, but never start a scan.
         .onChange(of: path) { _ in reseedFromCache(); crumbs = [] }
+        // P1: reset show-more caps when lens changes
+        .onChange(of: lens) { _ in bigFilesShowCount = 50; oldFilesShowCount = 50 }
         .onChange(of: result?.computedAt) { _ in
             let totals = result?.categoryTotals ?? [:]
             sortedCategories = BigScanCategory.allCases
@@ -1115,37 +1145,60 @@ public struct BigScanView: View {
     }
 
     private var statusRow: some View {
-        HStack(spacing: 14) {
-            if loading {
-                ProgressView().controlSize(.small)
-                Text("Scanning… \(progress.files) files · \(progress.dirs) dirs · \(progress.bytes.human)")
-                    .font(.callout).foregroundStyle(.secondary)
-                if progress.skipped > 0 {
-                    Text("· \(progress.skipped) skipped (no access)")
-                        .font(.caption).foregroundStyle(.tertiary)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 14) {
+                if loading {
+                    ProgressView().controlSize(.small)
+                    Text("Scanning… \(progress.files) files · \(progress.dirs) dirs · \(progress.bytes.human)")
+                        .font(.callout).foregroundStyle(.secondary)
+                    if progress.skipped > 0 {
+                        Text("· \(progress.skipped) skipped (no access)")
+                            .font(.caption).foregroundStyle(.tertiary)
+                    }
+                    if let s = startedAt {
+                        Text("· \(elapsedString(since: s))")
+                            .font(.caption).foregroundStyle(.tertiary)
+                    }
+                } else if let r = result {
+                    Text("\(r.filesScanned) files · \(r.dirsScanned) dirs · \(r.totalBytes.human) · \(String(format: "%.1fs", r.elapsed))")
+                        .font(.callout).foregroundStyle(.secondary)
+                    if r.skippedNoAccess > 0 {
+                        Text("· \(r.skippedNoAccess) skipped").font(.caption).foregroundStyle(.tertiary)
+                    }
+                } else {
+                    Text("Pick a folder and hit Scan. Nothing runs until you do.")
+                        .font(.callout).foregroundStyle(.secondary)
                 }
-                if let s = startedAt {
-                    Text("· \(elapsedString(since: s))")
-                        .font(.caption).foregroundStyle(.tertiary)
-                }
-            } else if let r = result {
-                Text("\(r.filesScanned) files · \(r.dirsScanned) dirs · \(r.totalBytes.human) · \(String(format: "%.1fs", r.elapsed))")
-                    .font(.callout).foregroundStyle(.secondary)
-                if r.skippedNoAccess > 0 {
-                    Text("· \(r.skippedNoAccess) skipped").font(.caption).foregroundStyle(.tertiary)
-                }
-            } else {
-                Text("Pick a folder and hit Scan. Nothing runs until you do.")
-                    .font(.callout).foregroundStyle(.secondary)
+                Spacer()
             }
-            Spacer()
+
+            // P1: stale-cache infobar — shown when painting cached results
+            if !loading, let r = result {
+                let age = -r.computedAt.timeIntervalSinceNow
+                if age > 300 {   // stale after 5 minutes
+                    HStack(spacing: 6) {
+                        Image(systemName: "clock.arrow.circlepath")
+                            .font(.caption).foregroundStyle(Color.troveWarning)
+                        Text("Cached \(StorageCacheAge.describe(r.computedAt)) — Scan to refresh")
+                            .font(.caption).foregroundStyle(Color.troveWarning)
+                        Spacer()
+                    }
+                }
+            }
+
+            // P1: proportional stacked bar breakdown by category
+            if !loading, let r = result, r.totalBytes > 0 {
+                BigScanStackedBar(categoryTotals: r.categoryTotals, totalBytes: r.totalBytes)
+                    .frame(height: 12)
+                    .padding(.top, 2)
+            }
         }
     }
 
     private var hogsCard: some View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
-                Text("Common disk hogs").font(.headline)
+                Text("Common disk hogs").headerText()
                 Text("Tap one to set it as the scan root, then click Scan.")
                     .font(.caption).foregroundStyle(.secondary)
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 240), spacing: 10)],
@@ -1180,7 +1233,7 @@ public struct BigScanView: View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text("Time Machine local snapshots").font(.headline)
+                    Text("Time Machine local snapshots").headerText()
                     Spacer()
                     Button("Refresh") {
                         Task { snapshots = await Task.detached { BigScanSnapshots.list() }.value }
@@ -1251,6 +1304,51 @@ public struct BigScanView: View {
                 }
                 .pickerStyle(.segmented)
                 lensSpecificControls
+
+                // P1: exclude list + duplicates checkbox
+                Divider().padding(.vertical, 2)
+                HStack(spacing: 12) {
+                    Toggle(isOn: $computeDuplicates) {
+                        Text("Always compute duplicates")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    .toggleStyle(.checkbox)
+                    .help("Compute duplicate hashes even outside the Duplicates lens (slow on large trees)")
+
+                    Spacer()
+
+                    Button {
+                        showExcludeEditor.toggle()
+                    } label: {
+                        Label("Exclude \(excludedDirNames.count) dir\(excludedDirNames.count == 1 ? "" : "s")",
+                              systemImage: "eye.slash")
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    .popover(isPresented: $showExcludeEditor) {
+                        BigScanExcludeEditor(excluded: $excludedDirNames)
+                    }
+                }
+
+                // P1: sort + filter for file lenses
+                if [.bigFiles, .oldFiles].contains(lens) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "line.3.horizontal.decrease.circle")
+                            .foregroundStyle(.secondary)
+                        TextField("Filter by name", text: $fileFilterText)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(maxWidth: 200)
+                        Spacer()
+                        Button {
+                            fileSortAscending.toggle()
+                        } label: {
+                            Label(fileSortAscending ? "Smallest first" : "Largest first",
+                                  systemImage: fileSortAscending ? "arrow.up" : "arrow.down")
+                        }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                    }
+                }
             }
         }
     }
@@ -1290,7 +1388,7 @@ public struct BigScanView: View {
         Card {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
-                    Text(lens.rawValue).font(.headline)
+                    Text(lens.rawValue).headerText()
                     Spacer()
                 }
                 if loading {
@@ -1304,7 +1402,7 @@ public struct BigScanView: View {
                             .font(.system(size: 36, weight: .light))
                             .foregroundStyle(.tertiary)
                         Text("No scan yet")
-                            .font(.headline)
+                            .headerText()
                         Text("Big Scan walks the folder above and surfaces what's actually eating disk — top hogs by size, oldest files, duplicates, and per-category totals. Time Machine snapshots and privacy-protected folders are flagged separately.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
@@ -1400,20 +1498,39 @@ public struct BigScanView: View {
     // ---- Big files lens -----------------------------------------------------
 
     private var bigFilesLens: some View {
-        let files = result?.topBigFiles ?? []
-        let filtered = files.filter { $0.size >= Int64(bigMinMB) * 1024 * 1024 }
-        let m = filtered.first?.size ?? 1
+        var files = result?.topBigFiles ?? []
+        files = files.filter { $0.size >= Int64(bigMinMB) * 1024 * 1024 }
+        // P1: text filter
+        if !fileFilterText.isEmpty {
+            let q = fileFilterText.lowercased()
+            files = files.filter { $0.name.lowercased().contains(q) || $0.path.lowercased().contains(q) }
+        }
+        // P1: sort direction
+        files = fileSortAscending ? files.sorted { $0.size < $1.size } : files.sorted { $0.size > $1.size }
+        let total = files.count
+        // P1: show-more cap
+        let shown = Array(files.prefix(bigFilesShowCount))
+        let m = shown.first?.size ?? 1
         return VStack(alignment: .leading, spacing: 4) {
-            if filtered.isEmpty {
+            if shown.isEmpty {
                 Text("No files at or above \(Int(bigMinMB)) MB in this scan.")
                     .foregroundStyle(.secondary).font(.callout)
             } else {
-                ForEach(filtered) { f in
+                ForEach(shown) { f in
                     BigScanFileRow(file: f, maxSize: m,
                                    isSelected: selectedPath == f.path,
                                    onSelect: { selectedPath = f.path },
                                    onReveal: { reveal(f.path) },
                                    onTrash: { trashConfirm = BigScanTrashConfirm(paths: [f.path]) })
+                }
+                // P1: show-more button
+                if total > bigFilesShowCount {
+                    Button("\(total - bigFilesShowCount) more — Show all") {
+                        bigFilesShowCount = max(bigFilesShowCount + 150, total)
+                    }
+                    .font(.callout).buttonStyle(.borderless)
+                    .foregroundStyle(Color.troveAccent)
+                    .padding(.top, 4)
                 }
             }
         }
@@ -1422,19 +1539,38 @@ public struct BigScanView: View {
     // ---- Old files lens -----------------------------------------------------
 
     private var oldFilesLens: some View {
-        let files = result?.topOldFiles ?? []
-        let m = files.first?.size ?? 1
+        var files = result?.topOldFiles ?? []
+        // P1: text filter
+        if !fileFilterText.isEmpty {
+            let q = fileFilterText.lowercased()
+            files = files.filter { $0.name.lowercased().contains(q) || $0.path.lowercased().contains(q) }
+        }
+        // P1: sort direction
+        files = fileSortAscending ? files.sorted { $0.size < $1.size } : files.sorted { $0.size > $1.size }
+        let total = files.count
+        // P1: show-more cap
+        let shown = Array(files.prefix(oldFilesShowCount))
+        let m = shown.first?.size ?? 1
         return VStack(alignment: .leading, spacing: 4) {
-            if files.isEmpty {
+            if shown.isEmpty {
                 Text("No qualifying old files in this scan.")
                     .foregroundStyle(.secondary).font(.callout)
             } else {
-                ForEach(files) { f in
+                ForEach(shown) { f in
                     BigScanFileRow(file: f, maxSize: m,
                                    isSelected: selectedPath == f.path,
                                    onSelect: { selectedPath = f.path },
                                    onReveal: { reveal(f.path) },
                                    onTrash: { trashConfirm = BigScanTrashConfirm(paths: [f.path]) })
+                }
+                // P1: show-more button
+                if total > oldFilesShowCount {
+                    Button("\(total - oldFilesShowCount) more — Show all") {
+                        oldFilesShowCount = max(oldFilesShowCount + 150, total)
+                    }
+                    .font(.callout).buttonStyle(.borderless)
+                    .foregroundStyle(Color.troveAccent)
+                    .padding(.top, 4)
                 }
             }
         }
@@ -1452,9 +1588,10 @@ public struct BigScanView: View {
             } else {
                 // Caveat: 2-file groups are matched by size + partial-hash only.
                 // 3+ file groups use a full SHA-256. Verify before deleting.
+                // P2: raw .orange → token
                 Label("Pairs use partial-hash comparison — verify before deleting.", systemImage: "exclamationmark.triangle")
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(Color.troveWarning)
                 HStack {
                     Text("Wasted space across \(groups.count) groups:").foregroundStyle(.secondary)
                     Text(totalWasted.human).bold()
@@ -1502,12 +1639,16 @@ public struct BigScanView: View {
 
     private func startScan() {
         if loading { return }
+        // P1: only compute duplicates when on the Duplicates lens or the
+        // checkbox is set — hashing is expensive on large trees.
+        let shouldComputeDupes = (lens == .duplicates) || computeDuplicates
         let opts = BigScanWalker.Options(
             root: path,
             oldAge: oldAge,
             bigFilesMinBytes: Int64(bigMinMB) * 1024 * 1024,
             dupesMinBytes: Int64((dupesMinMB * 1024 * 1024).rounded()),
-            includeDuplicates: true
+            includeDuplicates: shouldComputeDupes,
+            excludedDirNames: excludedDirNames
         )
         loading = true
         progress = .init()
@@ -1596,71 +1737,80 @@ public struct BigScanView: View {
     }
 
     private func performTrash(paths: [String]) {
-        var ok = 0
-        var failed: [String] = []
-        // red-team-sec: defense-in-depth path validation. trashItem itself
-        // rejects empty strings, but a row with an unusual character (NUL,
-        // newline) shouldn't reach FileManager at all — and we never want to
-        // accept a relative path here even if a future code path produced
-        // one. Reject before we even try.
-        for p in paths {
-            guard !p.isEmpty,
-                  !p.contains("\0"),
-                  !p.contains("\n"),
-                  (p as NSString).isAbsolutePath else {
-                failed.append("(invalid path)")
-                continue
-            }
-            do {
-                try FileManager.default.trashItem(at: URL(fileURLWithPath: p), resultingItemURL: nil)
-                ok += 1
-            } catch {
-                failed.append("\((p as NSString).lastPathComponent): \(error.localizedDescription)")
-            }
-        }
-        if !failed.isEmpty {
-            SharedStore.stage.flash("Trashed \(ok); \(failed.count) failed (\(failed.first ?? ""))")
-        } else {
-            SharedStore.stage.flash("Moved \(ok) to Trash")
-        }
-        if let sp = selectedPath, paths.contains(sp) { selectedPath = nil }
-        // red-team: remove the trashed paths from the current in-memory
-        // result tree so the rows disappear immediately. Without this, the
-        // user sees "Moved N to Trash" but the rows stay visible until they
-        // hit Scan again — confusing on a successful destructive op.
-        if !paths.isEmpty, let r = self.result {
-            let gone = Set(paths)
-            var trimmedTree = r.tree
-            // Snapshot keys before mutation — Swift dictionaries don't promise
-            // safe in-place mutation during iteration.
-            for k in Array(trimmedTree.keys) {
-                guard let node = trimmedTree[k] else { continue }
-                let kept = node.children.filter { !gone.contains($0.path) }
-                if kept.count != node.children.count {
-                    trimmedTree[k] = BigScanTreeNode(path: node.path,
-                                                    totalSize: node.totalSize,
-                                                    children: kept,
-                                                    computedAt: node.computedAt)
+        // P1 fix: run the FileManager calls off-main (trashItem can block on
+        // slow volumes / network shares), then publish results back on MainActor.
+        Task {
+            let (ok, failed): (Int, [String]) = await Task.detached(priority: .userInitiated) {
+                var ok = 0
+                var failed: [String] = []
+                // red-team-sec: defense-in-depth path validation. trashItem itself
+                // rejects empty strings, but a row with an unusual character (NUL,
+                // newline) shouldn't reach FileManager at all — and we never want to
+                // accept a relative path here even if a future code path produced
+                // one. Reject before we even try.
+                for p in paths {
+                    guard !p.isEmpty,
+                          !p.contains("\0"),
+                          !p.contains("\n"),
+                          (p as NSString).isAbsolutePath else {
+                        failed.append("(invalid path)")
+                        continue
+                    }
+                    do {
+                        try FileManager.default.trashItem(at: URL(fileURLWithPath: p), resultingItemURL: nil)
+                        ok += 1
+                    } catch {
+                        failed.append("\((p as NSString).lastPathComponent): \(error.localizedDescription)")
+                    }
                 }
+                return (ok, failed)
+            }.value
+
+            // Back on MainActor for UI updates.
+            if !failed.isEmpty {
+                SharedStore.stage.flash("Trashed \(ok); \(failed.count) failed (\(failed.first ?? ""))")
+            } else {
+                SharedStore.stage.flash("Moved \(ok) to Trash")
             }
-            let filterFiles: ([BigScanFile]) -> [BigScanFile] = { $0.filter { !gone.contains($0.path) } }
-            var newByCat: [BigScanCategory: [BigScanFile]] = [:]
-            for (cat, files) in r.byCategory { newByCat[cat] = filterFiles(files) }
-            let newDupes = r.duplicates.compactMap { g -> BigScanDuplicateGroup? in
-                let kept = g.files.filter { !gone.contains($0) }
-                if kept.count < 2 { return nil }
-                return BigScanDuplicateGroup(key: g.key, size: g.size, files: kept)
+            if let sp = selectedPath, paths.contains(sp) { selectedPath = nil }
+            // red-team: remove the trashed paths from the current in-memory
+            // result tree so the rows disappear immediately. Without this, the
+            // user sees "Moved N to Trash" but the rows stay visible until they
+            // hit Scan again — confusing on a successful destructive op.
+            if !paths.isEmpty, let r = self.result {
+                let gone = Set(paths)
+                var trimmedTree = r.tree
+                // Snapshot keys before mutation — Swift dictionaries don't promise
+                // safe in-place mutation during iteration.
+                for k in Array(trimmedTree.keys) {
+                    guard let node = trimmedTree[k] else { continue }
+                    let kept = node.children.filter { !gone.contains($0.path) }
+                    if kept.count != node.children.count {
+                        trimmedTree[k] = BigScanTreeNode(path: node.path,
+                                                        totalSize: node.totalSize,
+                                                        children: kept,
+                                                        computedAt: node.computedAt)
+                    }
+                }
+                let filterFiles: ([BigScanFile]) -> [BigScanFile] = { $0.filter { !gone.contains($0.path) } }
+                var newByCat: [BigScanCategory: [BigScanFile]] = [:]
+                for (cat, files) in r.byCategory { newByCat[cat] = filterFiles(files) }
+                let newDupes = r.duplicates.compactMap { g -> BigScanDuplicateGroup? in
+                    let kept = g.files.filter { !gone.contains($0) }
+                    if kept.count < 2 { return nil }
+                    return BigScanDuplicateGroup(key: g.key, size: g.size, files: kept)
+                }
+                self.result = BigScanResult(
+                    root: r.root, computedAt: r.computedAt, elapsed: r.elapsed,
+                    filesScanned: r.filesScanned, dirsScanned: r.dirsScanned,
+                    skippedNoAccess: r.skippedNoAccess, totalBytes: r.totalBytes,
+                    topBigFiles: filterFiles(r.topBigFiles),
+                    topOldFiles: filterFiles(r.topOldFiles),
+                    byCategory: newByCat, categoryTotals: r.categoryTotals,
+                    duplicates: newDupes, tree: trimmedTree)
             }
-            self.result = BigScanResult(
-                root: r.root, computedAt: r.computedAt, elapsed: r.elapsed,
-                filesScanned: r.filesScanned, dirsScanned: r.dirsScanned,
-                skippedNoAccess: r.skippedNoAccess, totalBytes: r.totalBytes,
-                topBigFiles: filterFiles(r.topBigFiles),
-                topOldFiles: filterFiles(r.topOldFiles),
-                byCategory: newByCat, categoryTotals: r.categoryTotals,
-                duplicates: newDupes, tree: trimmedTree)
+            // Don't re-scan automatically; user can hit Scan to refresh.
         }
-        // Don't re-scan automatically; user can hit Scan to refresh.
     }
 
     private func elapsedString(since: Date) -> String {
@@ -1741,7 +1891,8 @@ fileprivate struct BigScanTreeRow: View {
                 .buttonStyle(.borderless).help("Move to Trash")
         }
         .padding(.vertical, 5).padding(.horizontal, 6)
-        .background(isSelected ? Color.accentColor.opacity(0.12) : .clear,
+        // P2: raw Color.accentColor → token
+        .background(isSelected ? Color.troveAccent.opacity(0.12) : .clear,
                     in: RoundedRectangle(cornerRadius: 6))
         .contentShape(Rectangle())
         .onTapGesture { onSelect() }
@@ -1790,7 +1941,8 @@ fileprivate struct BigScanFileRow: View {
                 .buttonStyle(.borderless).help("Move to Trash")
         }
         .padding(.vertical, 5).padding(.horizontal, 6)
-        .background(isSelected ? Color.accentColor.opacity(0.12) : .clear,
+        // P2: raw Color.accentColor → token
+        .background(isSelected ? Color.troveAccent.opacity(0.12) : .clear,
                     in: RoundedRectangle(cornerRadius: 6))
         .contentShape(Rectangle())
         .onTapGesture { onSelect() }
@@ -1826,6 +1978,146 @@ fileprivate struct BigScanCategoryRow: View {
         .padding(.vertical, 6).padding(.horizontal, 6)
         .contentShape(Rectangle())
         .onTapGesture { onToggle() }
+    }
+}
+
+// ===========================================================================
+// MARK: - P1: Stacked bar breakdown (proportional per-category)
+// ===========================================================================
+
+fileprivate struct BigScanStackedBar: View {
+    let categoryTotals: [BigScanCategory: Int64]
+    let totalBytes: Int64
+
+    /// Palette of token-adjacent hues — cycled per category in allCases order
+    /// so the bar is visually distinctive without raw literal colours.
+    private static let segmentColors: [Color] = [
+        .troveAccent, .troveSuccess, .troveWarning, .troveError,
+        Color(hue: 0.55, saturation: 0.7, brightness: 0.75),
+        Color(hue: 0.75, saturation: 0.6, brightness: 0.80),
+        Color(hue: 0.08, saturation: 0.8, brightness: 0.85),
+        Color(hue: 0.33, saturation: 0.65, brightness: 0.70),
+        Color(hue: 0.15, saturation: 0.7, brightness: 0.80),
+        Color(hue: 0.90, saturation: 0.6, brightness: 0.75),
+    ]
+
+    var body: some View {
+        GeometryReader { geo in
+            HStack(spacing: 1) {
+                let sorted = BigScanCategory.allCases
+                    .enumerated()
+                    .compactMap { (idx, cat) -> (BigScanCategory, Int, CGFloat)? in
+                        guard let bytes = categoryTotals[cat], bytes > 0 else { return nil }
+                        let fraction = CGFloat(Double(bytes) / Double(totalBytes))
+                        return (cat, idx, fraction)
+                    }
+                    .sorted { $0.2 > $1.2 }
+                ForEach(Array(sorted.enumerated()), id: \.offset) { (i, entry) in
+                    let (cat, colorIdx, fraction) = entry
+                    let color = Self.segmentColors[colorIdx % Self.segmentColors.count]
+                    Rectangle()
+                        .fill(color.opacity(0.85))
+                        .frame(width: max(1, geo.size.width * fraction))
+                        .help("\(cat.rawValue): \((categoryTotals[cat] ?? 0).human)")
+                }
+                Spacer(minLength: 0)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 3))
+        }
+    }
+}
+
+// ===========================================================================
+// MARK: - P1: Exclude editor popover
+// ===========================================================================
+
+fileprivate struct BigScanExcludeEditor: View {
+    @Binding var excluded: Set<String>
+    @State private var newName: String = ""
+
+    private static let presets: [String] = [
+        "node_modules", ".git", "build", ".build", "DerivedData",
+        ".gradle", "__pycache__", ".venv", "vendor",
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Exclude directory names")
+                .headerText()
+            Text("Directories whose base-name matches are skipped entirely during scan.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            // Existing exclusions
+            ForEach(Array(excluded).sorted(), id: \.self) { name in
+                HStack {
+                    Text(name).font(.callout.monospaced())
+                    Spacer()
+                    Button {
+                        excluded.remove(name)
+                    } label: {
+                        Image(systemName: "minus.circle.fill").foregroundStyle(Color.troveError)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            // Add custom
+            HStack {
+                TextField("Add name…", text: $newName)
+                    .textFieldStyle(.roundedBorder)
+                Button("Add") {
+                    let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty { excluded.insert(trimmed); newName = "" }
+                }
+                .disabled(newName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+
+            // Presets
+            Text("Common presets")
+                .font(.caption).foregroundStyle(.secondary)
+            FlowLayout(spacing: 6) {
+                ForEach(Self.presets, id: \.self) { preset in
+                    Button(preset) {
+                        excluded.insert(preset)
+                    }
+                    .font(.caption)
+                    .buttonStyle(.bordered)
+                    .disabled(excluded.contains(preset))
+                }
+            }
+        }
+        .padding(16)
+        .frame(minWidth: 300, idealWidth: 340)
+    }
+}
+
+/// Minimal horizontal-wrapping flow layout for the preset chips.
+fileprivate struct FlowLayout: Layout {
+    var spacing: CGFloat = 8
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width ?? 300
+        var y: CGFloat = 0; var x: CGFloat = 0; var rowH: CGFloat = 0
+        for sub in subviews {
+            let s = sub.sizeThatFits(.unspecified)
+            if x + s.width > width && x > 0 { y += rowH + spacing; x = 0; rowH = 0 }
+            x += s.width + spacing; rowH = max(rowH, s.height)
+        }
+        return CGSize(width: width, height: y + rowH)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX; var y = bounds.minY; var rowH: CGFloat = 0
+        for sub in subviews {
+            let s = sub.sizeThatFits(.unspecified)
+            if x + s.width > bounds.maxX && x > bounds.minX {
+                y += rowH + spacing; x = bounds.minX; rowH = 0
+            }
+            sub.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(s))
+            x += s.width + spacing; rowH = max(rowH, s.height)
+        }
     }
 }
 
@@ -1874,7 +2166,8 @@ fileprivate struct BigScanDupeGroupRow: View {
                             .buttonStyle(.borderless)
                     }
                     .padding(.leading, 30).padding(.vertical, 2)
-                    .background(selectedPath == p ? Color.accentColor.opacity(0.12) : .clear,
+                    // P2: raw Color.accentColor → token
+                    .background(selectedPath == p ? Color.troveAccent.opacity(0.12) : .clear,
                                 in: RoundedRectangle(cornerRadius: 4))
                     .contentShape(Rectangle())
                     .onTapGesture { selectedPath = p }

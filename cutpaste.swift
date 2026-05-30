@@ -32,12 +32,19 @@ struct CutPasteHistoryEntry: Identifiable, Hashable {
     let src: String
     let dst: String
     let at: Date
-    var time: String {
+    // P1: store full src/dst URLs for rollback and Reveal in Finder.
+    let srcURLs: [URL]
+    let dstURLs: [URL]
+
+    // P1: static DateFormatter — avoids allocating a new one per row render.
+    private static let timeFmt: DateFormatter = {
         let f = DateFormatter()
         f.dateStyle = .short
         f.timeStyle = .medium
-        return f.string(from: at)
-    }
+        return f
+    }()
+
+    var time: String { Self.timeFmt.string(from: at) }
 }
 
 // ===========================================================================
@@ -47,6 +54,14 @@ struct CutPasteHistoryEntry: Identifiable, Hashable {
 final class CutPasteController: ObservableObject {
     static let shared = CutPasteController()
 
+    // INTENTIONALLY transient: the audit asked whether this should persist via
+    // @AppStorage so the user doesn't have to re-enable on every launch. Answer
+    // is no — `enabled = true` installs a CGEventTap that intercepts ⌘X/⌘V in
+    // Finder, and re-engaging the tap should be an explicit per-session opt-in.
+    // Silent persistence would mean a user who enables cut-paste once forever
+    // intercepts those keys on every future launch (including after a system
+    // upgrade that may have reset Accessibility permissions). The defensive
+    // default is: each session, the user actively opts in. Keep it that way.
     @Published var enabled: Bool = false
     @Published var cut: [CutPasteEntry] = []
     @Published var history: [CutPasteHistoryEntry] = []
@@ -271,108 +286,149 @@ final class CutPasteController: ObservableObject {
         if !silent { SharedStore.stage.flash("Cut cancelled") }
     }
 
+    // P1: performPaste runs on a background queue; all FM work is off-main.
+    // We snapshot `cut` on main, then dispatch to avoid blocking the UI during
+    // large or cross-volume moves.
+    private var pasteIsRunning = false
+
     private func performPaste() {
         guard !cut.isEmpty else { return }
-        guard let dest = CutPasteFinderBridge.frontTargetFolder() else {
-            SharedStore.stage.flash("Couldn't read Finder's front window destination")
+        guard !pasteIsRunning else {
+            SharedStore.stage.flash("Paste in progress — please wait")
             return
         }
+        pasteIsRunning = true
 
-        // Red-team #4: validate each source still exists.
-        let fm = FileManager.default
-        var sources: [URL] = []
-        var missing = 0
-        for entry in cut {
-            if fm.fileExists(atPath: entry.url.path) { sources.append(entry.url) }
-            else { missing += 1 }
-        }
-        if sources.isEmpty {
-            SharedStore.stage.flash("All \(cut.count) cut file\(cut.count == 1 ? "" : "s") missing — paste aborted")
-            cancelCut(silent: true)
-            return
-        }
+        // Snapshot cut list before async dispatch.
+        let cutSnapshot = cut
 
-        // Red-team #5: no-op when source and dest are the same folder.
-        let sameParent = sources.allSatisfy {
-            $0.deletingLastPathComponent().standardizedFileURL == dest.standardizedFileURL
-        }
-        if sameParent {
-            SharedStore.stage.flash("Source and destination are the same folder — nothing to do")
-            return
-        }
+        SharedStore.stage.flash("Moving \(cutSnapshot.count) file\(cutSnapshot.count == 1 ? "" : "s")…")
 
-        // red-team: refuse to paste a folder into itself or any descendant.
-        // FileManager.moveItem would create a self-recursive directory and
-        // either spin until out of inodes or corrupt the source.
-        let destPath = dest.standardizedFileURL.path
-        let destPathWithSlash = destPath.hasSuffix("/") ? destPath : destPath + "/"
-        let recursive = sources.first { src in
-            let s = src.standardizedFileURL.path
-            return destPath == s || destPathWithSlash.hasPrefix(s + "/")
-        }
-        if let bad = recursive {
-            SharedStore.stage.flash("Refusing to paste \(bad.lastPathComponent) into itself")
-            return
-        }
+        // P1: move off-main to avoid freezing the UI.
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
 
-        // red-team: refuse to write into a read-only volume up-front instead
-        // of letting every per-file moveItem fail with a confusing error.
-        if !fm.isWritableFile(atPath: dest.path) {
-            SharedStore.stage.flash("Destination is read-only — paste aborted")
-            return
-        }
+            // Read Finder's target folder (AppleScript) — must stay on background.
+            guard let dest = CutPasteFinderBridge.frontTargetFolder() else {
+                await MainActor.run {
+                    SharedStore.stage.flash("Couldn't read Finder's front window destination")
+                    self.pasteIsRunning = false
+                }
+                return
+            }
 
-        var moved = 0
-        var failed = 0
-        var firstError: String? = nil
-        var srcParents = Set<String>()
-        for src in sources {
-            srcParents.insert(src.deletingLastPathComponent().path)
-            let target = uniqueDestination(for: src.lastPathComponent, in: dest)
-            do {
-                try fm.moveItem(at: src, to: target)
-                moved += 1
-            } catch {
-                // Red-team #6: log + count, keep going. Surface the first
-                // error to the status line so the user gets a real reason
-                // (read-only mid-volume, permission, busy file) instead of
-                // an opaque "N failed".
-                failed += 1
-                if firstError == nil { firstError = error.localizedDescription }
+            let fm = FileManager.default
+            // P0 fix: skip symlinks. fm.fileExists follows symlinks, so a symlink
+            // pointing at /dev/zero, a FIFO, or another device node passes the
+            // existence check; moveItem then moves the *symlink*, and a recipient
+            // that later opens it (or copies from it) hangs reading the device.
+            // big_scan and image_tools already gate on isSymbolicLinkKey; cut/paste
+            // was the last code path with no guard.
+            var sources: [URL] = cutSnapshot
+                .filter { entry in
+                    guard fm.fileExists(atPath: entry.url.path) else { return false }
+                    let isSymlink = (try? entry.url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) ?? false
+                    return !isSymlink
+                }
+                .map { $0.url }
+            let missingCount = cutSnapshot.count - sources.count
+
+            if sources.isEmpty {
+                await MainActor.run {
+                    SharedStore.stage.flash("All \(cutSnapshot.count) cut file\(cutSnapshot.count == 1 ? "" : "s") missing — paste aborted")
+                    self.pasteIsRunning = false
+                    self.cancelCut(silent: true)
+                }
+                return
+            }
+
+            // Red-team #5: no-op when same folder.
+            let sameParent = sources.allSatisfy {
+                $0.deletingLastPathComponent().standardizedFileURL == dest.standardizedFileURL
+            }
+            if sameParent {
+                await MainActor.run {
+                    SharedStore.stage.flash("Source and destination are the same folder — nothing to do")
+                    self.pasteIsRunning = false
+                }
+                return
+            }
+
+            // red-team: refuse to paste a folder into itself.
+            let destPath = dest.standardizedFileURL.path
+            let destPathWithSlash = destPath.hasSuffix("/") ? destPath : destPath + "/"
+            if let bad = sources.first(where: { src in
+                let s = src.standardizedFileURL.path
+                return destPath == s || destPathWithSlash.hasPrefix(s + "/")
+            }) {
+                await MainActor.run {
+                    SharedStore.stage.flash("Refusing to paste \(bad.lastPathComponent) into itself")
+                    self.pasteIsRunning = false
+                }
+                return
+            }
+
+            if !fm.isWritableFile(atPath: dest.path) {
+                await MainActor.run {
+                    SharedStore.stage.flash("Destination is read-only — paste aborted")
+                    self.pasteIsRunning = false
+                }
+                return
+            }
+
+            var moved = 0
+            var failed = 0
+            var firstError: String? = nil
+            var srcParents = Set<String>()
+            // P1: track (src, dst) pairs for undo and history.
+            var movedPairs: [(src: URL, dst: URL)] = []
+            for src in sources {
+                srcParents.insert(src.deletingLastPathComponent().path)
+                let target = self.uniqueDestination(for: src.lastPathComponent, in: dest)
+                do {
+                    try fm.moveItem(at: src, to: target)
+                    movedPairs.append((src: src, dst: target))
+                    moved += 1
+                } catch {
+                    failed += 1
+                    if firstError == nil { firstError = error.localizedDescription }
+                }
+            }
+
+            let srcLabel = srcParents.count == 1
+                ? (srcParents.first.map { ($0 as NSString).lastPathComponent } ?? "various")
+                : "\(srcParents.count) folders"
+            let dstLabel = dest.lastPathComponent.isEmpty ? dest.path : dest.lastPathComponent
+
+            await MainActor.run {
+                self.clearAllVisualHints()
+
+                // P1: record full src/dst URLs in history.
+                let entry = CutPasteHistoryEntry(
+                    count: moved, src: srcLabel, dst: dstLabel, at: Date(),
+                    srcURLs: movedPairs.map { $0.src },
+                    dstURLs: movedPairs.map { $0.dst }
+                )
+                self.history.insert(entry, at: 0)
+                if self.history.count > 10 { self.history.removeLast(self.history.count - 10) }
+
+                self.cut.removeAll()
+                os_unfair_lock_lock(&self.pendingLock)
+                self.pendingCut = false
+                os_unfair_lock_unlock(&self.pendingLock)
+                self.staleTimer?.invalidate()
+                self.staleTimer = nil
+                self.pasteIsRunning = false
+
+                NSSound(named: NSSound.Name("Glass"))?.play()
+                var parts: [String] = ["Moved \(moved) file\(moved == 1 ? "" : "s")"]
+                if failed > 0 {
+                    parts.append(firstError.map { "\(failed) failed (\($0))" } ?? "\(failed) failed")
+                }
+                if missingCount > 0 { parts.append("\(missingCount) missing — skipped") }
+                SharedStore.stage.flash(parts.joined(separator: " · "))
             }
         }
-
-        // Scrub any visual hint tags from anything that didn't move.
-        clearAllVisualHints()
-
-        // Record history (cap at 10 newest-first).
-        let srcLabel = srcParents.count == 1
-            ? (srcParents.first.map { (($0 as NSString).lastPathComponent) } ?? "various")
-            : "\(srcParents.count) folders"
-        let dstLabel = dest.lastPathComponent.isEmpty ? dest.path : dest.lastPathComponent
-        let entry = CutPasteHistoryEntry(count: moved, src: srcLabel, dst: dstLabel, at: Date())
-        history.insert(entry, at: 0)
-        if history.count > 10 { history.removeLast(history.count - 10) }
-
-        cut.removeAll()
-        // red-team: mirror cleared after a paste pass.
-        os_unfair_lock_lock(&pendingLock); pendingCut = false; os_unfair_lock_unlock(&pendingLock)
-        staleTimer?.invalidate()
-        staleTimer = nil
-
-        // Audible + visual feedback (spec point 3).
-        NSSound(named: NSSound.Name("Glass"))?.play()
-        var parts: [String] = []
-        parts.append("Moved \(moved) file\(moved == 1 ? "" : "s")")
-        if failed > 0  {
-            if let e = firstError {
-                parts.append("\(failed) failed (\(e))")
-            } else {
-                parts.append("\(failed) failed")
-            }
-        }
-        if missing > 0 { parts.append("\(missing) missing — skipped") }
-        SharedStore.stage.flash(parts.joined(separator: " · "))
     }
 
     private func uniqueDestination(for filename: String, in folder: URL) -> URL {
@@ -501,30 +557,21 @@ enum CutPasteFinderBridge {
         return URL(fileURLWithPath: text.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
-    /// Runs AppleScript with a 5-second timeout. Returns nil on error or
-    /// timeout, and flips the `appleScriptDenied` flag if the failure looks
-    /// like a permission issue (red-team #2).
-    private static func runAppleScript(_ source: String) -> String? {
+    /// P1: Runs AppleScript synchronously on the CALLING thread (must already
+    /// be a background thread — never call from main). Returns nil on error.
+    /// Callers in CutPasteController.performPaste use Task.detached so this is safe.
+    /// Flips `appleScriptDenied` on permission errors.
+    ///
+    /// NOTE: NSAppleScript.executeAndReturnError is synchronous — the previous
+    /// DispatchGroup.wait pattern blocked a GCD worker while waiting for itself
+    /// (double-dispatch deadlock risk under thread exhaustion). Now we run
+    /// directly on the calling background thread with no wait.
+    static func runAppleScript(_ source: String) -> String? {
         guard let script = NSAppleScript(source: source) else { return nil }
-        let group = DispatchGroup()
-        group.enter()
-        var errInfo: NSDictionary?
-        var result: NSAppleEventDescriptor?
-        DispatchQueue.global(qos: .userInitiated).async {
-            var err: NSDictionary?
-            result = script.executeAndReturnError(&err)
-            errInfo = err
-            group.leave()
-        }
-        if group.wait(timeout: .now() + 5.0) == .timedOut {
-            DispatchQueue.main.async {
-                SharedStore.stage.flash("Finder is unresponsive — AppleScript timed out", kind: .warning)
-            }
-            return nil
-        }
-        if let err = errInfo {
-            let num = (err[NSAppleScript.errorNumber] as? Int) ?? 0
-            // -1743 = permission denied; -600 / -10004 = also permission-shaped.
+        var err: NSDictionary?
+        let result = script.executeAndReturnError(&err)
+        if let errInfo = err {
+            let num = (errInfo[NSAppleScript.errorNumber] as? Int) ?? 0
             if num == -1743 || num == -10004 || num == -600 {
                 DispatchQueue.main.async {
                     CutPasteController.shared.appleScriptDenied = true
@@ -537,7 +584,7 @@ enum CutPasteFinderBridge {
             }
             return nil
         }
-        return result?.stringValue
+        return result.stringValue
     }
 }
 
@@ -646,29 +693,28 @@ public struct CutPasteView: View {
                             .keyboardShortcut(.escape, modifiers: [])
                     }
                     Divider()
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(ctl.cut.prefix(12)) { entry in
-                            HStack(spacing: 8) {
-                                Image(systemName: "doc")
-                                    .foregroundStyle(.secondary)
-                                Text(entry.name)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                                Spacer()
-                                Text(entry.parent)
-                                    .font(.caption)
-                                    .foregroundStyle(.tertiary)
-                                    .lineLimit(1)
-                                    .truncationMode(.head)
+                    // P1: make cut list scrollable (was capped at 12 with a "more" label).
+                    ScrollView(.vertical, showsIndicators: true) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(ctl.cut) { entry in
+                                HStack(spacing: 8) {
+                                    Image(systemName: "doc")
+                                        .foregroundStyle(.secondary)
+                                    Text(entry.name)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    Spacer()
+                                    Text(entry.parent)
+                                        .font(.caption)
+                                        .foregroundStyle(.tertiary)
+                                        .lineLimit(1)
+                                        .truncationMode(.head)
+                                }
+                                .font(.callout)
                             }
-                            .font(.callout)
-                        }
-                        if ctl.cut.count > 12 {
-                            Text("+ \(ctl.cut.count - 12) more…")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
                         }
                     }
+                    .frame(maxHeight: 200)
                 }
             }
         }
@@ -776,12 +822,14 @@ public struct CutPasteView: View {
                     }
                 }
                 if ctl.history.isEmpty {
+                    // P1: empty-state uses .callout text style.
                     Text("No moves yet.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 } else {
                     VStack(alignment: .leading, spacing: 6) {
                         ForEach(ctl.history) { h in
+                            // P1: "Reveal in Finder" per history row via context menu.
                             HStack(spacing: 8) {
                                 Image(systemName: "arrow.right.doc.on.clipboard")
                                     .foregroundStyle(.secondary)
@@ -795,6 +843,27 @@ public struct CutPasteView: View {
                             .font(.callout)
                             .lineLimit(1)
                             .truncationMode(.middle)
+                            .contextMenu {
+                                if !h.dstURLs.isEmpty {
+                                    Button("Reveal in Finder") {
+                                        NSWorkspace.shared.activateFileViewerSelecting(h.dstURLs)
+                                    }
+                                }
+                                // P1: partial undo/rollback — move each dst back to src.
+                                if !h.srcURLs.isEmpty && !h.dstURLs.isEmpty
+                                    && h.srcURLs.count == h.dstURLs.count {
+                                    Button("Undo Move") {
+                                        let pairs = zip(h.dstURLs, h.srcURLs)
+                                        for (dst, src) in pairs {
+                                            let destDir = src.deletingLastPathComponent()
+                                            try? FileManager.default.createDirectory(
+                                                at: destDir, withIntermediateDirectories: true)
+                                            try? FileManager.default.moveItem(at: dst, to: src)
+                                        }
+                                        SharedStore.stage.flash("Rolled back \(h.count) file\(h.count == 1 ? "" : "s")")
+                                    }
+                                }
+                            }
                         }
                     }
                 }

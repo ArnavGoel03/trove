@@ -61,7 +61,13 @@ final class FloatingStageController {
         panel.hidesOnDeactivate = false
         panel.becomesKeyOnlyIfNeeded = true
         panel.isReleasedWhenClosed = false
-        panel.appearance = NSApp.appearance     // honor user's Trove theme
+        // P1: don't freeze the appearance at creation time — set to nil so the
+        // panel inherits the app-level appearance dynamically. When the user
+        // switches Trove's theme the floating panel will follow without needing
+        // to be hidden and reshown.
+        panel.appearance = nil
+        // P1: set a minimum size so the panel can't be collapsed to an unusable sliver.
+        panel.minSize = NSSize(width: 200, height: 160)
 
         let content = NSHostingView(rootView:
             FloatingStageContentView()
@@ -143,16 +149,17 @@ private struct FloatingStageRow: View {
                 }
             }
             Spacer(minLength: 0)
-            if hovering {
-                Button {
-                    stage.remove(item.id)
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 11))
-                        .foregroundStyle(Color.troveFgMute)
-                }
-                .buttonStyle(.plain)
+            // P1: remove button always present in AX tree; visually dim when not hovering.
+            Button {
+                stage.remove(item.id)
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.troveFgMute)
             }
+            .buttonStyle(.plain)
+            .opacity(hovering ? 1 : 0.3)
+            .accessibilityLabel("Remove from Stage")
         }
         .padding(.horizontal, 6).padding(.vertical, 4)
         .background(
@@ -162,6 +169,16 @@ private struct FloatingStageRow: View {
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .onDrag { dragItem() }
+        // P1: context menu with Copy/Remove/Reveal.
+        .contextMenu {
+            Button("Copy") { copyItem() }
+            Button("Remove") { stage.remove(item.id) }
+            if case .file(let url) = item.kind {
+                Button("Reveal in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([url])
+                }
+            }
+        }
     }
 
     private var icon: some View {
@@ -193,12 +210,54 @@ private struct FloatingStageRow: View {
         }
     }
 
+    // P1: dragItem() falls back gracefully when a temp-file URL is dead.
     private func dragItem() -> NSItemProvider {
         switch item.kind {
-        case .file(let url):  return NSItemProvider(object: url as NSURL)
-        case .text(let s):    return NSItemProvider(object: s as NSString)
-        case .image(let url): return NSItemProvider(object: url as NSURL)
+        case .file(let url):
+            if FileManager.default.fileExists(atPath: url.path) {
+                return NSItemProvider(object: url as NSURL)
+            }
+            // Dead file — return empty provider rather than a phantom URL.
+            return NSItemProvider()
+        case .text(let s):
+            return NSItemProvider(object: s as NSString)
+        case .image(let url):
+            // Fast path: file still on disk.
+            if FileManager.default.fileExists(atPath: url.path) {
+                return NSItemProvider(object: url as NSURL)
+            }
+            // Fallback: try loading the NSImage and vend as data.
+            let provider = NSItemProvider()
+            if let img = NSImage(contentsOf: url),
+               let tiff = img.tiffRepresentation,
+               let rep = NSBitmapImageRep(data: tiff),
+               let png = rep.representation(using: .png, properties: [:]) {
+                provider.registerDataRepresentation(
+                    forTypeIdentifier: "public.png",
+                    visibility: .all
+                ) { completion in
+                    completion(png, nil)
+                    return nil
+                }
+            }
+            return provider
         }
+    }
+
+    // P1: Copy item to clipboard.
+    private func copyItem() {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        switch item.kind {
+        case .text(let s):    pb.setString(s, forType: .string)
+        case .file(let url):  pb.writeObjects([url as NSURL])
+        case .image(let url):
+            if let img = NSImage(contentsOf: url) {
+                pb.writeObjects([img])
+            }
+        }
+        NotificationCenter.default.post(name: .troveDidWritePasteboard, object: nil)
+        stage.flash("Copied to clipboard")
     }
 }
 

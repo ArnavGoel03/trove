@@ -289,6 +289,22 @@ final class KeepAwakePowerWatcher: ObservableObject {
 final class KeepAwakeCoordinator: ObservableObject {
     static let shared = KeepAwakeCoordinator()
 
+    // ---- AppStorage keys for persistence ----
+    private static let kMasterOn          = "keepAwake.masterOn"
+    private static let kPreventSystem     = "keepAwake.preventSystemSleep"
+    private static let kShowInMenuBar     = "keepAwake.showInMenuBar"
+    private static let kRuleFrontmostOn   = "keepAwake.ruleFrontmostOn"
+    private static let kRuleFrontmostBID  = "keepAwake.ruleFrontmostBundleID"
+    private static let kRuleFrontmostName = "keepAwake.ruleFrontmostName"
+    private static let kRuleUntilTimeOn   = "keepAwake.ruleUntilTimeOn"
+    private static let kRuleUntilDate     = "keepAwake.ruleUntilDate"
+    private static let kRuleWhilePlug     = "keepAwake.ruleWhilePlug"
+    private static let kRuleBattOn        = "keepAwake.ruleBattOn"
+    private static let kRuleBattThreshold = "keepAwake.ruleBattThreshold"
+    private static let kRuleScheduleOn    = "keepAwake.ruleScheduleOn"
+    private static let kRuleScheduleStart = "keepAwake.ruleScheduleStart"  // minutes since midnight
+    private static let kRuleScheduleEnd   = "keepAwake.ruleScheduleEnd"    // minutes since midnight
+
     // ---- published state ----
     @Published var masterOn: Bool = false
     @Published var preventSystemSleep: Bool = false
@@ -307,6 +323,11 @@ final class KeepAwakeCoordinator: ObservableObject {
     @Published var ruleBatteryAboveOn: Bool = false
     @Published var ruleBatteryThreshold: Double = 30  // 10–95
 
+    // P1: scheduled (HH:MM–HH:MM daily) rule
+    @Published var ruleScheduleOn: Bool = false
+    @Published var ruleScheduleStartMinutes: Int = 9 * 60   // 09:00
+    @Published var ruleScheduleEndMinutes: Int = 17 * 60    // 17:00
+
     // Derived display state.
     @Published var displayName: String = ""
     @Published var displayUptime: String = ""
@@ -315,9 +336,11 @@ final class KeepAwakeCoordinator: ObservableObject {
     private var frontmostObserver: NSObjectProtocol?
     private var willTerminateObserver: NSObjectProtocol?
     private var releaseTimer: DispatchSourceTimer?  // for "until time"
+    private var scheduleTimer: DispatchSourceTimer? // for daily schedule rule
     private var uptimeTimer: DispatchSourceTimer?   // for header label
     private var quickExpireAt: Date? = nil
     private var statusItem: NSStatusItem?
+    private var popover: NSPopover?
 
     private let power = KeepAwakePowerWatcher()
     private var powerCancellable: AnyCancellable?
@@ -328,15 +351,61 @@ final class KeepAwakeCoordinator: ObservableObject {
 
     /// Released when willTerminate fires — release everything cleanly.
     private init() {
+        // Restore persisted state on init.
+        let ud = UserDefaults.standard
+        masterOn            = ud.bool(forKey: Self.kMasterOn)
+        preventSystemSleep  = ud.bool(forKey: Self.kPreventSystem)
+        showInMenuBar       = ud.bool(forKey: Self.kShowInMenuBar)
+        ruleFrontmostOn     = ud.bool(forKey: Self.kRuleFrontmostOn)
+        ruleFrontmostBundleID = ud.string(forKey: Self.kRuleFrontmostBID)
+        ruleFrontmostName   = ud.string(forKey: Self.kRuleFrontmostName) ?? ""
+        ruleUntilTimeOn     = ud.bool(forKey: Self.kRuleUntilTimeOn)
+        if let d = ud.object(forKey: Self.kRuleUntilDate) as? Date { ruleUntilDate = d }
+        ruleWhilePluggedOn  = ud.bool(forKey: Self.kRuleWhilePlug)
+        ruleBatteryAboveOn  = ud.bool(forKey: Self.kRuleBattOn)
+        ruleBatteryThreshold = ud.object(forKey: Self.kRuleBattThreshold) != nil
+            ? ud.double(forKey: Self.kRuleBattThreshold) : 30
+        ruleScheduleOn      = ud.bool(forKey: Self.kRuleScheduleOn)
+        ruleScheduleStartMinutes = ud.object(forKey: Self.kRuleScheduleStart) != nil
+            ? ud.integer(forKey: Self.kRuleScheduleStart) : 9 * 60
+        ruleScheduleEndMinutes   = ud.object(forKey: Self.kRuleScheduleEnd) != nil
+            ? ud.integer(forKey: Self.kRuleScheduleEnd) : 17 * 60
+
         willTerminateObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            // red-team #1: guaranteed release on graceful quit. NSApp.terminate
-            // fires this before exit().
             Task { @MainActor [weak self] in
                 self?.releaseEverything(cause: .appTerminating, silent: true)
             }
         }
+
+        // Restore assertion if masterOn was persisted as true.
+        if masterOn {
+            applyAssertions(reason: assertionReason())
+            refreshObserversForActiveRules()
+            startUptimeTicker()
+            evaluateRulesNow()
+        }
+        if showInMenuBar { syncMenuBar() }
+    }
+
+    // Persist all rule/master state.
+    private func persistAll() {
+        let ud = UserDefaults.standard
+        ud.set(masterOn,            forKey: Self.kMasterOn)
+        ud.set(preventSystemSleep,  forKey: Self.kPreventSystem)
+        ud.set(showInMenuBar,       forKey: Self.kShowInMenuBar)
+        ud.set(ruleFrontmostOn,     forKey: Self.kRuleFrontmostOn)
+        ud.set(ruleFrontmostBundleID, forKey: Self.kRuleFrontmostBID)
+        ud.set(ruleFrontmostName,   forKey: Self.kRuleFrontmostName)
+        ud.set(ruleUntilTimeOn,     forKey: Self.kRuleUntilTimeOn)
+        ud.set(ruleUntilDate,       forKey: Self.kRuleUntilDate)
+        ud.set(ruleWhilePluggedOn,  forKey: Self.kRuleWhilePlug)
+        ud.set(ruleBatteryAboveOn,  forKey: Self.kRuleBattOn)
+        ud.set(ruleBatteryThreshold, forKey: Self.kRuleBattThreshold)
+        ud.set(ruleScheduleOn,      forKey: Self.kRuleScheduleOn)
+        ud.set(ruleScheduleStartMinutes, forKey: Self.kRuleScheduleStart)
+        ud.set(ruleScheduleEndMinutes,   forKey: Self.kRuleScheduleEnd)
     }
 
     // red-team #1b: coordinator is a singleton, so deinit is unreachable in
@@ -351,6 +420,7 @@ final class KeepAwakeCoordinator: ObservableObject {
             NSWorkspace.shared.notificationCenter.removeObserver(tok)
         }
         releaseTimer?.cancel()
+        scheduleTimer?.cancel()
         uptimeTimer?.cancel()
     }
 
@@ -363,6 +433,7 @@ final class KeepAwakeCoordinator: ObservableObject {
 
     func toggleMaster(_ on: Bool) {
         masterOn = on
+        persistAll()
         if on {
             applyAssertions(reason: assertionReason())
             refreshObserversForActiveRules()
@@ -377,6 +448,7 @@ final class KeepAwakeCoordinator: ObservableObject {
 
     func toggleSystemSleep(_ on: Bool) {
         preventSystemSleep = on
+        persistAll()
         if masterOn {
             KeepAwakeAssertion.shared.setSystemSleepBlocked(on)
         }
@@ -385,6 +457,7 @@ final class KeepAwakeCoordinator: ObservableObject {
 
     func toggleMenuBar(_ on: Bool) {
         showInMenuBar = on
+        persistAll()
         syncMenuBar()
     }
 
@@ -415,6 +488,7 @@ final class KeepAwakeCoordinator: ObservableObject {
     /// re-wire, "enable frontmost rule while caffeinated" would never fire.
     func evaluateRulesNow() {
         guard masterOn else { return }
+        persistAll()
         refreshObserversForActiveRules()
         let snap = power.snapshot
 
@@ -427,13 +501,32 @@ final class KeepAwakeCoordinator: ObservableObject {
         if ruleUntilTimeOn && ruleUntilDate <= Date() {
             releaseEverything(cause: quickExpireAt != nil ? .quickExpired : .timeReached); return
         }
+        // Fixed P1 dead branch: if the frontmost-app rule is enabled AND a DIFFERENT
+        // app (not Trove) is currently frontmost, release immediately.
         if ruleFrontmostOn, let want = ruleFrontmostBundleID {
             let frontID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-            if frontID != want && frontID != Bundle.main.bundleIdentifier {
-                // red-team: also treat *Trove* as a transient frontmost so
-                // editing the rule itself doesn't fire the release. Only flip
-                // off when the user moves to a *third* app.
-                // (We deliberately don't release here in that edge case.)
+            // Allow Trove itself as "transient frontmost" (user editing rules),
+            // but release if it's a genuinely different third app.
+            if let frontID = frontID,
+               frontID != want,
+               frontID != Bundle.main.bundleIdentifier {
+                releaseEverything(cause: .appLostFocus); return
+            }
+        }
+        // Scheduled rule: release if outside the configured HH:MM–HH:MM window.
+        if ruleScheduleOn {
+            let cal = Calendar.current
+            let now = Date()
+            let minuteOfDay = cal.component(.hour, from: now) * 60 + cal.component(.minute, from: now)
+            let inWindow: Bool
+            if ruleScheduleStartMinutes <= ruleScheduleEndMinutes {
+                inWindow = minuteOfDay >= ruleScheduleStartMinutes && minuteOfDay < ruleScheduleEndMinutes
+            } else {
+                // Overnight window (e.g. 22:00–06:00)
+                inWindow = minuteOfDay >= ruleScheduleStartMinutes || minuteOfDay < ruleScheduleEndMinutes
+            }
+            if !inWindow {
+                releaseEverything(cause: .timeReached); return
             }
         }
     }
@@ -527,6 +620,21 @@ final class KeepAwakeCoordinator: ObservableObject {
             releaseTimer?.cancel()
             releaseTimer = nil
         }
+
+        // ---- scheduled daily rule timer ----
+        // Re-fire every minute to check if we've left the window.
+        if ruleScheduleOn {
+            if scheduleTimer == nil {
+                let t = DispatchSource.makeTimerSource(queue: .main)
+                t.schedule(deadline: .now() + 60, repeating: .seconds(60))
+                t.setEventHandler { [weak self] in self?.evaluateRulesNow() }
+                scheduleTimer = t
+                t.resume()
+            }
+        } else {
+            scheduleTimer?.cancel()
+            scheduleTimer = nil
+        }
     }
 
     /// red-team #5: DispatchSourceTimer, not Timer.scheduledTimer. The former
@@ -577,8 +685,9 @@ final class KeepAwakeCoordinator: ObservableObject {
             NSWorkspace.shared.notificationCenter.removeObserver(tok)
             frontmostObserver = nil
         }
-        releaseTimer?.cancel(); releaseTimer = nil
-        uptimeTimer?.cancel();  uptimeTimer  = nil
+        releaseTimer?.cancel();  releaseTimer  = nil
+        scheduleTimer?.cancel(); scheduleTimer = nil
+        uptimeTimer?.cancel();   uptimeTimer   = nil
         // Balance our outstanding power.start() with a matching stop() so
         // the watcher's internal subscriber count doesn't drift. The View's
         // onAppear keeps it running for the live status chips independently.
@@ -649,7 +758,28 @@ final class KeepAwakeCoordinator: ObservableObject {
     }
 
     @objc private func menuBarClicked(_ sender: Any?) {
-        toggleMaster(!masterOn)
+        // Ensure we're on main actor — NSStatusBarButton callbacks can fire
+        // on a background thread in rare edge cases.
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in self?.menuBarClicked(sender) }
+            return
+        }
+        // Show NSPopover mini-status panel instead of silently toggling.
+        if let btn = statusItem?.button {
+            if popover == nil {
+                let p = NSPopover()
+                p.contentSize = NSSize(width: 260, height: 130)
+                p.behavior = .transient
+                let vc = NSHostingController(rootView: KeepAwakeMenuBarPopover(coord: self))
+                p.contentViewController = vc
+                self.popover = p
+            }
+            if popover?.isShown == true {
+                popover?.performClose(nil)
+            } else {
+                popover?.show(relativeTo: btn.bounds, of: btn, preferredEdge: .minY)
+            }
+        }
     }
 }
 
@@ -674,6 +804,56 @@ enum KeepAwakeFormat {
         if h > 0 { return String(format: "%dh %02dm %02ds", h, m, s) }
         if m > 0 { return String(format: "%dm %02ds", m, s) }
         return "\(s)s"
+    }
+}
+
+// ===========================================================================
+// MARK: - Menu-bar popover mini-status panel
+// ===========================================================================
+
+/// Shows current assertion state + quick toggle in the NSPopover attached to
+/// the menu-bar status item. Avoids the confusing "click → silent toggle"
+/// pattern; users see what's happening before committing.
+fileprivate struct KeepAwakeMenuBarPopover: View {
+    @ObservedObject var coord: KeepAwakeCoordinator
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Image(systemName: coord.masterOn ? "sun.max.fill" : "moon.fill")
+                    .foregroundStyle(coord.masterOn ? .yellow : .secondary)
+                Text("Keep Awake").headerText()
+                Spacer()
+                Text(coord.masterOn ? "On" : "Off")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(coord.masterOn ? .green : .secondary)
+            }
+            if coord.masterOn {
+                Text(coord.displayName.isEmpty ? "Indefinite" : coord.displayName)
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                if !coord.displayUptime.isEmpty {
+                    Text("Up \(coord.displayUptime)")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Divider()
+            HStack(spacing: 8) {
+                Button(coord.masterOn ? "Turn Off" : "Turn On") {
+                    coord.toggleMaster(!coord.masterOn)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                if coord.masterOn {
+                    Button("Open Trove") {
+                        NSApp.activate(ignoringOtherApps: true)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+        }
+        .padding(14)
     }
 }
 
@@ -894,7 +1074,53 @@ public struct KeepAwakeView: View {
                     ), in: 10...95, step: 5)
                     .frame(maxWidth: 220)
                 }
+
+                // 5) Scheduled daily window (HH:MM – HH:MM)
+                ruleRow(
+                    on: Binding(
+                        get: { coord.ruleScheduleOn },
+                        set: { coord.ruleScheduleOn = $0; coord.evaluateRulesNow() }),
+                    icon: "calendar.clock",
+                    title: "Scheduled daily window",
+                    detail: "Stay awake only between the two times below, every day."
+                ) {
+                    HStack(spacing: 6) {
+                        minutesPicker(minutes: Binding(
+                            get: { coord.ruleScheduleStartMinutes },
+                            set: { coord.ruleScheduleStartMinutes = $0; coord.evaluateRulesNow() }
+                        ))
+                        Text("→").foregroundStyle(.secondary)
+                        minutesPicker(minutes: Binding(
+                            get: { coord.ruleScheduleEndMinutes },
+                            set: { coord.ruleScheduleEndMinutes = $0; coord.evaluateRulesNow() }
+                        ))
+                    }
+                }
             }
+        }
+    }
+
+    @ViewBuilder
+    private func minutesPicker(minutes: Binding<Int>) -> some View {
+        // Picker for HH:MM expressed as minutes-since-midnight (0–1439).
+        let hours = Binding(
+            get: { minutes.wrappedValue / 60 },
+            set: { minutes.wrappedValue = $0 * 60 + minutes.wrappedValue % 60 }
+        )
+        let mins = Binding(
+            get: { minutes.wrappedValue % 60 },
+            set: { minutes.wrappedValue = (minutes.wrappedValue / 60) * 60 + $0 }
+        )
+        HStack(spacing: 2) {
+            Picker("", selection: hours) {
+                ForEach(0..<24, id: \.self) { h in Text(String(format: "%02d", h)).tag(h) }
+            }
+            .labelsHidden().frame(width: 52)
+            Text(":").foregroundStyle(.secondary)
+            Picker("", selection: mins) {
+                ForEach([0, 15, 30, 45], id: \.self) { m in Text(String(format: "%02d", m)).tag(m) }
+            }
+            .labelsHidden().frame(width: 52)
         }
     }
 

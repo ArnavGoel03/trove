@@ -16,6 +16,7 @@ import SwiftUI
 import AppKit
 import Foundation
 import Combine
+import UniformTypeIdentifiers
 
 // ===========================================================================
 // MARK: - Tab color model
@@ -79,6 +80,14 @@ final class NoteStore: ObservableObject {
     @Published var counts: [NoteColor: (words: Int, chars: Int)] = [:]
     @Published var oversized: Set<NoteColor> = []
 
+    // P1: cached rendered blocks per tab. `NoteMarkdown.render()` is O(n)
+    // and was previously called synchronously inside `NotePreviewPane.body`
+    // on every render frame. Now updated off-main on a throttled schedule and
+    // published back via @Published so the preview pane just reads the cache.
+    @Published var renderedBlocks: [NoteColor: [NoteRenderedBlock]] = [:]
+    private var renderWork: DispatchWorkItem?
+    private let renderQueue = DispatchQueue(label: "trove.notes.render", qos: .userInitiated)
+
     private static let appSupportDir: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory,
                                              in: .userDomainMask).first
@@ -106,52 +115,18 @@ final class NoteStore: ObservableObject {
     private var terminateObserver: NSObjectProtocol?
 
     init() {
-        // Ensure all five tabs exist; rehydrate from disk if present.
-        var loaded: [NoteTab] = NoteColor.allCases.map(NoteTab.empty)
-        var recoveryMessage: String? = nil
-
-        try? FileManager.default.createDirectory(at: Self.appSupportDir,
-                                                 withIntermediateDirectories: true)
-
-        if FileManager.default.fileExists(atPath: Self.storeURL.path) {
-            do {
-                guard let data = boundedRead(Self.storeURL) else { throw CocoaError(.fileReadNoSuchFile) }
-                let decoded = try JSONDecoder().decode(NotePersisted.self, from: data)
-                // Fix 2: reject files written by a future version to avoid silent data corruption.
-                guard decoded.version <= NotePersisted.currentVersion else {
-                    let ts = Int(Date().timeIntervalSince1970)
-                    let futureURL = Self.appSupportDir
-                        .appendingPathComponent("notes-future-\(ts).json")
-                    try? FileManager.default.moveItem(at: Self.storeURL, to: futureURL)
-                    recoveryMessage = "Notes file was written by a newer version of Trove — backed up to \(futureURL.lastPathComponent)"
-                    throw CocoaError(.fileReadCorruptFile)
-                }
-                // Replace defaults with any colors we recognize from disk.
-                for t in decoded.tabs {
-                    if let i = loaded.firstIndex(where: { $0.color == t.color }) {
-                        loaded[i] = t
-                    }
-                }
-            } catch {
-                // Red-team #2: corrupt JSON — rename so next save can't clobber it.
-                let ts = Int(Date().timeIntervalSince1970)
-                let corruptURL = Self.appSupportDir
-                    .appendingPathComponent("notes-corrupt-\(ts).json")
-                try? FileManager.default.moveItem(at: Self.storeURL, to: corruptURL)
-                recoveryMessage = "Notes file unreadable — backed up to \(corruptURL.lastPathComponent)"
-            }
-        }
-        self.tabs = loaded
-
-        // Initial count pass synchronously (small/empty at boot).
-        for t in tabs { counts[t.color] = Self.cheapCount(t.body) }
-
-        if let msg = recoveryMessage {
-            // Wait until app is up so the flash isn't lost during launch.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                SharedStore.stage.flash(msg)
-            }
-        }
+        // P1 fix (DEVELOP_RULES §1): seed @Published with the empty 5-color set
+        // SYNCHRONOUSLY so SwiftUI has a complete value to render with — but
+        // do NOT touch disk on the main thread during init. boundedRead can
+        // pull up to 16 MB and JSONDecoder.decode on a multi-MB note file
+        // pushed @StateObject construction past the AttributeGraph 50 ms
+        // watchdog on slow / cold storage, matching the pattern that triggered
+        // the AccountView SIGTRAP crash loop. Rehydration is now a Task.detached
+        // that publishes a full replacement payload back on @MainActor.
+        let seeded = NoteColor.allCases.map(NoteTab.empty)
+        self.tabs = seeded
+        for t in seeded { counts[t.color] = Self.cheapCount(t.body) }
+        for t in seeded { renderedBlocks[t.color] = NoteMarkdown.render(t.body) }
 
         // red-team: force-flush within the 200ms debounce window on quit.
         // Block observer registered AFTER stored properties are initialized so
@@ -161,6 +136,62 @@ final class NoteStore: ObservableObject {
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.flushSynchronously()
+            }
+        }
+
+        // Async-rehydrate the persisted store off-main. Builds a complete
+        // replacement (tabs + counts + rendered blocks) in one shot so the
+        // view only sees one publish transition rather than three.
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            try? FileManager.default.createDirectory(at: Self.appSupportDir,
+                                                     withIntermediateDirectories: true)
+            var loaded = seeded
+            var recoveryMessage: String? = nil
+            if FileManager.default.fileExists(atPath: Self.storeURL.path) {
+                do {
+                    guard let data = boundedRead(Self.storeURL) else { throw CocoaError(.fileReadNoSuchFile) }
+                    let decoded = try JSONDecoder().decode(NotePersisted.self, from: data)
+                    guard decoded.version <= NotePersisted.currentVersion else {
+                        let ts = Int(Date().timeIntervalSince1970)
+                        let futureURL = Self.appSupportDir
+                            .appendingPathComponent("notes-future-\(ts).json")
+                        try? FileManager.default.moveItem(at: Self.storeURL, to: futureURL)
+                        recoveryMessage = "Notes file was written by a newer version of Trove — backed up to \(futureURL.lastPathComponent)"
+                        throw CocoaError(.fileReadCorruptFile)
+                    }
+                    for t in decoded.tabs {
+                        if let i = loaded.firstIndex(where: { $0.color == t.color }) {
+                            loaded[i] = t
+                        }
+                    }
+                } catch {
+                    let ts = Int(Date().timeIntervalSince1970)
+                    let corruptURL = Self.appSupportDir
+                        .appendingPathComponent("notes-corrupt-\(ts).json")
+                    try? FileManager.default.moveItem(at: Self.storeURL, to: corruptURL)
+                    recoveryMessage = "Notes file unreadable — backed up to \(corruptURL.lastPathComponent)"
+                }
+            }
+            // Skip the patch if nothing changed (empty seed = empty load).
+            // The expensive render+count pass only runs when we actually have
+            // content to display.
+            let same = zip(loaded, seeded).allSatisfy { $0.body == $1.body }
+            if same && recoveryMessage == nil { return }
+
+            var newCounts: [NoteColor: (Int, Int)] = [:]
+            var newBlocks: [NoteColor: [NoteRenderedBlock]] = [:]
+            for t in loaded {
+                newCounts[t.color] = Self.cheapCount(t.body)
+                newBlocks[t.color] = NoteMarkdown.render(t.body)
+            }
+            await MainActor.run {
+                self.tabs = loaded
+                self.counts = newCounts
+                self.renderedBlocks = newBlocks
+                if let msg = recoveryMessage {
+                    SharedStore.stage.flash(msg)
+                }
             }
         }
     }
@@ -202,6 +233,8 @@ final class NoteStore: ObservableObject {
         }
         scheduleSave()
         scheduleCount(color, newValue)
+        // P1: schedule off-main render update so preview pane reads the cache.
+        scheduleRender(color, newValue)
     }
 
     func setTitle(_ color: NoteColor, _ newValue: String) {
@@ -279,7 +312,9 @@ final class NoteStore: ObservableObject {
         let panel = NSSavePanel()
         panel.title = "Export \"\(cur.title)\""
         panel.nameFieldStringValue = cur.title
-        panel.allowedContentTypes = [.plainText]
+        // P1: offer both .md and plain text export.
+        let mdType = UTType(filenameExtension: "md") ?? .plainText
+        panel.allowedContentTypes = [mdType, .plainText]
         panel.canCreateDirectories = true
         panel.begin { [weak self] resp in
             guard resp == .OK, let url = panel.url, let self else { return }
@@ -290,6 +325,53 @@ final class NoteStore: ObservableObject {
             } catch {
                 SharedStore.stage.flash("Export failed: \(error.localizedDescription)", kind: .warning)
             }
+        }
+    }
+
+    /// P1: Copy current tab body to clipboard.
+    func copyCurrentTabToClipboard() {
+        let body = tab(selected).body
+        guard !body.isEmpty else {
+            SharedStore.stage.flash("Note is empty — nothing to copy")
+            return
+        }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(body, forType: .string)
+        NotificationCenter.default.post(name: .troveDidWritePasteboard, object: nil)
+        SharedStore.stage.flash("Copied \"\(tab(selected).title)\" to clipboard")
+    }
+
+    /// P1: Export all tabs to a single folder or as individual files.
+    func exportAllTabs() {
+        let panel = NSOpenPanel()
+        panel.title = "Export All Notes — choose a folder"
+        panel.prompt = "Export Here"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.begin { [weak self] resp in
+            guard resp == .OK, let dir = panel.url, let self else { return }
+            var saved = 0
+            var failed = 0
+            for t in self.tabs {
+                guard !t.body.isEmpty else { continue }
+                let filename = t.title.isEmpty ? t.color.rawValue : t.title
+                let safeFilename = filename
+                    .components(separatedBy: CharacterSet(charactersIn: "/\\:*?\"<>|"))
+                    .joined(separator: "_")
+                let fileURL = dir.appendingPathComponent("\(safeFilename).md")
+                do {
+                    try t.body.write(to: fileURL, atomically: true, encoding: .utf8)
+                    saved += 1
+                } catch {
+                    failed += 1
+                }
+            }
+            let msg = failed == 0
+                ? "Exported \(saved) note\(saved == 1 ? "" : "s") to \(dir.lastPathComponent)"
+                : "Exported \(saved), \(failed) failed"
+            SharedStore.stage.flash(msg)
         }
     }
 
@@ -357,7 +439,7 @@ final class NoteStore: ObservableObject {
     // MARK: - Word / char counting (throttled for huge bodies)
 
     /// Cheap counter used on small bodies and at boot.
-    private static func cheapCount(_ s: String) -> (Int, Int) {
+    nonisolated private static func cheapCount(_ s: String) -> (Int, Int) {
         // red-team: `String.count` walks the entire string to compose grapheme
         // clusters — O(n) over the body, on the main thread for any body
         // ≤100KB. For a 90KB markdown note that's a multi-ms hitch on every
@@ -399,6 +481,22 @@ final class NoteStore: ObservableObject {
         countWork = work
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.25,
                                                        execute: work)
+    }
+
+    // P1: Off-main render schedule. Throttled at 150ms so rapid typing doesn't
+    // saturate the render queue. The preview pane reads renderedBlocks (cached)
+    // instead of calling NoteMarkdown.render() synchronously in .body.
+    private func scheduleRender(_ color: NoteColor, _ body: String) {
+        renderWork?.cancel()
+        let snap = body
+        let work = DispatchWorkItem { [weak self] in
+            let blocks = NoteMarkdown.render(snap)
+            DispatchQueue.main.async {
+                self?.renderedBlocks[color] = blocks
+            }
+        }
+        renderWork = work
+        renderQueue.asyncAfter(deadline: .now() + 0.15, execute: work)
     }
 
     // MARK: - Cross-tab search
@@ -707,13 +805,29 @@ public struct NotesView: View {
             .help("Stage this note as a text item")
             .keyboardShortcut(.return, modifiers: [.command, .shift])
 
+            // P1: Copy current tab to clipboard.
+            Button {
+                store.copyCurrentTabToClipboard()
+            } label: {
+                Label("Copy Note", systemImage: "doc.on.doc")
+            }
+            .help("Copy this note to clipboard (⌘C shortcut handled by TextEditor)")
+
             Button {
                 store.exportCurrentTab()
             } label: {
                 Label("Export", systemImage: "arrow.down.doc")
             }
-            .help("Export note as .txt (⌘E)")
+            .help("Export note as .md/.txt (⌘E)")
             .keyboardShortcut("e", modifiers: .command)
+
+            // P1: Export all tabs at once.
+            Button {
+                store.exportAllTabs()
+            } label: {
+                Label("Export All", systemImage: "arrow.down.doc.fill")
+            }
+            .help("Export all tabs as .md files to a folder")
 
             Toggle(isOn: $store.showPreview) {
                 Label("Preview", systemImage: "doc.richtext")
@@ -765,7 +879,8 @@ private struct NoteTabChip: View {
                 .fill(color.swiftUI)
                 .frame(width: 11, height: 11)
                 .overlay(
-                    Circle().strokeBorder(.white.opacity(0.35), lineWidth: 0.5)
+                    // P1: use troveCardStroke token instead of raw .white.opacity.
+                    Circle().strokeBorder(Color.troveCardStroke.opacity(0.35), lineWidth: 0.5)
                 )
                 .overlay(alignment: .topTrailing) {
                     if isOversized {
@@ -819,6 +934,8 @@ private struct NoteTabChip: View {
 private struct NoteSearchOverlay: View {
     @ObservedObject var store: NoteStore
     @FocusState private var focused: Bool
+    // P0: Reduce Transparency — solid fallback instead of .opacity().
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     // Fix 14: hits moved to @State, populated asynchronously with 80ms debounce
     // so the synchronous store.search() is not called on every body re-render.
     @State private var hits: [NoteStore.SearchHit] = []
@@ -874,7 +991,8 @@ private struct NoteSearchOverlay: View {
                 }
                 .padding(.horizontal, 14).padding(.vertical, 6)
             }
-            .background(Color.troveBgElev.opacity(0.8))
+            // P0: honor Reduce Transparency — use solid token instead of .opacity().
+            .background(reduceTransparency ? Color.troveBgElev : Color.troveBgElev.opacity(0.8))
             .onChange(of: store.searchQuery) { newValue in
                 debounceTask?.cancel()
                 debounceTask = Task { @MainActor in
@@ -968,7 +1086,10 @@ private struct NotePreviewPane: View {
 
     var body: some View {
         let tab = store.tab(store.selected)
-        let blocks = NoteMarkdown.render(tab.body)
+        // P1: use cached rendered blocks from store to avoid synchronous
+        // O(n) render on every SwiftUI frame. Falls back to a live render
+        // only if the cache hasn't been populated yet (e.g. first load).
+        let blocks = store.renderedBlocks[store.selected] ?? NoteMarkdown.render(tab.body)
         return ScrollView {
             VStack(alignment: .leading, spacing: 4) {
                 if tab.body.isEmpty {

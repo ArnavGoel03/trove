@@ -610,32 +610,63 @@ final class WinSnapModel: ObservableObject {
     @Published var suggestion: WinSnapSuggestion? = nil
     @Published var openWindows: [WinSnapWindowHandle] = []
     @Published var selection: Set<UUID> = []
+    /// True while an AX enumeration is running off-main (prevents re-entry).
+    @Published var isRefreshing: Bool = false
+
+    // Persist last-used tile and layout selection across sessions.
+    @AppStorage("winsnapLastTileID") var lastTileID: String = ""
+    @AppStorage("winsnapLastLayoutCount") var lastLayoutCount: Int = 0
+
     private var statusClear: DispatchWorkItem?
 
     /// Recompute "what's the frontmost app + its smart suggestion".
+    /// AX enumeration runs off-main; result published on @MainActor.
     func refreshFrontmost() {
         trusted = WinSnapAX.isTrusted()
-        if let (_, bid) = WinSnapAX.frontmostExternalApp() {
-            frontmostBundleID = bid
-            if let bid = bid,
-               let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bid }) {
-                frontmostName = app.localizedName ?? bid
-            } else {
-                frontmostName = bid ?? "—"
+        // Resolve app name off-main (NSWorkspace.runningApplications is fine but
+        // the AX queries block — keep main unblocked for smooth UI).
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let trusted = WinSnapAX.isTrusted()
+            var name: String = "—"
+            var bid: String? = nil
+            var sugg: WinSnapSuggestion? = nil
+            if let (_, b) = WinSnapAX.frontmostExternalApp() {
+                bid = b
+                if let b = b,
+                   let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == b }) {
+                    // Resolve human name from running app (never the raw bundle ID alone).
+                    name = app.localizedName ?? b
+                } else if let b = b {
+                    // Bundle ID but no running app found — use the ID as a last resort.
+                    name = b
+                }
+                sugg = WinSnapSmart.suggestion(forBundleID: b)
             }
-            suggestion = WinSnapSmart.suggestion(forBundleID: bid)
-        } else {
-            frontmostBundleID = nil
-            frontmostName = "—"
-            suggestion = nil
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.trusted = trusted
+                self.frontmostBundleID = bid
+                self.frontmostName = name
+                self.suggestion = sugg
+            }
         }
     }
 
+    /// Enumerate open windows off-main; publish back on @MainActor.
     func refreshOpenWindows() {
-        openWindows = WinSnapWindowList.enumerate()
-        // Drop selections that no longer correspond to a real window.
-        let live = Set(openWindows.map(\.id))
-        selection = selection.intersection(live)
+        guard !isRefreshing else { return }  // reentry guard
+        isRefreshing = true
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let wins = WinSnapWindowList.enumerate()
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.openWindows = wins
+                // Drop selections that no longer correspond to a real window.
+                let live = Set(wins.map(\.id))
+                self.selection = self.selection.intersection(live)
+                self.isRefreshing = false
+            }
+        }
     }
 
     func flash(_ s: String) {
@@ -646,10 +677,8 @@ final class WinSnapModel: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: w)
     }
 
-    func apply(_ f: WinSnapFraction) {
-        // red-team: animation is now async (cooperative sleep), so kick it off
-        // in a Task and update status when it completes. Snapping the picks
-        // up the live window from the AX query at call time.
+    func apply(_ f: WinSnapFraction, tileID: String = "") {
+        if !tileID.isEmpty { lastTileID = tileID }
         Task { @MainActor in
             let msg = await WinSnapEngine.applyToFrontmost(f)
             flash(msg)
@@ -720,6 +749,7 @@ final class WinSnapModel: ObservableObject {
             flash("Layout supports up to 4 windows; got \(picks.count).")
             return
         }
+        lastLayoutCount = picks.count
         Task { @MainActor in
             var lines: [String] = []
             for (i, h) in picks.enumerated() {
@@ -787,7 +817,7 @@ public struct WinSnapView: View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
                 Label("Accessibility access needed", systemImage: "lock.shield")
-                    .font(.headline)
+                    .headerText()
                 Text("To move and resize other apps' windows, macOS requires Trove to have Accessibility permission. We never read keystrokes — only move/resize the focused window when you ask.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -825,7 +855,7 @@ public struct WinSnapView: View {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     Label("Smart layout for frontmost app", systemImage: "sparkles.rectangle.stack")
-                        .font(.headline)
+                        .headerText()
                     Spacer()
                 }
                 HStack(spacing: 10) {
@@ -868,7 +898,7 @@ public struct WinSnapView: View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text("Tile palette").font(.headline)
+                    Text("Tile palette").headerText()
                     Spacer()
                     Text("⌘⌃← halves · ⌘⌃⇧1-5 thirds")
                         .font(.caption.monospaced()).foregroundStyle(.secondary)
@@ -877,7 +907,7 @@ public struct WinSnapView: View {
                           spacing: 10) {
                     ForEach(WinSnapPalette.tiles) { tile in
                         Button {
-                            m.apply(tile.fraction)
+                            m.apply(tile.fraction, tileID: tile.id)
                         } label: {
                             tileFace(tile)
                         }
@@ -885,7 +915,32 @@ public struct WinSnapView: View {
                         .disabled(!m.trusted)
                         .onHover { hoveredTile = $0 ? tile.id : (hoveredTile == tile.id ? nil : hoveredTile) }
                         .help(tile.label)
+                        .accessibilityLabel("\(tile.label) snap\(tile.shortcut != nil ? ", keyboard shortcut available" : "")")
                     }
+                }
+                // Snap-zone ghost overlay preview — shows a semi-transparent
+                // overlay on the notional screen area while the user hovers a tile.
+                if let hid = hoveredTile,
+                   let tile = WinSnapPalette.tiles.first(where: { $0.id == hid }) {
+                    GeometryReader { geo in
+                        let f = tile.fraction
+                        Color.troveAccent.opacity(0.18)
+                            .frame(
+                                width: geo.size.width * f.w,
+                                height: geo.size.height * f.h
+                            )
+                            .offset(x: geo.size.width * f.x,
+                                    y: geo.size.height * f.y)
+                    }
+                    .frame(height: 44)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .strokeBorder(Color.troveAccent.opacity(0.5), lineWidth: 1.5)
+                    )
+                    .padding(.top, 6)
+                    .animation(.easeOut(duration: 0.1), value: hoveredTile)
+                    .accessibilityHidden(true)
                 }
             }
         }
@@ -893,15 +948,19 @@ public struct WinSnapView: View {
 
     private func tileFace(_ tile: WinSnapTile) -> some View {
         let hover = hoveredTile == tile.id
+        let isLast = m.lastTileID == tile.id
         return VStack(spacing: 6) {
             ZStack {
-                RoundedRectangle(cornerRadius: 6).strokeBorder(.separator, lineWidth: 1)
+                // Use troveLine token for the border (matches card stroke convention).
+                RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(isLast ? Color.troveAccent.opacity(0.7) : Color.troveLine, lineWidth: isLast ? 1.5 : 1)
                     .frame(height: 44)
                 // Visual representation of the fraction inside the tile.
                 GeometryReader { g in
                     let f = tile.fraction
                     Rectangle()
-                        .fill(hover ? Color.accentColor.opacity(0.65) : Color.accentColor.opacity(0.32))
+                        // Use troveAccent token at varying opacity for fill.
+                        .fill(hover ? Color.troveAccent.opacity(0.65) : Color.troveAccent.opacity(0.32))
                         .frame(width: g.size.width * f.w, height: g.size.height * f.h)
                         .offset(x: g.size.width * f.x, y: g.size.height * f.y)
                 }
@@ -910,11 +969,13 @@ public struct WinSnapView: View {
             }
             Text(tile.label)
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                // Use troveFgDim / troveFgMute tokens.
+                .foregroundStyle(hover ? Color.troveFg : Color.troveFgDim)
                 .lineLimit(1)
         }
         .padding(6)
-        .background((hover ? Color.secondary.opacity(0.18) : Color.secondary.opacity(0.10)), in: RoundedRectangle(cornerRadius: 8))
+        // Use troveCardFill / troveCardSolid tokens instead of raw secondary.opacity.
+        .background(hover ? Color.troveCardSolid : Color.troveCardFill, in: RoundedRectangle(cornerRadius: 8))
     }
 
     // ---------- Multi-window layout composer ----------
@@ -924,7 +985,7 @@ public struct WinSnapView: View {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     Label("Multi-window Layout", systemImage: "square.grid.2x2")
-                        .font(.headline)
+                        .headerText()
                     Spacer()
                     Button {
                         m.refreshOpenWindows()
@@ -946,7 +1007,7 @@ public struct WinSnapView: View {
                                 .font(.system(size: 36, weight: .light))
                                 .foregroundStyle(.orange)
                             Text("Accessibility permission required")
-                                .font(.headline)
+                                .headerText()
                             Text("Trove uses the Accessibility API to move and resize other apps' windows. macOS won't let it enumerate or move anything until you grant access in System Settings.")
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
@@ -969,7 +1030,7 @@ public struct WinSnapView: View {
                                 .font(.system(size: 36, weight: .light))
                                 .foregroundStyle(.tertiary)
                             Text("No moveable windows found")
-                                .font(.headline)
+                                .headerText()
                             Text("Trove couldn't enumerate windows from any visible app. Open something with a regular window (Safari, Notes, a Finder window) and rescan.")
                                 .font(.callout)
                                 .foregroundStyle(.secondary)

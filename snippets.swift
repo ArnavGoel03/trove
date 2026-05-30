@@ -17,6 +17,7 @@
 import SwiftUI
 import AppKit
 import Foundation
+import UniformTypeIdentifiers
 
 // ===========================================================================
 // MARK: - Model
@@ -160,7 +161,10 @@ final class SnippetStore: ObservableObject {
             case .alphabetical:
                 return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
             case .recentlyUsed:
-                return a.useCount > b.useCount
+                // P1: sort by recency (lastUsedAt), not frequency (useCount).
+                let aDate = a.lastUsedAt ?? a.createdAt
+                let bDate = b.lastUsedAt ?? b.createdAt
+                return aDate > bDate
             case .recentlyCreated:
                 return a.createdAt > b.createdAt
             }
@@ -190,7 +194,31 @@ final class SnippetStore: ObservableObject {
                 .appendingPathComponent("Trove", isDirectory: true)
                 .appendingPathComponent("snippets.json")
         }
-        load()
+        // P1 fix (DEVELOP_RULES §1): previously `load()` ran synchronously here —
+        // boundedRead (16 MB cap) + JSONDecoder.decode of the snippet library
+        // pushed @StateObject init past the AttributeGraph 50 ms watchdog on
+        // slow / cold storage. Library briefly renders empty, then populates.
+        // The nonisolated worker returns the parsed payload; the @Published
+        // mutation is dispatched back to MainActor.
+        let loadURL = self.fileURL
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let outcome = Self.loadFromDiskOffMain(url: loadURL)
+            await MainActor.run {
+                guard let self else { return }
+                switch outcome {
+                case .ok(let list):
+                    self.snippets = list
+                case .empty:
+                    self.snippets = []
+                case .corrupt(let msg):
+                    self.snippets = []
+                    self.lastErrorMessage = msg
+                case .noFile:
+                    self.snippets = []
+                }
+                self.pendingSave?.cancel()
+            }
+        }
         // Fix 5: force-flush on quit within the 200ms debounce window.
         let url = self.fileURL
         let queue = self.ioQueue
@@ -299,6 +327,42 @@ final class SnippetStore: ObservableObject {
 
     // MARK: persistence
 
+    /// Result of the off-main load attempt. The caller patches `snippets`
+    /// (and optionally `lastErrorMessage`) on MainActor based on which case
+    /// is returned.
+    enum SnippetLoadOutcome {
+        case ok([Snippet])
+        case empty
+        case corrupt(String)   // user-facing error message
+        case noFile
+    }
+
+    /// Off-main loader, used by `init()` to keep the @StateObject default
+    /// expression cheap. Same read/decode logic as `load()`; differs only in
+    /// that it returns the outcome instead of mutating @Published state, and
+    /// performs the corrupt-file rename inline so the next save doesn't append
+    /// to garbage.
+    nonisolated static func loadFromDiskOffMain(url: URL) -> SnippetLoadOutcome {
+        do {
+            guard let data = boundedRead(url) else { return .noFile }
+            guard !data.isEmpty else { return .empty }
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let decoded = try decoder.decode([Snippet].self, from: data)
+            return .ok(decoded)
+        } catch let e as NSError where e.domain == NSCocoaErrorDomain
+                                  && e.code == NSFileReadNoSuchFileError {
+            return .noFile
+        } catch {
+            // Best-effort: rename the bad file out of the way so the next save
+            // doesn't accidentally append to garbage.
+            let bak = url.deletingPathExtension()
+                .appendingPathExtension("corrupt-\(Int(Date().timeIntervalSince1970)).json")
+            try? FileManager.default.moveItem(at: url, to: bak)
+            return .corrupt("Couldn't read snippets.json — starting empty.")
+        }
+    }
+
     func load() {
         let url = self.fileURL
         // Run synchronously on init to avoid a flash-of-empty-list, but defensive
@@ -404,6 +468,12 @@ struct SnippetsView: View {
     @State private var editorTarget: SnippetEditorTarget? = nil
     @State private var deleteCandidate: Snippet? = nil
     @State private var pendingSnippetBody: String? = nil
+    // P1: multi-select + batch ops
+    @State private var selection: Set<UUID> = []
+    // P1: delete undo tombstone
+    @State private var undoStack: [(Snippet, Int)] = []  // (deleted snippet, original index)
+    // P1: JSON import
+    @State private var isImporting = false
 
     var body: some View {
         Group {
@@ -419,6 +489,41 @@ struct SnippetsView: View {
         .navigationSubtitle(subtitle)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                // P1: batch send to Stage when items are selected.
+                if !selection.isEmpty {
+                    Button {
+                        batchSendToStage()
+                    } label: {
+                        Label("Send \(selection.count) to Stage", systemImage: "tray.and.arrow.down")
+                    }
+                    .help("Send all selected snippets to Stage")
+
+                    Button(role: .destructive) {
+                        batchDelete()
+                    } label: {
+                        Label("Delete \(selection.count)", systemImage: "trash")
+                    }
+                    .help("Delete selected snippets")
+                }
+
+                // P1: undo last delete
+                if !undoStack.isEmpty {
+                    Button {
+                        undoLastDelete()
+                    } label: {
+                        Label("Undo Delete", systemImage: "arrow.uturn.backward")
+                    }
+                    .help("Undo last deletion")
+                }
+
+                Menu {
+                    Button("Import from JSON…") { isImporting = true }
+                    Button("Export Library to JSON…") { triggerExport() }
+                } label: {
+                    Label("More", systemImage: "ellipsis.circle")
+                }
+                .help("Import/Export snippet library")
+
                 Picker("Sort", selection: $store.sortMode) {
                     ForEach(SortMode.allCases, id: \.self) { mode in
                         Text(mode.rawValue).tag(mode)
@@ -452,13 +557,21 @@ struct SnippetsView: View {
             presenting: deleteCandidate
         ) { snip in
             Button("Delete", role: .destructive) {
-                store.delete(snip.id)
-                stage.flash("Deleted \(snip.name)")
+                deleteWithUndo(snip)
                 deleteCandidate = nil
             }
             Button("Cancel", role: .cancel) { deleteCandidate = nil }
         } message: { snip in
             Text("\"\(snip.name)\" will be removed from your snippet library.")
+        }
+        // P1: JSON import via file importer.
+        .fileImporter(
+            isPresented: $isImporting,
+            allowedContentTypes: [.json],
+            allowsMultipleSelection: false
+        ) { result in
+            guard let url = (try? result.get())?.first else { return }
+            importJSON(from: url)
         }
         .onAppear {
             if let msg = store.lastErrorMessage {
@@ -515,8 +628,10 @@ struct SnippetsView: View {
                     ForEach(rows) { snip in
                         SnippetRow(
                             snippet: snip,
+                            isSelected: selection.contains(snip.id),
                             onCopy: { copy(snip) },
                             onTogglePin: { store.togglePin(snip.id) },
+                            onToggleSelect: { toggleSelect(snip.id) },
                             onTagFilter: { store.search = "tag:\($0)" }
                         )
                         .contextMenu {
@@ -549,11 +664,56 @@ struct SnippetsView: View {
                                 }
                             }
                         }
+                        // P1: drag-out via NSItemProvider.
+                        .onDrag {
+                            NSItemProvider(object: snip.body as NSString)
+                        }
                     }
                 }
                 .padding(18)
             }
         }
+    }
+
+    private func toggleSelect(_ id: UUID) {
+        if selection.contains(id) { selection.remove(id) } else { selection.insert(id) }
+    }
+
+    private func batchSendToStage() {
+        let targets = store.snippets.filter { selection.contains($0.id) }
+        for snip in targets {
+            stage.addText(snip.body)
+            store.recordUse(snip.id)
+        }
+        stage.flash("Sent \(targets.count) snippet\(targets.count == 1 ? "" : "s") to Stage")
+        selection.removeAll()
+    }
+
+    private func batchDelete() {
+        let ids = selection
+        let targets = store.snippets.enumerated().filter { ids.contains($0.element.id) }
+        // Store tombstones for undo (keep at most 10).
+        let tombstones = targets.map { ($0.element, $0.offset) }
+        undoStack = Array((tombstones + undoStack).prefix(10))
+        for t in targets {
+            store.delete(t.element.id)
+        }
+        stage.flash("Deleted \(targets.count) snippet\(targets.count == 1 ? "" : "s")")
+        selection.removeAll()
+    }
+
+    private func deleteWithUndo(_ snip: Snippet) {
+        let idx = store.snippets.firstIndex(where: { $0.id == snip.id }) ?? 0
+        undoStack = Array([(snip, idx)] + undoStack.prefix(9))
+        store.delete(snip.id)
+        stage.flash("Deleted \(snip.name)")
+    }
+
+    private func undoLastDelete() {
+        guard let (snip, _) = undoStack.first else { return }
+        undoStack.removeFirst()
+        store.add(snip)
+        stage.flash("Restored \(snip.name)")
     }
 
     private func copy(_ snip: Snippet) {
@@ -568,6 +728,54 @@ struct SnippetsView: View {
         store.recordUse(snip.id)
         stage.flash("Copied \(snip.name)")
     }
+
+    // P1: JSON export — encode all snippets and save via NSSavePanel.
+    private func triggerExport() {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        enc.dateEncodingStrategy = .iso8601
+        guard let data = try? enc.encode(store.snippets) else {
+            stage.flash("Export encoding failed")
+            return
+        }
+        let panel = NSSavePanel()
+        panel.title = "Export Snippets"
+        panel.nameFieldStringValue = "trove-snippets.json"
+        panel.allowedContentTypes = [.json]
+        panel.begin { resp in
+            guard resp == .OK, let url = panel.url else { return }
+            do {
+                try data.write(to: url, options: .atomic)
+                stage.flash("Snippets exported to \(url.lastPathComponent)")
+            } catch {
+                stage.flash("Export failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    // P1: JSON import — merge incoming snippets by name dedup.
+    private func importJSON(from url: URL) {
+        guard let data = boundedRead(url), !data.isEmpty else {
+            stage.flash("Import: couldn't read file")
+            return
+        }
+        let dec = JSONDecoder()
+        dec.dateDecodingStrategy = .iso8601
+        guard let incoming = try? dec.decode([Snippet].self, from: data) else {
+            stage.flash("Import: file is not a valid Trove snippets JSON")
+            return
+        }
+        var added = 0
+        let existingNames = Set(store.snippets.map { $0.name.lowercased() })
+        for snip in incoming {
+            if existingNames.contains(snip.name.lowercased()) { continue }
+            let fresh = Snippet(name: snip.name, body: snip.body, tags: snip.tags,
+                                pinned: snip.pinned)
+            store.add(fresh)
+            added += 1
+        }
+        stage.flash("Imported \(added) snippet\(added == 1 ? "" : "s") (\(incoming.count - added) skipped as duplicates)")
+    }
 }
 
 // ===========================================================================
@@ -576,8 +784,10 @@ struct SnippetsView: View {
 
 private struct SnippetRow: View {
     let snippet: Snippet
+    let isSelected: Bool          // P1: multi-select state passed in
     let onCopy: () -> Void
     let onTogglePin: () -> Void
+    let onToggleSelect: () -> Void // P1: selection toggle callback
     let onTagFilter: (String) -> Void
     @State private var hover = false
 
@@ -591,6 +801,15 @@ private struct SnippetRow: View {
     var body: some View {
         Card {
             HStack(alignment: .top, spacing: 12) {
+                // P1: multi-select checkbox.
+                Button(action: onToggleSelect) {
+                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 14))
+                        .foregroundStyle(isSelected ? Color.troveAccent : Color.troveFgMute)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(isSelected ? "Deselect snippet" : "Select snippet")
+
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 8) {
                         Text(snippet.name)
@@ -631,17 +850,23 @@ private struct SnippetRow: View {
                         .truncationMode(.tail)
                 }
                 Spacer(minLength: 8)
+                // P1: accessibilityLabel on pin button.
                 Button(action: onTogglePin) {
                     Image(systemName: snippet.pinned ? "pin.fill" : "pin")
                         .foregroundStyle(snippet.pinned ? Color.accentColor : .secondary)
                 }
                 .buttonStyle(.borderless)
                 .help(snippet.pinned ? "Unpin" : "Pin to top")
+                .accessibilityLabel(snippet.pinned ? "Unpin \(snippet.name)" : "Pin \(snippet.name) to top")
             }
         }
         .overlay(
             RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(hover ? Color.accentColor.opacity(0.45) : .clear, lineWidth: 1)
+                .strokeBorder(
+                    isSelected ? Color.troveAccent.opacity(0.6) :
+                    (hover ? Color.accentColor.opacity(0.45) : .clear),
+                    lineWidth: isSelected ? 1.5 : 1
+                )
         )
         .contentShape(Rectangle())
         .onHover { hover = $0 }
@@ -660,7 +885,7 @@ private struct SnippetsEmpty: View {
             Image(systemName: "doc.text.below.ecg")
                 .font(.system(size: 60, weight: .light))
                 .foregroundStyle(.tertiary)
-            Text("No snippets yet").font(.title2.weight(.medium))
+            Text("No snippets yet").headerText()
             Text("Save email signatures, prompt scaffolds, and boilerplate once. Click any saved snippet to copy it instantly, or send it to Stage.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -910,3 +1135,5 @@ private struct SnippetEditorSheet: View {
         onClose()
     }
 }
+
+

@@ -941,20 +941,26 @@ final class DiskSpeedViewModel: ObservableObject {
         panel.nameFieldStringValue = "disk-speed-\(Self.fileStamp()).csv"
         panel.canCreateDirectories = true
         panel.message = "Export Disk Speed results"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        // red-team-sec: NSSavePanel returns a user-validated URL. Defense in
-        // depth: refuse non-file URLs (the user typing a URL into the path
-        // field, or a future bug surfacing a `nil`-ish placeholder URL) so
-        // we never feed a network/iCloud-only placeholder to Data.write
-        // and end up surfacing a confusing "failed to write" error.
-        guard url.isFileURL else { return }
-        let csv = Self.buildCSV(results)
-        do {
-            try csv.write(to: url, atomically: true, encoding: .utf8)
-            NSWorkspace.shared.activateFileViewerSelecting([url])
-            stage.flash("Exported \(results.count) result\(results.count == 1 ? "" : "s")")
-        } catch {
-            stage.flash("Export failed: \(error.localizedDescription)")
+        // Use panel.begin (async sheet) instead of panel.runModal() which
+        // blocks the run loop and freezes all live timers while the sheet is open.
+        let snapshot = results   // capture before the async callback
+        panel.begin { [weak self] resp in
+            guard resp == .OK, let url = panel.url else { return }
+            // red-team-sec: NSSavePanel returns a user-validated URL. Defense in
+            // depth: refuse non-file URLs (the user typing a URL into the path
+            // field, or a future bug surfacing a `nil`-ish placeholder URL) so
+            // we never feed a network/iCloud-only placeholder to Data.write
+            // and end up surfacing a confusing "failed to write" error.
+            guard url.isFileURL else { return }
+            let csv = Self.buildCSV(snapshot)
+            do {
+                try csv.write(to: url, atomically: true, encoding: .utf8)
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+                stage.flash("Exported \(snapshot.count) result\(snapshot.count == 1 ? "" : "s")")
+            } catch {
+                stage.flash("Export failed: \(error.localizedDescription)")
+            }
+            _ = self  // keep vm alive for the callback
         }
     }
 
@@ -1002,6 +1008,7 @@ final class DiskSpeedViewModel: ObservableObject {
     private static func fileStamp() -> String {
         let f = DateFormatter()
         f.dateFormat = "yyyyMMdd-HHmmss"
+        f.locale = Locale(identifier: "en_US_POSIX")
         return f.string(from: Date())
     }
 }
@@ -1096,7 +1103,7 @@ public struct DiskSpeedView: View {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 8) {
                     Image(systemName: "internaldrive").foregroundStyle(.secondary)
-                    Text("Volume").font(.headline)
+                    Text("Volume").headerText()
                     Spacer()
                     Text("\(vm.volumes.count) mounted")
                         .font(.caption).foregroundStyle(.tertiary)
@@ -1164,7 +1171,7 @@ public struct DiskSpeedView: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
                     Image(systemName: "list.bullet.rectangle").foregroundStyle(.secondary)
-                    Text("Queue").font(.headline)
+                    Text("Queue").headerText()
                     Spacer()
                     if !vm.queue.isEmpty {
                         Button("Clear", role: .destructive) { vm.queue.removeAll() }
@@ -1208,7 +1215,7 @@ public struct DiskSpeedView: View {
                                                  : "bolt.horizontal.circle.fill")
                         .foregroundStyle(vm.running ? AnyShapeStyle(.tint)
                                                     : AnyShapeStyle(.secondary))
-                    Text(vm.running ? "Running" : "Ready").font(.headline)
+                    Text(vm.running ? "Running" : "Ready").headerText()
                     Spacer()
                     Text(vm.liveMessage)
                         .font(.caption).foregroundStyle(.secondary)
@@ -1247,7 +1254,7 @@ public struct DiskSpeedView: View {
                     .font(.system(size: 36, weight: .light))
                     .foregroundStyle(.tertiary)
                 Text("No benchmark yet")
-                    .font(.headline)
+                    .headerText()
                 Text("Disk Speed measures sequential and random read/write throughput plus 4 KiB IOPS on the volume above. Each run uses F_NOCACHE to bypass the page cache and reports the median of \(DiskSpeedRepeats) passes.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -1273,7 +1280,7 @@ public struct DiskSpeedView: View {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Issue").font(.headline)
+                    Text("Issue").headerText()
                     Text(msg).font(.callout).foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -1288,50 +1295,82 @@ public struct DiskSpeedView: View {
 
     private var resultsCard: some View {
         Card {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 8) {
-                    Image(systemName: "tablecells").foregroundStyle(.secondary)
-                    Text("Results").font(.headline)
-                    Spacer()
-                    Text("\(vm.results.count) run\(vm.results.count == 1 ? "" : "s")")
-                        .font(.caption).foregroundStyle(.tertiary)
-                }
-                // Header row
-                HStack(spacing: 0) {
-                    DiskSpeedColHeader("Volume", width: 200, align: .leading)
-                    DiskSpeedColHeader("Size",   width: 70)
-                    DiskSpeedColHeader("Seq W",  width: 80)
-                    DiskSpeedColHeader("Seq R",  width: 80)
-                    DiskSpeedColHeader("Rnd W",  width: 80)
-                    DiskSpeedColHeader("Rnd R",  width: 80)
-                    DiskSpeedColHeader("W IOPS", width: 80)
-                    DiskSpeedColHeader("R IOPS", width: 80)
-                    Spacer(minLength: 0)
-                }
-                Divider()
-                ForEach(vm.results) { r in
-                    HStack(spacing: 0) {
-                        DiskSpeedCell(text: r.volumeName.isEmpty ? r.volumePath : r.volumeName,
-                                      width: 200, align: .leading)
-                        DiskSpeedCell(text: diskSpeedFormatMiB(r.blobMiB), width: 70)
-                        DiskSpeedCell(text: String(format: "%.0f", r.seqWrite), width: 80)
-                        DiskSpeedCell(text: String(format: "%.0f", r.seqRead),  width: 80)
-                        DiskSpeedCell(text: String(format: "%.0f", r.randWrite),width: 80)
-                        DiskSpeedCell(text: String(format: "%.0f", r.randRead), width: 80)
-                        DiskSpeedCell(text: String(format: "%.0f", r.randWriteIOPS), width: 80)
-                        DiskSpeedCell(text: String(format: "%.0f", r.randReadIOPS),  width: 80)
-                        Spacer(minLength: 0)
+            // A single GeometryReader at the card level drives the flex Volume
+            // column width for both the header and data rows.
+            GeometryReader { geo in
+                let availW = max(geo.size.width, 400)
+                // Volume column gets whatever space is left after the 7 fixed columns.
+                let volW = max(availW - 6 * 80.0 - 70.0 - 8, 100)
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "tablecells").foregroundStyle(.secondary)
+                        Text("Results").headerText()
+                        Spacer()
+                        Text("\(vm.results.count) run\(vm.results.count == 1 ? "" : "s")")
+                            .font(.caption).foregroundStyle(.tertiary)
                     }
+                    DiskSpeedHeaderRow(volW: volW)
+                    Divider()
+                    // ScrollView + LazyVStack so a long result list is scrollable
+                    // and doesn't overflow the card when the sidebar is narrow.
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            ForEach(vm.results) { r in
+                                DiskSpeedResultRow(result: r, volW: volW)
+                                Divider().opacity(0.4)
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 320)
+                    Text("All numbers are median MiB/s across \(DiskSpeedRepeats) passes. " +
+                         "IOPS are 4 KiB random ops.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
-                Text("All numbers are median MiB/s across \(DiskSpeedRepeats) passes. " +
-                     "IOPS are 4 KiB random ops.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
+            .frame(minHeight: 160)  // give the GeometryReader a natural height
         }
     }
 }
 
 // ----- small subviews / formatters -------------------------------------------
+
+/// Flexible header row — `volW` is the computed width for the Volume column;
+/// the remaining 7 columns are fixed at their natural widths.
+private struct DiskSpeedHeaderRow: View {
+    let volW: CGFloat
+    var body: some View {
+        HStack(spacing: 0) {
+            DiskSpeedColHeader("Volume", width: volW, align: .leading)
+            DiskSpeedColHeader("Size",   width: 70)
+            DiskSpeedColHeader("Seq W",  width: 80)
+            DiskSpeedColHeader("Seq R",  width: 80)
+            DiskSpeedColHeader("Rnd W",  width: 80)
+            DiskSpeedColHeader("Rnd R",  width: 80)
+            DiskSpeedColHeader("W IOPS", width: 80)
+            DiskSpeedColHeader("R IOPS", width: 80)
+        }
+    }
+}
+
+/// Flexible data row matching DiskSpeedHeaderRow's column widths.
+private struct DiskSpeedResultRow: View {
+    let result: DiskSpeedResult
+    let volW: CGFloat
+    var body: some View {
+        HStack(spacing: 0) {
+            DiskSpeedCell(text: result.volumeName.isEmpty ? result.volumePath : result.volumeName,
+                          width: volW, align: .leading)
+            DiskSpeedCell(text: diskSpeedFormatMiB(result.blobMiB), width: 70)
+            DiskSpeedCell(text: String(format: "%.0f", result.seqWrite),      width: 80)
+            DiskSpeedCell(text: String(format: "%.0f", result.seqRead),       width: 80)
+            DiskSpeedCell(text: String(format: "%.0f", result.randWrite),     width: 80)
+            DiskSpeedCell(text: String(format: "%.0f", result.randRead),      width: 80)
+            DiskSpeedCell(text: String(format: "%.0f", result.randWriteIOPS), width: 80)
+            DiskSpeedCell(text: String(format: "%.0f", result.randReadIOPS),  width: 80)
+        }
+        .padding(.vertical, 2)
+    }
+}
 
 private struct DiskSpeedColHeader: View {
     let title: String

@@ -124,6 +124,24 @@ struct TroveCustomTheme: Codable, Equatable {
     var bgHexA: String = "#0F0F11"        // gradient top
     var bgHexB: String = "#0A0A0C"        // gradient bottom
 
+    enum CodingKeys: String, CodingKey { case isLight, accentHex, bgHexA, bgHexB }
+
+    init(isLight: Bool, accentHex: String, bgHexA: String, bgHexB: String) {
+        self.isLight = isLight; self.accentHex = accentHex
+        self.bgHexA = bgHexA; self.bgHexB = bgHexB
+    }
+
+    /// P1 fix: tolerant decoder. Stored as a JSON Data blob in UserDefaults under
+    /// `trove.theme.custom.v1`. Adding a future field (e.g. `lineHex`) would
+    /// otherwise silently reset the user's custom theme to dark on upgrade.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.isLight   = (try? c.decodeIfPresent(Bool.self,   forKey: .isLight))   ?? false
+        self.accentHex = (try? c.decodeIfPresent(String.self, forKey: .accentHex)) ?? "#F08227"
+        self.bgHexA    = (try? c.decodeIfPresent(String.self, forKey: .bgHexA))    ?? "#0F0F11"
+        self.bgHexB    = (try? c.decodeIfPresent(String.self, forKey: .bgHexB))    ?? "#0A0A0C"
+    }
+
     static let dark = TroveCustomTheme(
         isLight: false,
         accentHex: "#F08227",

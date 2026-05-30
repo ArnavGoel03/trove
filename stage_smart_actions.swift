@@ -264,6 +264,11 @@ struct StageSmartAction: Identifiable {
 public struct StageSmartActionsBar: View {
     let items: [StagedItem]
 
+    // P1: cache reduceMotion via @Environment instead of querying NSWorkspace on every render.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    // P1: Reduce Transparency guard.
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
     // red-team: `StagedItem` is an internal type in main.swift, so this
     // initializer can't be marked `public`. Module-internal access is all
     // we need — `StageView` lives in the same module.
@@ -272,7 +277,41 @@ public struct StageSmartActionsBar: View {
     }
 
     public var body: some View {
-        let actions = Self.actions(for: items)
+        smartActionsContent
+    }
+
+    @ViewBuilder
+    private var smartActionsContent: some View {
+        // P1: show a brief informational label instead of silently showing EmptyView
+        // when the bag is too large for Smart Actions to classify.
+        if items.count > 200 {
+            HStack(spacing: 6) {
+                Image(systemName: "info.circle")
+                    .font(.caption)
+                    .foregroundStyle(Color.troveFgMute)
+                Text("Too many items for Smart Actions (\(items.count) of 200 max)")
+                    .font(.caption)
+                    .foregroundStyle(Color.troveFgDim)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+        } else {
+            SmartActionsBar(
+                actions: Self.actions(for: items),
+                reduceMotion: reduceMotion,
+                reduceTransparency: reduceTransparency
+            )
+        }
+    }
+}
+
+// Private helper view so @ViewBuilder doesn't need `let` inside a branch.
+private struct SmartActionsBar: View {
+    let actions: [StageSmartAction]
+    let reduceMotion: Bool
+    let reduceTransparency: Bool
+
+    var body: some View {
         if actions.isEmpty {
             EmptyView()
         } else {
@@ -285,23 +324,9 @@ public struct StageSmartActionsBar: View {
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
                 Divider().frame(height: 16)
-                // red-team: action bar can host up to 4 pills and titles like
-                // "Combine into a PDF" are wide. On a narrow window the
-                // ForEach was pushing pills off-screen because we lived
-                // inside a non-scrollable HStack. Wrap in a horizontal
-                // ScrollView so they remain reachable; hide indicators since
-                // the bag is small (<=4 buttons).
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         ForEach(actions) { a in
-                            // red-team: drop AnyButtonStyle (nested-Button
-                            // wrapper that re-triggers `configuration.trigger`
-                            // from inside its own `makeBody`) — branch on
-                            // `primary` here so SwiftUI picks the concrete
-                            // ButtonStyle type at compile time. The previous
-                            // wrapper hit a double-fire on macOS 14 trackpad
-                            // taps because the inner Button observed the
-                            // outer Button's gesture as a tap too.
                             if a.primary {
                                 Button(action: a.perform) {
                                     Label(a.title, systemImage: a.icon)
@@ -325,15 +350,17 @@ public struct StageSmartActionsBar: View {
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
-            .background(Color.troveBgElev.opacity(0.8),
-                        in: RoundedRectangle(cornerRadius: 10))
+            // P1: Reduce-Transparency guard — solid token fallback.
+            .background(
+                reduceTransparency ? Color.troveBgElev : Color.troveBgElev.opacity(0.8),
+                in: RoundedRectangle(cornerRadius: 10)
+            )
             .overlay(
                 RoundedRectangle(cornerRadius: 10)
                     .strokeBorder(.separator.opacity(0.5), lineWidth: 0.5)
             )
-            // red-team #4: honor Reduce Motion — skip the slide if the user
-            // has the OS-level setting enabled.
-            .transition(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            // P1: use cached @Environment reduceMotion instead of NSWorkspace per-render.
+            .transition(reduceMotion
                         ? .identity
                         : .move(edge: .top).combined(with: .opacity))
             .accessibilityElement(children: .contain)
@@ -341,10 +368,13 @@ public struct StageSmartActionsBar: View {
         }
     }
 
-    // -------------------------------------------------------------------
-    // Rule table — pure function of items.
-    // -------------------------------------------------------------------
+} // end SmartActionsBar
 
+// ===========================================================================
+// MARK: - Rule table (pure function — testable without SwiftUI runtime)
+// ===========================================================================
+
+extension StageSmartActionsBar {
     /// Build the action set for the current bag.
     /// Exposed as `static` so tests can call it without a SwiftUI runtime.
     static func actions(for items: [StagedItem]) -> [StageSmartAction] {

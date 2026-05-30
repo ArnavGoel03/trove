@@ -32,6 +32,11 @@ import Foundation
 import UniformTypeIdentifiers
 import CoreGraphics  // for CGPreflightScreenCaptureAccess (Screen Recording TCC probe)
 
+// P1: tiny helper used when reading Int defaults that default to 0 on missing key.
+private extension Int {
+    var nonZero: Int? { self == 0 ? nil : self }
+}
+
 // ===========================================================================
 // MARK: - Models
 // ===========================================================================
@@ -185,11 +190,19 @@ enum SnipFileDestination {
 /// SwiftUI state.
 @MainActor
 final class SnipEngine: ObservableObject {
-    // User-tunable settings. SnipView binds to these.
-    @Published var mode: SnipMode = .region
-    @Published var delay: SnipDelay = .none
-    @Published var customSeconds: Int = 5
-    @Published var destination: SnipDestination = .stage
+    // User-tunable settings. SnipView binds to these; didSet persists to UserDefaults.
+    @Published var mode: SnipMode = .region {
+        didSet { UserDefaults.standard.set(mode.rawValue, forKey: "snip.mode") }
+    }
+    @Published var delay: SnipDelay = .none {
+        didSet { UserDefaults.standard.set(delay.id, forKey: "snip.delay") }
+    }
+    @Published var customSeconds: Int = 5 {
+        didSet { UserDefaults.standard.set(customSeconds, forKey: "snip.customSeconds") }
+    }
+    @Published var destination: SnipDestination = .stage {
+        didSet { UserDefaults.standard.set(destination.rawValue, forKey: "snip.destination") }
+    }
 
     // Countdown / live-fire state.
     @Published private(set) var countdownRemaining: Int = 0
@@ -211,6 +224,15 @@ final class SnipEngine: ObservableObject {
     let tempDir: URL
 
     init() {
+        // P1: restore persisted settings from UserDefaults (synchronous read at init).
+        mode         = SnipMode(rawValue: UserDefaults.standard.string(forKey: "snip.mode") ?? "") ?? .region
+        delay        = {
+            let id = UserDefaults.standard.string(forKey: "snip.delay") ?? "none"
+            return SnipDelay.allCases.first { $0.id == id } ?? .none
+        }()
+        customSeconds = max(1, min(60, UserDefaults.standard.integer(forKey: "snip.customSeconds").nonZero ?? 5))
+        destination  = SnipDestination(rawValue: UserDefaults.standard.string(forKey: "snip.destination") ?? "") ?? .stage
+
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("trove-snip-\(UUID().uuidString.prefix(8))",
                                     isDirectory: true)
@@ -308,9 +330,14 @@ final class SnipEngine: ObservableObject {
         }
 
         var destURL = recent.url
-        // If the target is temp (not in Pictures/Trove), write in-place.
-        // If it's in a permanent folder, write a sibling with "-annotated" suffix.
-        let isPerm = recent.url.path.contains("/Trove/")
+        // P1: replace fragile path.contains("/Trove/") with a resolved-path
+        // prefix check against the actual permanent folder URL. Avoids false
+        // positives when the tmp dir or a user's home directory happens to
+        // include "Trove" as a path component.
+        let (permFolder, _) = SnipFileDestination.resolveFolder()
+        let resolvedRecent  = recent.url.resolvingSymlinksInPath().path
+        let resolvedPerm    = permFolder.resolvingSymlinksInPath().path
+        let isPerm = resolvedRecent.hasPrefix(resolvedPerm)
         if isPerm {
             let stem = recent.url.deletingPathExtension().lastPathComponent
             let folder = recent.url.deletingLastPathComponent()
@@ -456,12 +483,23 @@ final class SnipEngine: ObservableObject {
     }
 
     /// Fan the captured PNG out to one or more destinations.
+    /// P1: NSImage(contentsOf:) decode moved off-main via Task.detached — a
+    /// 4K full-screen capture can be 8–20 MB; decoding synchronously on main
+    /// was blocking the run loop noticeably on slower machines.
     private func routeCapturedFile(at workURL: URL, mode: SnipMode, destination: SnipDestination) {
-        guard let img = NSImage(contentsOf: workURL) else {
-            SharedStore.stage.flash("Couldn't read the captured image — try again.")
-            return
+        Task { @MainActor in
+            let img: NSImage? = await Task.detached(priority: .userInitiated) {
+                NSImage(contentsOf: workURL)
+            }.value
+            guard let img = img else {
+                SharedStore.stage.flash("Couldn't read the captured image — try again.")
+                return
+            }
+            self.routeCapturedImage(img, workURL: workURL, mode: mode, destination: destination)
         }
+    }
 
+    private func routeCapturedImage(_ img: NSImage, workURL: URL, mode: SnipMode, destination: SnipDestination) {
         var didStage = false
         var didClip  = false
         var savedURL: URL? = nil
@@ -623,7 +661,7 @@ private struct SnipModeCard: View {
         Card {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Capture mode")
-                    .font(.headline)
+                    .headerText()
                 Picker("", selection: $engine.mode) {
                     ForEach(SnipMode.allCases) { mode in
                         Label(mode.label, systemImage: mode.symbol).tag(mode)
@@ -657,7 +695,7 @@ private struct SnipDelayCard: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Text("Delay")
-                        .font(.headline)
+                        .headerText()
                     Spacer()
                     Text("Windows Snipping Tool tops out at 10s — we go to 60s.")
                         .font(.caption)
@@ -700,7 +738,7 @@ private struct SnipDestinationCard: View {
         Card {
             VStack(alignment: .leading, spacing: 8) {
                 Text("After capture")
-                    .font(.headline)
+                    .headerText()
                 Picker("", selection: $engine.destination) {
                     ForEach(SnipDestination.allCases) { d in
                         Label(d.label, systemImage: d.symbol).tag(d)
@@ -847,7 +885,7 @@ private struct SnipRecentsCard: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Text("Recent snips")
-                        .font(.headline)
+                        .headerText()
                     Spacer()
                     if engine.recents.count > 1 {
                         Button {
@@ -936,25 +974,36 @@ private struct AsyncAnnotationLoader<Content: View>: View {
     }
 }
 
+// P1: bounded NSCache for SnipRecent thumbnails — keyed by URL path.
+// OCREngine.fastThumbnail is fast but still does CGImageSource work on
+// every body evaluation if called synchronously. Cache eliminates the
+// repeat I/O for the same URL.
+private let snipThumbCache: NSCache<NSString, NSImage> = {
+    let c = NSCache<NSString, NSImage>()
+    c.countLimit = 20    // 5 recents × up to 4 history windows = headroom
+    return c
+}()
+
 private struct SnipRecentThumb: View {
     let recent: SnipRecent
     var isPrimary: Bool = false
     var onAnnotate: (() -> Void)? = nil
     let onSelect: () -> Void
     @State private var hover = false
+    // P1: async-loaded thumbnail so body never does synchronous I/O.
+    @State private var thumb: NSImage? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Button(action: onSelect) {
                 Group {
-                    if let img = OCREngine.fastThumbnail(url: recent.url, maxPixel: 256) {
+                    if let img = thumb {
                         Image(nsImage: img)
                             .resizable()
                             .interpolation(.medium)
                             .scaledToFill()
                     } else {
-                        // The on-disk file may have been pruned from /tmp.
-                        // Show a placeholder so the strip doesn't crash.
+                        // Placeholder while async load is in flight or file missing.
                         Image(systemName: "photo")
                             .font(.system(size: 22))
                             .foregroundStyle(.secondary)
@@ -970,6 +1019,23 @@ private struct SnipRecentThumb: View {
                                             : Color.secondary.opacity(0.35),
                                       lineWidth: hover ? 1.2 : 0.5)
                 )
+            }
+            // P1: load thumbnail asynchronously; cache-first to avoid
+            // repeated CGImageSource work on every body evaluation.
+            .task(id: recent.url) {
+                let key = recent.url.path as NSString
+                if let cached = snipThumbCache.object(forKey: key) {
+                    thumb = cached
+                    return
+                }
+                let url = recent.url
+                let loaded = await Task.detached(priority: .utility) {
+                    OCREngine.fastThumbnail(url: url, maxPixel: 256)
+                }.value
+                if let img = loaded {
+                    snipThumbCache.setObject(img, forKey: key)
+                    thumb = img
+                }
             }
             .buttonStyle(.plain)
             .onHover { hover = $0 }

@@ -16,6 +16,7 @@
 import AppKit
 import Foundation
 import ImageIO
+import SwiftUI
 import UniformTypeIdentifiers
 
 @MainActor
@@ -30,8 +31,19 @@ final class AutoCompress: ObservableObject {
     nonisolated static let maxInputBytes: Int64 = 200_000_000
 
     /// Compression quality (0.0...1.0). 0.78 is the visually-lossless sweet
-    /// spot for HEIC/WebP at typical screenshot sizes.
-    nonisolated static let quality: Double = 0.78
+    /// spot for HEIC/WebP at typical screenshot sizes — the default. Users
+    /// who archive photos can push toward 0.95; users who only ever share
+    /// screenshots on the web can drop to 0.55 for ~half-size output.
+    nonisolated static let defaultQuality: Double = 0.78
+    nonisolated static let qualityKey = "trove.stage.autoCompress.quality"
+    /// Live-read of the persisted quality, clamped to [0.5, 0.98] so a hand-
+    /// edited UserDefaults value can't produce a useless 0.0 (which encodes
+    /// pure noise) or 1.0 (which defeats the purpose).
+    nonisolated static var quality: Double {
+        let raw = UserDefaults.standard.object(forKey: qualityKey) as? Double
+            ?? defaultQuality
+        return min(0.98, max(0.50, raw))
+    }
 
     /// Persistence key — user can disable via Settings toggle (default ON).
     nonisolated static let prefKey = "trove.stage.autoCompress"
@@ -68,6 +80,15 @@ final class AutoCompress: ObservableObject {
         guard Self.isEnabled() else { return }
         guard Self.shouldConsider(url) else { return }
 
+        // P1 fix: skip symlinks / non-regular files. Every other ImageIO call site
+        // in the codebase (color, image_tools, pdf) gates on isSymbolicLinkKey +
+        // isRegularFileKey before handing the URL to CGImageSourceCreateWithURL —
+        // this was the last unguarded entry point. A symlink to /dev/urandom would
+        // cause CGImageSourceCreateWithURL to read forever (no EOF).
+        let resourceVals = try? url.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey])
+        if resourceVals?.isSymbolicLink == true { return }
+        if resourceVals?.isRegularFile != true { return }
+
         let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
         let originalBytes = (attrs?[.size] as? Int64) ?? 0
         guard originalBytes >= Self.thresholdBytes,
@@ -92,17 +113,53 @@ final class AutoCompress: ObservableObject {
         // names so collisions are rare; still skip cleanly.
         if FileManager.default.fileExists(atPath: dest.path) { return }
 
+        // P0 FIX: probe pixel dimensions BEFORE decoding to cap raster scale
+        // and avoid OOM on pathologically large inputs (e.g. 500 MB PNG).
+        // Cap at 8192 px on the long side — well above screen resolution;
+        // beyond that the compressed output is no smaller anyway.
+        let maxPixelSide = 8192
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
-              CGImageSourceGetCount(src) > 0,
-              let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return }
+              CGImageSourceGetCount(src) > 0 else { return }
+        var pixelW = 0, pixelH = 0
+        if let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] {
+            pixelW = (props[kCGImagePropertyPixelWidth] as? Int) ?? 0
+            pixelH = (props[kCGImagePropertyPixelHeight] as? Int) ?? 0
+        }
+        // If we can't probe dims, bail — safer than a silent OOM.
+        guard pixelW > 0, pixelH > 0 else { return }
+        let longSide = max(pixelW, pixelH)
+        // Use thumbnail decode to cap memory: if the image fits under the cap,
+        // CGImageSourceCreateThumbnailAtIndex returns full-res from the cache.
+        let decodeSize = min(longSide, maxPixelSide)
+        let thumbOpts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: decodeSize,
+            kCGImageSourceShouldCacheImmediately: false,
+        ]
+        guard let img = CGImageSourceCreateThumbnailAtIndex(src, 0, thumbOpts as CFDictionary) else { return }
 
-        guard let out = CGImageDestinationCreateWithURL(dest as CFURL, targetUTI, 1, nil) else { return }
+        // P0 FIX: atomic write — encode to a .tmp sibling, then moveItem into
+        // place. The previous code wrote directly to `dest`; a crash mid-encode
+        // left a partial file, and the fileExists guard above then permanently
+        // blocked future passes on that URL.
+        let tmp = dest.deletingPathExtension()
+            .appendingPathExtension("tmp-\(UUID().uuidString.prefix(8))")
+            .appendingPathExtension(suffix)
+        guard let out = CGImageDestinationCreateWithURL(tmp as CFURL, targetUTI, 1, nil) else { return }
         let props: CFDictionary = [
             kCGImageDestinationLossyCompressionQuality: Self.quality
         ] as CFDictionary
         CGImageDestinationAddImage(out, img, props)
         guard CGImageDestinationFinalize(out) else {
-            try? FileManager.default.removeItem(at: dest)
+            try? FileManager.default.removeItem(at: tmp)
+            return
+        }
+        // Move tmp → dest atomically.
+        do {
+            try FileManager.default.moveItem(at: tmp, to: dest)
+        } catch {
+            try? FileManager.default.removeItem(at: tmp)
             return
         }
 
@@ -178,10 +235,49 @@ final class AutoCompress: ObservableObject {
     }
 }
 
-// TODO: wire from Stage.addFile(url:) and Stage.addImage(url:) in main.swift
-// by appending a single line at the end of each:
-//
-//     Task.detached { await AutoCompress.shared.maybeCompress(at: url) }
-//
-// Add a toggle in Settings → Stage section:
-//     Toggle("Auto-compress oversized images", isOn: $autoCompress.enabled)
+// NOTE: AutoCompress is wired live from Stage.addFile/addImage/captureScreenshot
+// in main.swift (Task.detached { await AutoCompress.shared.maybeCompress(at: url) }),
+// and the Settings toggle is in main.swift's Stage card.
+
+// ---------------------------------------------------------------------------
+// MARK: - Quality slider
+// ---------------------------------------------------------------------------
+// A user-tunable quality knob bound to the same UserDefaults key that
+// `AutoCompress.quality` reads non-isolated, so changes apply on the next
+// compress without any reactive plumbing. Range [0.50, 0.98]: below 0.5 the
+// perceptual quality collapses; above 0.98 there's no real shrink benefit.
+struct AutoCompressQualitySlider: View {
+    @AppStorage(AutoCompress.qualityKey) private var quality: Double = AutoCompress.defaultQuality
+    private let minQ: Double = 0.50
+    private let maxQ: Double = 0.98
+
+    private var pct: Int { Int((quality * 100).rounded()) }
+    private var label: String {
+        switch quality {
+        case ..<0.65: return "Aggressive (smaller files)"
+        case ..<0.82: return "Balanced (default)"
+        default:      return "Conservative (larger files)"
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Text("Quality")
+                    .font(.subheadline)
+                Text("· \(label) · \(pct)%")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                Button("Reset") { quality = AutoCompress.defaultQuality }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+                    .disabled(abs(quality - AutoCompress.defaultQuality) < 0.005)
+            }
+            Slider(value: $quality, in: minQ...maxQ, step: 0.01)
+                .accessibilityLabel("Auto-compress quality")
+                .accessibilityValue("\(pct) percent — \(label)")
+        }
+        .padding(.top, 2)
+    }
+}

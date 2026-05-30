@@ -38,6 +38,12 @@ struct NetSample: Hashable {
 ///   • nettop's own delta math is fine; we'd be ignoring it anyway in favour
 ///     of our own delta-against-prior-snapshot for sparklines.
 let netNettopPath = "/usr/bin/nettop"
+// NOTE: `-t external` silently drops traffic on VPN/utun interfaces (utun0,
+// utun1, …). If the user needs to monitor a VPN tunnel they should remove
+// `-t external` and replace with `-t wifi,wired,external,loopback` or similar,
+// but without `-t external` the output includes loopback/mdns noise. A future
+// "Include VPN interfaces" toggle could pass `-t wifi,wired,external` instead
+// to keep the filter narrow while adding utun coverage.
 let netNettopArgs = ["-P", "-L", "1", "-x", "-J", "bytes_in,bytes_out", "-t", "external"]
 
 enum NetSamplerError: Error, CustomStringConvertible {
@@ -361,6 +367,11 @@ struct NetGroup: Identifiable {
     let bundlePath: String?
     let primary: NetRow            // chosen by max sumRate for icon/pid display
     let members: [NetRow]
+    // Pre-computed aggregate sparkline histories (element-wise sum across members).
+    // Computed once in regroup() rather than inside the ViewBuilder so the
+    // O(groups×history×members) work is amortised across ticks, not per-render.
+    let aggIn:  [Double]
+    let aggOut: [Double]
     // Fix 22: nonisolated so Identifiable works across actor boundaries.
     nonisolated var id: String { key }
 
@@ -371,6 +382,17 @@ struct NetGroup: Identifiable {
     var totalOut: Int64 { members.reduce(0) { $0 + $1.totalOut } }
     var sumRate: Double { rateIn + rateOut }
     var count: Int { members.count }
+
+    /// Element-wise sum of `rateInHistory` across all members, length-padded to 60.
+    static func aggregateSpark(members: [NetRow], keyPath: KeyPath<NetRow, [Double]>) -> [Double] {
+        let histLen = 60
+        var agg = [Double](repeating: 0.0, count: histLen)
+        for m in members {
+            let h = m[keyPath: keyPath]
+            for i in 0..<min(h.count, histLen) { agg[i] += h[i] }
+        }
+        return agg
+    }
 }
 
 @MainActor
@@ -410,6 +432,9 @@ final class NetModel: ObservableObject {
     private var generation: UInt64 = 0
     private var lastTickAt: ContinuousClock.Instant? = nil
     private var wakeObserver: NSObjectProtocol? = nil
+    /// Terminate observer lives on the model (not on view @State) so it isn't
+    /// leaked if the view identity resets while the pane stays mounted.
+    private var terminateObserver: NSObjectProtocol? = nil
 
     func start() {
         // Early sanity — surface "nettop not installed" without waiting for
@@ -432,6 +457,16 @@ final class NetModel: ObservableObject {
                     self?.lastTickAt = nil
                     self?.generation &+= 1
                 }
+            }
+        }
+        // App-terminate observer: guarantee the sampler is stopped even if
+        // onDisappear is missed (e.g. window force-closed mid-tick).
+        // Moved from view @State to model so it survives view identity resets.
+        if terminateObserver == nil {
+            terminateObserver = NotificationCenter.default.addObserver(
+                forName: .troveWillTerminate, object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in self?.stop() }
             }
         }
         tickTask = Task { [weak self] in
@@ -464,6 +499,10 @@ final class NetModel: ObservableObject {
         if let o = wakeObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(o)
             wakeObserver = nil
+        }
+        if let o = terminateObserver {
+            NotificationCenter.default.removeObserver(o)
+            terminateObserver = nil
         }
     }
 
@@ -586,7 +625,9 @@ final class NetModel: ObservableObject {
                 let info = bucketInfo[key] ?? (primary.name, nil)
                 built.append(NetGroup(
                     key: key, displayName: info.display, bundlePath: info.bundle,
-                    primary: primary, members: members
+                    primary: primary, members: members,
+                    aggIn:  NetGroup.aggregateSpark(members: members, keyPath: \.rateInHistory),
+                    aggOut: NetGroup.aggregateSpark(members: members, keyPath: \.rateOutHistory)
                 ))
             }
         } else {
@@ -596,7 +637,9 @@ final class NetModel: ObservableObject {
                     key: key,
                     displayName: r.name,
                     bundlePath: netBundlePath(for: r),
-                    primary: r, members: [r]
+                    primary: r, members: [r],
+                    aggIn:  r.rateInHistory,
+                    aggOut: r.rateOutHistory
                 ))
             }
         }
@@ -820,12 +863,12 @@ struct NetSparkline: View {
             ZStack {
                 if mode != .outgoing {
                     line(inHistory,  in: g.size, max: maxBoth)
-                        .stroke(Color.green, style: .init(lineWidth: 1.2, lineJoin: .round))
+                        .stroke(Color.troveAccentSky, style: .init(lineWidth: 1.2, lineJoin: .round))
                         .accessibilityLabel("Download rate sparkline")
                 }
                 if mode != .incoming {
                     line(outHistory, in: g.size, max: maxBoth)
-                        .stroke(Color.orange, style: .init(lineWidth: 1.2, lineJoin: .round))
+                        .stroke(Color.troveAccent, style: .init(lineWidth: 1.2, lineJoin: .round))
                         .accessibilityLabel("Upload rate sparkline")
                 }
             }
@@ -898,10 +941,10 @@ struct NetRowView: View {
 
             // Rate columns: ↓ in, ↑ out — hide the irrelevant axis when filtered.
             if direction != .outgoing {
-                rateColumn(symbol: "arrow.down", rate: rateIn,  total: totalIn,  tint: .green)
+                rateColumn(symbol: "arrow.down", rate: rateIn,  total: totalIn,  tint: .troveAccentSky)
             }
             if direction != .incoming {
-                rateColumn(symbol: "arrow.up",   rate: rateOut, total: totalOut, tint: .orange)
+                rateColumn(symbol: "arrow.up",   rate: rateOut, total: totalOut, tint: .troveAccent)
             }
 
             NetSparkline(inHistory: sparkInHistory,
@@ -1035,9 +1078,6 @@ public struct NetworkMonitorView: View {
     @StateObject private var m = NetModel()
     @State private var compact: Bool = false
     @State private var selection: Int32? = nil
-    /// Subscribed in onAppear so app-terminate teardown happens even if the
-    /// pane is the foreground tab when the user quits (red-team #2).
-    @State private var terminateObserver: NSObjectProtocol? = nil
 
     public init() {}
 
@@ -1055,24 +1095,8 @@ public struct NetworkMonitorView: View {
         .navigationTitle("Network")
         .navigationSubtitle(subtitle)
         .toolbar { toolbar() }
-        .onAppear {
-            guard terminateObserver == nil else { return }
-            m.start()
-            // Red-team #2: even if onDisappear is missed (window force-closed
-            // mid-tick), the terminate hook guarantees we drop the sampler.
-            terminateObserver = NotificationCenter.default.addObserver(
-                forName: .troveWillTerminate, object: nil, queue: .main
-            ) { _ in
-                Task { @MainActor in m.stop() }
-            }
-        }
-        .onDisappear {
-            m.stop()
-            if let t = terminateObserver {
-                NotificationCenter.default.removeObserver(t)
-                terminateObserver = nil
-            }
-        }
+        .onAppear { m.start() }
+        .onDisappear { m.stop() }
     }
 
     // MARK: full body
@@ -1104,7 +1128,7 @@ public struct NetworkMonitorView: View {
                     Text(m.search.isEmpty
                          ? "No \(m.direction == .incoming ? "inbound" : "outbound") traffic right now"
                          : "No processes match \"\(m.search)\"")
-                        .font(.headline)
+                        .headerText()
                     Text("Try clearing the filter or switching the direction toggle back to Both.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
@@ -1125,7 +1149,7 @@ public struct NetworkMonitorView: View {
                         .font(.system(size: 36, weight: .light))
                         .foregroundStyle(.tertiary)
                     Text("No network traffic yet")
-                        .font(.headline)
+                        .headerText()
                     Text("Trove is listening via nettop. Idle apps produce no rows — anything that sends or receives bytes will appear here, grouped by app and sorted by throughput.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
@@ -1171,19 +1195,7 @@ public struct NetworkMonitorView: View {
 
     @ViewBuilder
     private func groupRow(_ g: NetGroup) -> some View {
-        // Fix: aggregate sparkline histories element-wise from all members so
-        // a grouped app row shows combined throughput rather than just the primary's.
-        let histLen = 60
-        let aggIn:  [Double] = (0..<histLen).map { i in
-            g.members.reduce(0.0) { sum, m in
-                i < m.rateInHistory.count ? sum + m.rateInHistory[i] : sum
-            }
-        }
-        let aggOut: [Double] = (0..<histLen).map { i in
-            g.members.reduce(0.0) { sum, m in
-                i < m.rateOutHistory.count ? sum + m.rateOutHistory[i] : sum
-            }
-        }
+        // aggIn/aggOut are pre-computed in NetModel.regroup() — no per-render work.
         NetRowView(
             primary: g.primary,
             displayName: g.displayName,
@@ -1194,8 +1206,8 @@ public struct NetworkMonitorView: View {
             totalIn: g.totalIn,
             totalOut: g.totalOut,
             direction: m.direction,
-            sparkInHistory: aggIn,
-            sparkOutHistory: aggOut
+            sparkInHistory: g.aggIn,
+            sparkOutHistory: g.aggOut
         )
     }
 
@@ -1205,7 +1217,7 @@ public struct NetworkMonitorView: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                    Text("Network monitoring unavailable").font(.headline)
+                    Text("Network monitoring unavailable").headerText()
                 }
                 Text("`/usr/bin/nettop` was not found on this Mac. The Network pane uses nettop to read per-process byte counters; it ships with macOS but is missing on some stripped-down installs.")
                     .foregroundStyle(.secondary)

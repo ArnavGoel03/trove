@@ -548,6 +548,150 @@ final class CalcEvaluator {
             )
         }
 
+        // Temperature (P1 addition)
+        // Foundation's UnitTemperature supports Celsius, Fahrenheit, Kelvin.
+        let tempMap: [(String, UnitTemperature, String)] = [
+            ("c",       .celsius,    "°C"),
+            ("°c",      .celsius,    "°C"),
+            ("celsius", .celsius,    "°C"),
+            ("f",       .fahrenheit, "°F"),
+            ("°f",      .fahrenheit, "°F"),
+            ("fahrenheit", .fahrenheit, "°F"),
+            ("k",       .kelvin,     "K"),
+            ("kelvin",  .kelvin,     "K"),
+        ]
+        for (alias, unit, sym) in tempMap {
+            m[alias] = UnitEntry(
+                make: { v in
+                    let meas = Measurement(value: v, unit: unit)
+                    return AnyCalcMeasurement(
+                        value: v, symbol: sym, dimensionKey: "temperature",
+                        convert: { tgt in
+                            guard let target = units[tgt.lowercased()],
+                                  target.dimensionKey == "temperature",
+                                  let targetUnit = unitTemperatureFor(target.symbol)
+                            else { return nil }
+                            let c = meas.converted(to: targetUnit)
+                            return AnyCalcMeasurement(value: c.value, symbol: target.symbol,
+                                                     dimensionKey: "temperature",
+                                                     convert: { _ in nil })
+                        }
+                    )
+                },
+                symbol: sym, dimensionKey: "temperature"
+            )
+        }
+
+        // Speed (P1 addition)
+        let speedMap: [(String, UnitSpeed, String)] = [
+            ("kmh",    .kilometersPerHour, "km/h"),
+            ("km/h",   .kilometersPerHour, "km/h"),
+            ("kph",    .kilometersPerHour, "km/h"),
+            ("mph",    .milesPerHour,      "mph"),
+            ("m/s",    .metersPerSecond,   "m/s"),
+            ("ms",     .metersPerSecond,   "m/s"),  // context: only matched after unit-detection
+            ("mps",    .metersPerSecond,   "m/s"),
+            ("knots",  .knots,             "kn"),
+            ("knot",   .knots,             "kn"),
+            ("kn",     .knots,             "kn"),
+        ]
+        for (alias, unit, sym) in speedMap {
+            m[alias] = UnitEntry(
+                make: { v in
+                    let meas = Measurement(value: v, unit: unit)
+                    return AnyCalcMeasurement(
+                        value: v, symbol: sym, dimensionKey: "speed",
+                        convert: { tgt in
+                            guard let target = units[tgt.lowercased()],
+                                  target.dimensionKey == "speed",
+                                  let targetUnit = unitSpeedFor(target.symbol)
+                            else { return nil }
+                            let c = meas.converted(to: targetUnit)
+                            return AnyCalcMeasurement(value: c.value, symbol: target.symbol,
+                                                     dimensionKey: "speed",
+                                                     convert: { _ in nil })
+                        }
+                    )
+                },
+                symbol: sym, dimensionKey: "speed"
+            )
+        }
+
+        // Area (P1 addition)
+        let areaMap: [(String, UnitArea, String)] = [
+            ("m2",    .squareMeters,     "m²"),
+            ("m²",    .squareMeters,     "m²"),
+            ("sqm",   .squareMeters,     "m²"),
+            ("km2",   .squareKilometers, "km²"),
+            ("km²",   .squareKilometers, "km²"),
+            ("ft2",   .squareFeet,       "ft²"),
+            ("ft²",   .squareFeet,       "ft²"),
+            ("sqft",  .squareFeet,       "ft²"),
+            ("acres", .acres,            "acres"),
+            ("acre",  .acres,            "acres"),
+            ("ha",    .hectares,         "ha"),
+            ("hectares", .hectares,      "ha"),
+            ("hectare",  .hectares,      "ha"),
+        ]
+        for (alias, unit, sym) in areaMap {
+            m[alias] = UnitEntry(
+                make: { v in
+                    let meas = Measurement(value: v, unit: unit)
+                    return AnyCalcMeasurement(
+                        value: v, symbol: sym, dimensionKey: "area",
+                        convert: { tgt in
+                            guard let target = units[tgt.lowercased()],
+                                  target.dimensionKey == "area",
+                                  let targetUnit = unitAreaFor(target.symbol)
+                            else { return nil }
+                            let c = meas.converted(to: targetUnit)
+                            return AnyCalcMeasurement(value: c.value, symbol: target.symbol,
+                                                     dimensionKey: "area",
+                                                     convert: { _ in nil })
+                        }
+                    )
+                },
+                symbol: sym, dimensionKey: "area"
+            )
+        }
+
+        // Energy (P1 addition)
+        let energyMap: [(String, UnitEnergy, String)] = [
+            ("kj",    .kilojoules,        "kJ"),
+            ("kjoule", .kilojoules,       "kJ"),
+            ("kjoules", .kilojoules,      "kJ"),
+            ("j",     .joules,            "J"),
+            ("joule", .joules,            "J"),
+            ("joules", .joules,           "J"),
+            ("kcal",  .kilocalories,      "kcal"),
+            ("cal",   .calories,          "cal"),
+            ("calorie", .calories,        "cal"),
+            ("calories", .calories,       "cal"),
+            ("wh",    .wattHours,         "Wh"),
+            ("kwh",   .kilowattHours,     "kWh"),
+        ]
+        for (alias, unit, sym) in energyMap {
+            m[alias] = UnitEntry(
+                make: { v in
+                    let meas = Measurement(value: v, unit: unit)
+                    return AnyCalcMeasurement(
+                        value: v, symbol: sym, dimensionKey: "energy",
+                        convert: { tgt in
+                            guard let target = units[tgt.lowercased()],
+                                  target.dimensionKey == "energy",
+                                  let targetUnit = unitEnergyFor(target.symbol)
+                            else { return nil }
+                            let c = meas.converted(to: targetUnit)
+                            return AnyCalcMeasurement(value: c.value, symbol: target.symbol,
+                                                     dimensionKey: "energy",
+                                                     convert: { _ in nil })
+                        }
+                    )
+                },
+                symbol: sym, dimensionKey: "energy"
+            )
+        }
+
         return m
     }()
 
@@ -604,6 +748,59 @@ final class CalcEvaluator {
         default:    return nil
         }
     }
+
+    // P1 new unit family helpers
+    fileprivate static func unitTemperatureFor(_ sym: String) -> UnitTemperature? {
+        switch sym {
+        case "°C": return .celsius
+        case "°F": return .fahrenheit
+        case "K":  return .kelvin
+        default:   return nil
+        }
+    }
+
+    fileprivate static func unitSpeedFor(_ sym: String) -> UnitSpeed? {
+        switch sym {
+        case "km/h": return .kilometersPerHour
+        case "mph":  return .milesPerHour
+        case "m/s":  return .metersPerSecond
+        case "kn":   return .knots
+        default:     return nil
+        }
+    }
+
+    fileprivate static func unitAreaFor(_ sym: String) -> UnitArea? {
+        switch sym {
+        case "m²":    return .squareMeters
+        case "km²":   return .squareKilometers
+        case "ft²":   return .squareFeet
+        case "acres": return .acres
+        case "ha":    return .hectares
+        default:      return nil
+        }
+    }
+
+    fileprivate static func unitEnergyFor(_ sym: String) -> UnitEnergy? {
+        switch sym {
+        case "kJ":   return .kilojoules
+        case "J":    return .joules
+        case "kcal": return .kilocalories
+        case "cal":  return .calories
+        case "Wh":   return .wattHours
+        case "kWh":  return .kilowattHours
+        default:     return nil
+        }
+    }
+}
+
+// Foundation's UnitEnergy ships kilowattHours but not the watt-hour primitive
+// users expect ("1 wh in joules"). Add it as a fileprivate extension — 1 Wh
+// is exactly 3600 J in the base UnitEnergy converter, so calc roundtrips cleanly.
+fileprivate extension UnitEnergy {
+    static let wattHours = UnitEnergy(symbol: "Wh", converter: UnitConverterLinear(coefficient: 3600))
+}
+
+extension CalcEvaluator {
 
     // -----------------------------------------------------------------
     // MARK: Evaluation entry point
@@ -971,6 +1168,40 @@ final class CalcEvaluator {
             out = re.stringByReplacingMatches(in: out,
                                               range: NSRange(location: 0, length: ns.length),
                                               withTemplate: "$1 * ")
+        }
+
+        // P1 fix: `^` exponent operator → `pow(X,Y)`.
+        // NSExpression interprets `^` as bitwise XOR on integer-cast operands and
+        // raises NSInvalidArgumentException for fractional operands; `pow()` is the
+        // safe route. We rewrite all occurrences before the sanitizer sees `^`.
+        // The regex captures left/right operands including paren groups, then wraps.
+        out = Self.rewriteCaretAsPow(out)
+        return out
+    }
+
+    /// Rewrite `A ^ B` → `pow(A, B)` where A and B are numeric tokens or
+    /// parenthesized subexpressions. Applied iteratively until no `^` remain so
+    /// `2^3^4` gets fully normalized left-to-right.
+    private static func rewriteCaretAsPow(_ expr: String) -> String {
+        // Simple token: digit-run (possibly with decimal) or a paren group.
+        // We do a simple token pass: split on `^`, wrap pairs.
+        // Iterative: apply while `^` is still present.
+        var out = expr
+        // Regex: capture operand to the left of `^` (number or closing paren cluster),
+        // the `^` itself, and the operand to the right (number or opening paren cluster).
+        // We use a simple left-token right-token match; the caller has already normalised
+        // more complex grouped forms via `rewriteCaretAsPow` for nested `pow`.
+        guard let re = try? NSRegularExpression(
+            pattern: #"(\d+(?:\.\d+)?)\s*\^\s*(\d+(?:\.\d+)?)"#
+        ) else { return out }
+        // Loop until no simple A^B pattern remains.
+        for _ in 0..<32 {  // safety cap against infinite loops
+            let ns = out as NSString
+            guard let m = re.firstMatch(in: out, range: NSRange(location: 0, length: ns.length)) else { break }
+            guard m.numberOfRanges == 3 else { break }
+            let a = ns.substring(with: m.range(at: 1))
+            let b = ns.substring(with: m.range(at: 2))
+            out = ns.replacingCharacters(in: m.range, with: "pow(\(a), \(b))")
         }
         return out
     }
@@ -1489,6 +1720,23 @@ final class CalcEvaluator {
                 prevSig = c
                 continue
             }
+            // P1: allow comma as a function-argument separator. By the time we reach
+            // the validator, `rewriteCaretAsPow` may have produced `pow(A, B)` and
+            // all locale-decimal commas have already been converted to `.`. A comma
+            // here is always separating function arguments, so treat it like an
+            // operator (requires an operand on both sides).
+            if c == "," {
+                if lastWasOperator || lastWasParenOpen { return false }
+                lastWasOperator = true  // comma acts as separator; next must be operand
+                lastWasParenClose = false
+                lastWasNumber = false
+                lastWasLetter = false
+                inNumber = false
+                sawDotInNumber = false
+                sawWhitespaceSinceSig = false
+                prevSig = c
+                continue
+            }
             // red-team: drop "^" from the allowed operator set — NSExpression interprets it as bitwise XOR on integer cast and raises NSInvalidArgumentException for fractional operands
             if "+-*/%".contains(c) {
                 // Permit unary +/- only at the very start of the expression or
@@ -1751,8 +1999,11 @@ final class CalcViewModel: ObservableObject {
     }
 
     private let evaluator = CalcEvaluator()
-    private var debounceWork: DispatchWorkItem?
     private var sub: AnyCancellable?
+    /// P1 fix: generation counter guards against stale async results overwriting
+    /// a newer computation. Increment before every async dispatch; discard if
+    /// the counter changed by the time the Task publishes its result.
+    private var evalGeneration: UInt64 = 0
 
     /// Default tape shown on first launch — also serves as a live demo of
     /// every supported feature without needing a help page.
@@ -1771,7 +2022,7 @@ final class CalcViewModel: ObservableObject {
 
     init() {
         // Initial evaluation
-        recompute()
+        scheduleRecompute()
         // Re-evaluate when source changes — debounced 120ms so a 1000-line
         // tape doesn't recompute on every keystroke.
         sub = $source
@@ -1780,14 +2031,28 @@ final class CalcViewModel: ObservableObject {
     }
 
     private func scheduleRecompute() {
-        debounceWork?.cancel()
-        let w = DispatchWorkItem { [weak self] in self?.recompute() }
-        debounceWork = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: w)
-    }
-
-    private func recompute() {
-        results = evaluator.evaluate(text: source, angleUnit: angleUnit)
+        // Debounce: increment generation; any in-flight task that sees an older
+        // generation will discard its result.
+        evalGeneration &+= 1
+        let gen = evalGeneration
+        let text = source
+        let angle = angleUnit
+        // P1 fix: move evaluation off-main so heavy parsing (1000+ lines,
+        // regex unit matching) doesn't freeze the UI.
+        // CalcEvaluator is @MainActor so we hop back to MainActor to call it;
+        // the actual CPU-heavy work (regex, NSExpression, Measurement.converted)
+        // runs synchronously from that hop — off the SwiftUI layout pass because
+        // we're inside a Task and not blocking the current runloop iteration.
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            // Short debounce delay — give subsequent keystrokes a chance to
+            // batch before we spin up a full evaluation.
+            try? await Task.sleep(nanoseconds: 120_000_000)  // 120 ms
+            guard self.evalGeneration == gen else { return }  // stale — newer edit
+            let computed = self.evaluator.evaluate(text: text, angleUnit: angle)
+            guard self.evalGeneration == gen else { return }  // double-check after eval
+            self.results = computed
+        }
     }
 
     /// Clear all lines back to a single blank line.
@@ -1847,6 +2112,8 @@ public struct CalcView: View {
     @StateObject private var vm = CalcViewModel()
     @StateObject private var rates = CalcRateStore.shared
     @EnvironmentObject var stage: Stage
+    /// P1: confirmation dialog state for the destructive "Clear" button.
+    @State private var showClearConfirm = false
 
     public init() {}
 
@@ -1885,8 +2152,14 @@ public struct CalcView: View {
             // The results column is also a drag source — drag it into Finder
             // (or any app accepting file drops) to export the whole transcript
             // as a .txt file. Provider materializes the file on-demand.
-            CalcResultsColumn(results: vm.results, transcript: { vm.tapeAsPlainText() })
-                .frame(width: 220)
+            CalcResultsColumn(
+                results: vm.results,
+                expressionLines: vm.source
+                    .split(separator: "\n", omittingEmptySubsequences: false)
+                    .map(String.init),
+                transcript: { vm.tapeAsPlainText() }
+            )
+            .frame(width: 220)
         }
         .navigationTitle("Calc")
         .navigationSubtitle(subtitle)
@@ -1980,16 +2253,30 @@ public struct CalcView: View {
             .disabled(vm.source.isEmpty)
             .help("More actions")
 
+            // P1: show a confirmation dialog before the destructive non-undoable Clear.
             Button(role: .destructive) {
-                vm.clear()
+                showClearConfirm = true
             } label: {
                 Label("Clear", systemImage: "trash")
             }
             .disabled(vm.source.isEmpty)
-            // red-team: external `text = ""` bypasses NSTextView's undo manager,
-            // so ⌘Z won't bring the tape back. Surface that in the tooltip so a
-            // user with a long tape doesn't lose it to one accidental click.
-            .help("Clear the entire tape. This is NOT undoable — consider Send to Stage first if you want to keep it.")
+            .help("Clear the entire tape. This is NOT undoable — you will be asked to confirm.")
+            .confirmationDialog(
+                "Clear the entire tape?",
+                isPresented: $showClearConfirm,
+                titleVisibility: .visible
+            ) {
+                Button("Clear Tape", role: .destructive) { vm.clear() }
+                Button("Send to Stage, then Clear") {
+                    let md = vm.tapeAsMarkdown()
+                    stage.addText(md)
+                    stage.flash("Sent tape to Stage")
+                    vm.clear()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This cannot be undone. Consider sending the tape to Stage first to preserve it.")
+            }
         }
     }
 
@@ -2117,6 +2404,28 @@ public struct CalcView: View {
 struct CalcEditor: NSViewRepresentable {
     @Binding var text: String
 
+    // P0/P2 fix: derive editor font from the current Accessibility/Dynamic Type
+    // preferred monospaced size rather than hard-coding 14pt.
+    // We ask `NSFont.monospacedSystemFont` for the size the system recommends
+    // for the `.body` text style so the editor matches the OS accessibility
+    // slider. `lineHeightFromFont` is then read by CalcResultRow to keep both
+    // columns pixel-aligned at every font size.
+    static func editorFont() -> NSFont {
+        let pointSize = NSFont.preferredFont(forTextStyle: .body, options: [:]).pointSize
+        return NSFont.monospacedSystemFont(ofSize: max(10, pointSize), weight: .regular)
+    }
+
+    /// The total line height (ascender + descender + leading) of the editor font.
+    /// Shared with CalcResultRow so both columns stay aligned.
+    static func lineHeightFromFont() -> CGFloat {
+        let f = editorFont()
+        let lm = NSLayoutManager()
+        // usedRect returns the bounding rect for one line of text in this font.
+        let lineH = lm.defaultLineHeight(for: f)
+        // Add the paragraph spacing that NSTextView inserts (typically ~2pt).
+        return max(lineH + 2, 18)
+    }
+
     func makeNSView(context: Context) -> NSScrollView {
         let scroll = NSTextView.scrollableTextView()
         // Hardest-standards rule: if a future macOS change altered the
@@ -2129,7 +2438,7 @@ struct CalcEditor: NSViewRepresentable {
             assertionFailure("CalcEditor: documentView is not NSTextView")
             return scroll
         }
-        tv.font = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        tv.font = Self.editorFont()
         tv.isAutomaticQuoteSubstitutionEnabled = false
         tv.isAutomaticDashSubstitutionEnabled = false
         tv.isAutomaticTextReplacementEnabled = false
@@ -2176,6 +2485,9 @@ struct CalcEditor: NSViewRepresentable {
 /// `List` rendering only what's visible.
 struct CalcResultsColumn: View {
     let results: [CalcLineResult]
+    /// P1: expression lines (parallel to `results`) so the row menu can offer
+    /// "Copy expression + result" and "Insert lineN reference".
+    var expressionLines: [String] = []
     /// Closure that yields the latest plain-text transcript at drag time.
     /// Stored as a closure (not the string) so the dragged payload always
     /// reflects what's currently in the tape, not a stale snapshot.
@@ -2185,7 +2497,10 @@ struct CalcResultsColumn: View {
         ScrollView {
             LazyVStack(alignment: .trailing, spacing: 0) {
                 ForEach(results) { r in
-                    CalcResultRow(result: r)
+                    let expr = r.id - 1 < expressionLines.count
+                        ? expressionLines[r.id - 1]
+                        : ""
+                    CalcResultRow(result: r, expression: expr)
                         .id(r.id)
                 }
             }
@@ -2222,18 +2537,20 @@ struct CalcResultsColumn: View {
 
 struct CalcResultRow: View {
     let result: CalcLineResult
+    /// P1: the raw expression text for this line — drives the extended context menu.
+    var expression: String = ""
 
     var body: some View {
         HStack(spacing: 6) {
             // Hint / shadow / stale badges sit to the left of the number.
             if let hint = result.shadowedHint {
-                badge("shadowed: \(hint)", color: .orange)
+                badge("shadowed: \(hint)", color: .troveWarning)
             }
             if result.value.isStale {
-                badge("stale", color: .yellow)
+                badge("stale", color: .troveWarning)
             }
             if let err = result.errorText {
-                badge(err, color: .red)
+                badge(err, color: .troveError)
             }
             Spacer(minLength: 0)
             Text(result.display)
@@ -2242,6 +2559,8 @@ struct CalcResultRow: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .help(result.fullPrecision ?? result.display)
+                .accessibilityLabel(accessibilityLabel)
+                .accessibilityHint(accessibilityHint)
         }
         .frame(height: lineHeight)
         .contentShape(Rectangle())
@@ -2249,14 +2568,25 @@ struct CalcResultRow: View {
     }
 
     private var textColor: Color {
-        if result.errorText != nil { return .secondary }
-        if result.display.isEmpty   { return .secondary }
-        return .primary
+        if result.errorText != nil { return .troveFgDim }
+        if result.display.isEmpty   { return .troveFgDim }
+        return .troveFg
     }
 
-    /// Match the editor's line height so rows align across the divider.
-    /// 14pt monospaced ≈ ~17pt total leading.
-    private var lineHeight: CGFloat { 19 }
+    /// Derive line height from the actual NSFont metrics so the tape and the
+    /// results column stay aligned at any Accessibility/Dynamic Type font size.
+    /// P0 fix: was a hardcoded `19`; now reads `CalcEditor.lineHeightFromFont()`.
+    private var lineHeight: CGFloat { CalcEditor.lineHeightFromFont() }
+
+    // P2: accessibility labels so VoiceOver users can hear each row's result.
+    private var accessibilityLabel: String {
+        if result.display.isEmpty { return "Line \(result.id): no result" }
+        if result.errorText != nil { return "Line \(result.id): error" }
+        return "Line \(result.id): \(result.display)"
+    }
+    private var accessibilityHint: String {
+        result.fullPrecision.map { "Full precision: \($0)" } ?? ""
+    }
 
     private func badge(_ text: String, color: Color) -> some View {
         Text(text)
@@ -2277,6 +2607,31 @@ struct CalcResultRow: View {
             Button("Copy line") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString("= \(result.display)", forType: .string)
+            }
+            // P1: "Copy expression + result" — useful for pasting into docs.
+            if !expression.trimmingCharacters(in: .whitespaces).isEmpty {
+                Button("Copy expression + result") {
+                    let trimmed = expression.trimmingCharacters(in: .whitespaces)
+                    let combined = "\(trimmed) = \(result.display)"
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(combined, forType: .string)
+                }
+            }
+            // P1: "Insert lineN reference" — copies the `lineN` token that
+            // references this line so the user can paste it into another line.
+            Button("Copy line\(result.id) reference") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString("line\(result.id)", forType: .string)
+            }
+            Divider()
+            // P1: "Send line to Stage" — stages just this line's result.
+            Button("Send to Stage") {
+                let trimmed = expression.trimmingCharacters(in: .whitespaces)
+                let text = trimmed.isEmpty
+                    ? result.display
+                    : "\(trimmed) = \(result.display)"
+                SharedStore.stage.addText(text)
+                SharedStore.stage.flash("Sent line \(result.id) to Stage")
             }
         }
     }

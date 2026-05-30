@@ -195,6 +195,11 @@ struct ImgToolsSource: Identifiable, Hashable {
     var invalid: Bool = false
     var note: String = ""
 
+    // P1: per-source overrides — when set, these override the global settings
+    // just for this source during conversion. nil = use global.
+    var overrideFormat: ImgToolsFormat? = nil
+    var overrideDimension: Int? = nil   // overrides maxDimension (nil = use global)
+
     var pixelCount: Int { pixelWidth * pixelHeight }
     var dimensionsLabel: String {
         if pixelWidth <= 0 || pixelHeight <= 0 { return "—" }
@@ -212,10 +217,27 @@ struct ImgToolsOutput: Identifiable, Hashable {
     let outputURL: URL
     let beforeBytes: Int64
     let afterBytes: Int64
+    let sourcePixelWidth: Int
+    let sourcePixelHeight: Int
+    var outputPixelWidth: Int = 0
+    var outputPixelHeight: Int = 0
+    /// P1: lazily decoded output thumbnail (max 256 px). Populated after conversion.
+    var outputThumbnail: NSImage? = nil
     var deltaBytes: Int64 { afterBytes - beforeBytes }
     var deltaPct: Double {
         beforeBytes > 0 ? Double(afterBytes - beforeBytes) / Double(beforeBytes) : 0
     }
+}
+
+/// P1: transport struct for the before/after preview that is shown before
+/// the user commits to keeping output files. Marked @unchecked Sendable
+/// for the same reason as ImgToolsIngestResult — NSImage is only touched
+/// on the main actor after delivery.
+struct ImgToolsPreviewResult: Identifiable, @unchecked Sendable {
+    let id: UUID           // matches ImgToolsOutput.id
+    let thumb: NSImage?
+    let pixelWidth: Int
+    let pixelHeight: Int
 }
 
 struct ImgToolsFailure: Identifiable, Hashable {
@@ -446,7 +468,12 @@ enum ImgToolsConverter {
             }
         }
 
-        var resultURL: URL!
+        // P2 fix: previously declared as `var resultURL: URL!` (IUO). If `doConvert`
+        // ever returned without throwing AND without assigning (e.g. a future
+        // refactor that early-exits), `return resultURL` would force-unwrap nil
+        // and crash. Optional + explicit unwrap makes the contract obvious and
+        // surfaces a real error instead of a crash.
+        var resultURL: URL?
         var thrown: Error?
 
         autoreleasepool {
@@ -457,7 +484,12 @@ enum ImgToolsConverter {
             }
         }
         if let e = thrown { throw e }
-        return resultURL
+        guard let result = resultURL else {
+            // Defensive: should never happen unless doConvert is buggy. Surface
+            // a clean error instead of crashing the encode pipeline.
+            throw ImgToolsConvertError.decodeFailed
+        }
+        return result
     }
 
     private static func doConvert(
@@ -634,11 +666,25 @@ final class ImgToolsModel: ObservableObject {
     @Published var outputs: [ImgToolsOutput] = []
     @Published var failures: [ImgToolsFailure] = []
 
-    @Published var format: ImgToolsFormat = .png
-    @Published var maxDimension: Double = 2048
-    @Published var keepOriginalSize: Bool = false
-    @Published var quality: Double = 0.85
-    @Published var stripMetadata: Bool = true
+    // P1: @AppStorage-backed settings — persist across launches.
+    // We use UserDefaults directly (the @AppStorage property wrapper can't be
+    // used on a non-View type; we mirror the same key names so a Settings
+    // view could bind @AppStorage to the same keys transparently).
+    @Published var format: ImgToolsFormat {
+        didSet { UserDefaults.standard.set(format.rawValue, forKey: "imgTools.format") }
+    }
+    @Published var maxDimension: Double {
+        didSet { UserDefaults.standard.set(maxDimension, forKey: "imgTools.maxDimension") }
+    }
+    @Published var keepOriginalSize: Bool {
+        didSet { UserDefaults.standard.set(keepOriginalSize, forKey: "imgTools.keepOriginalSize") }
+    }
+    @Published var quality: Double {
+        didSet { UserDefaults.standard.set(quality, forKey: "imgTools.quality") }
+    }
+    @Published var stripMetadata: Bool {
+        didSet { UserDefaults.standard.set(stripMetadata, forKey: "imgTools.stripMetadata") }
+    }
 
     @Published var outputDir: URL = UserDefaults.standard.url(forKey: "image_tools.outputDir")
         ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first ?? FileManager.default.homeDirectoryForCurrentUser {
@@ -664,6 +710,21 @@ final class ImgToolsModel: ObservableObject {
     // pixel dims / thumbnails are still being decoded. Matches the
     // `!sources.contains(where: { $0.validating })` guard in pdf.swift.
     var isValidating: Bool { sources.contains(where: { $0.validating }) }
+
+    // P1: init restoring persisted settings.
+    init() {
+        let ud = UserDefaults.standard
+        let fmtRaw = ud.string(forKey: "imgTools.format") ?? ""
+        self.format = ImgToolsFormat(rawValue: fmtRaw) ?? .png
+        let dim = ud.double(forKey: "imgTools.maxDimension")
+        self.maxDimension = dim > 0 ? dim : 2048
+        self.keepOriginalSize = ud.object(forKey: "imgTools.keepOriginalSize") != nil
+            ? ud.bool(forKey: "imgTools.keepOriginalSize") : false
+        let q = ud.double(forKey: "imgTools.quality")
+        self.quality = q > 0 ? q : 0.85
+        self.stripMetadata = ud.object(forKey: "imgTools.stripMetadata") != nil
+            ? ud.bool(forKey: "imgTools.stripMetadata") : true
+    }
 
     /// speed: row-instant ingestion. We synchronously append a placeholder
     /// row for every dropped file so the user sees the file name immediately;
@@ -806,6 +867,54 @@ final class ImgToolsModel: ObservableObject {
         failures.removeAll()
     }
 
+    // P1: per-source override setters. Called from ImgToolsSourceCard.
+    func setSourceFormat(_ format: ImgToolsFormat?, id: UUID) {
+        if let idx = sources.firstIndex(where: { $0.id == id }) {
+            sources[idx].overrideFormat = format
+        }
+    }
+
+    func setSourceDimension(_ dim: Int?, id: UUID) {
+        if let idx = sources.firstIndex(where: { $0.id == id }) {
+            sources[idx].overrideDimension = dim
+        }
+    }
+
+    /// P1: after conversion, decode output thumbnails off-main and splice them
+    /// into `outputs`. Called immediately after `runConversion` finishes.
+    private func loadOutputThumbnails(for ids: [UUID]) {
+        Task.detached(priority: .utility) { [weak self] in
+            var results: [ImgToolsPreviewResult] = []
+            // Snapshot the URLs we need to decode.
+            let pairs: [(id: UUID, url: URL)] = await MainActor.run {
+                guard let self else { return [] }
+                return self.outputs.compactMap { o in
+                    ids.contains(o.id) ? (o.id, o.outputURL) : nil
+                }
+            }
+            for pair in pairs {
+                let thumb = ImgToolsLoader.makeThumbnail(url: pair.url, maxPixel: 256)
+                var w = 0, h = 0
+                if let src = CGImageSourceCreateWithURL(pair.url as CFURL, nil),
+                   let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] {
+                    w = (props[kCGImagePropertyPixelWidth] as? Int) ?? 0
+                    h = (props[kCGImagePropertyPixelHeight] as? Int) ?? 0
+                }
+                results.append(ImgToolsPreviewResult(id: pair.id, thumb: thumb, pixelWidth: w, pixelHeight: h))
+            }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                for r in results {
+                    if let idx = self.outputs.firstIndex(where: { $0.id == r.id }) {
+                        self.outputs[idx].outputThumbnail = r.thumb
+                        self.outputs[idx].outputPixelWidth = r.pixelWidth
+                        self.outputs[idx].outputPixelHeight = r.pixelHeight
+                    }
+                }
+            }
+        }
+    }
+
     func chooseOutputDir() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
@@ -844,7 +953,8 @@ final class ImgToolsModel: ObservableObject {
             return
         }
 
-        let opts = ImgToolsConvertOptions(
+        // P1: build per-source opts, applying per-source overrides where set.
+        let globalOpts = ImgToolsConvertOptions(
             format: format,
             maxDimension: Int(maxDimension),
             keepOriginalSize: keepOriginalSize,
@@ -853,9 +963,18 @@ final class ImgToolsModel: ObservableObject {
             outputDir: outputDir
         )
         let snapshot = sources
+        // Each source carries its own opts; if no override is set it inherits global.
+        let perSourceOpts: [UUID: ImgToolsConvertOptions] = Dictionary(
+            uniqueKeysWithValues: snapshot.map { src in
+                var opts = globalOpts
+                if let fmt = src.overrideFormat { opts.format = fmt }
+                if let dim = src.overrideDimension { opts.maxDimension = dim }
+                return (src.id, opts)
+            }
+        )
 
         convertTask = Task { [weak self] in
-            await self?.runConversion(snapshot: snapshot, opts: opts, toStage: toStage)
+            await self?.runConversion(snapshot: snapshot, perSourceOpts: perSourceOpts, globalOpts: globalOpts, toStage: toStage)
         }
     }
 
@@ -868,7 +987,8 @@ final class ImgToolsModel: ObservableObject {
 
     private func runConversion(
         snapshot: [ImgToolsSource],
-        opts: ImgToolsConvertOptions,
+        perSourceOpts: [UUID: ImgToolsConvertOptions],
+        globalOpts: ImgToolsConvertOptions,
         toStage: Bool
     ) async {
         working = true
@@ -894,6 +1014,7 @@ final class ImgToolsModel: ObservableObject {
             // Seed up to 6 tasks initially.
             while inFlight < 6, let src = iter.next() {
                 if Task.isCancelled { break }
+                let opts = perSourceOpts[src.id] ?? globalOpts
                 group.addTask {
                     do {
                         let url = try ImgToolsConverter.convert(source: src, opts: opts)
@@ -921,7 +1042,9 @@ final class ImgToolsModel: ObservableObject {
                         sourceName: src.url.lastPathComponent,
                         outputURL: url,
                         beforeBytes: src.bytes,
-                        afterBytes: after
+                        afterBytes: after,
+                        sourcePixelWidth: src.pixelWidth,
+                        sourcePixelHeight: src.pixelHeight
                     ))
                     if toStage {
                         await MainActor.run { SharedStore.stage.addFile(url) }
@@ -941,6 +1064,7 @@ final class ImgToolsModel: ObservableObject {
 
                 // Feed next item if not cancelled.
                 if !Task.isCancelled, let next = iter.next() {
+                    let opts = perSourceOpts[next.id] ?? globalOpts
                     group.addTask {
                         do {
                             let url = try ImgToolsConverter.convert(source: next, opts: opts)
@@ -954,8 +1078,11 @@ final class ImgToolsModel: ObservableObject {
             }
         }
 
+        let newIDs = newOutputs.map { $0.id }
         outputs.append(contentsOf: newOutputs)
         failures.append(contentsOf: newFailures)
+        // P1: kick off thumbnail decode for new outputs (off-main, result spliced back).
+        if !newIDs.isEmpty { loadOutputThumbnails(for: newIDs) }
 
         let n = newOutputs.count
         if Task.isCancelled {
@@ -1160,7 +1287,7 @@ public struct ImageToolsView: View {
     private var controlsCard: some View {
         Card {
             VStack(alignment: .leading, spacing: 14) {
-                Text("Conversion").font(.headline)
+                Text("Conversion").headerText()
 
                 // red-team: format picker is now a vertical list of rows, each
                 // row showing the format name + its "best for…" hint copy.
@@ -1261,15 +1388,18 @@ public struct ImageToolsView: View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text("Loaded images").font(.headline)
+                    Text("Loaded images").headerText()
                     Spacer()
                     if m.working { ProgressView().controlSize(.small) }
                 }
                 LazyVGrid(columns: thumbCols, spacing: 12) {
                     ForEach(m.sources) { src in
-                        ImgToolsSourceCard(source: src) {
-                            m.removeSource(id: src.id)
-                        }
+                        ImgToolsSourceCard(
+                            source: src,
+                            onRemove: { m.removeSource(id: src.id) },
+                            onSetFormat: { m.setSourceFormat($0, id: src.id) },
+                            onSetDimension: { m.setSourceDimension($0, id: src.id) }
+                        )
                     }
                 }
             }
@@ -1284,7 +1414,7 @@ public struct ImageToolsView: View {
         Card {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
-                    Text("Converted").font(.headline)
+                    Text("Converted").headerText()
                     Spacer()
                     let savings = m.outputs.reduce(Int64(0)) { $0 + (-$1.deltaBytes) }
                     if savings > 0 {
@@ -1311,49 +1441,85 @@ public struct ImageToolsView: View {
 
     @ViewBuilder
     private func outputRow(_ out: ImgToolsOutput, isPrimary: Bool = false) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(out.outputURL.lastPathComponent)
-                    .font(.body).lineLimit(1)
-                Text(out.outputURL.deletingLastPathComponent().path)
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1).truncationMode(.middle)
+        VStack(alignment: .leading, spacing: 8) {
+            // P1: before/after preview — shown when the output thumbnail has
+            // been decoded (off-main, lands asynchronously).
+            if out.outputThumbnail != nil || out.sourcePixelWidth > 0 {
+                let sourceSrc = m.sources.first(where: { $0.id == out.sourceID })
+                HStack(spacing: 12) {
+                    // Before
+                    beforeAfterThumbCell(
+                        thumb: sourceSrc?.thumbnail,
+                        label: "Before",
+                        dimsLabel: (sourceSrc?.pixelWidth ?? out.sourcePixelWidth) > 0
+                            ? "\(sourceSrc?.pixelWidth ?? out.sourcePixelWidth) × \(sourceSrc?.pixelHeight ?? out.sourcePixelHeight)"
+                            : "—",
+                        bytes: out.beforeBytes
+                    )
+                    Image(systemName: "arrow.right")
+                        .font(.title3)
+                        .foregroundStyle(.secondary)
+                    // After
+                    beforeAfterThumbCell(
+                        thumb: out.outputThumbnail,
+                        label: "After",
+                        dimsLabel: out.outputPixelWidth > 0
+                            ? "\(out.outputPixelWidth) × \(out.outputPixelHeight)"
+                            : "—",
+                        bytes: out.afterBytes
+                    )
+                    Spacer()
+                    deltaLabel(before: out.beforeBytes, after: out.afterBytes)
+                }
+                .padding(.bottom, 2)
             }
-            Spacer()
-            deltaLabel(before: out.beforeBytes, after: out.afterBytes)
-            Button { saveOutput(out) } label: {
-                Label("Save…", systemImage: "square.and.arrow.down")
-            }
-            .modifier(ImgPrimaryShortcut(isPrimary: isPrimary, key: "s"))
-            .help(isPrimary ? "Save… (⌘S)" : "Choose where to save this file.")
+            HStack(spacing: 10) {
+                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(out.outputURL.lastPathComponent)
+                        .font(.body).lineLimit(1)
+                    Text(out.outputURL.deletingLastPathComponent().path)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1).truncationMode(.middle)
+                }
+                Spacer()
+                if out.outputThumbnail == nil && out.sourcePixelWidth == 0 {
+                    // Show delta inline only if before/after panel isn't shown.
+                    deltaLabel(before: out.beforeBytes, after: out.afterBytes)
+                }
+                Button { saveOutput(out) } label: {
+                    Label("Save…", systemImage: "square.and.arrow.down")
+                }
+                .modifier(ImgPrimaryShortcut(isPrimary: isPrimary, key: "s"))
+                .help(isPrimary ? "Save… (⌘S)" : "Choose where to save this file.")
 
-            Menu {
-                Button { quickSaveToDownloads(out) } label: {
-                    Label("Save to Downloads", systemImage: "arrow.down.circle")
-                }
-                .modifier(ImgPrimaryShortcut(isPrimary: isPrimary, key: "d"))
-                Button { NSWorkspace.shared.activateFileViewerSelecting([out.outputURL]) } label: {
-                    Label("Reveal in Finder", systemImage: "magnifyingglass")
-                }
-                .modifier(ImgPrimaryShortcut(isPrimary: isPrimary, key: "r"))
-                Button {
-                    SharedStore.stage.addFile(out.outputURL)
-                    SharedStore.stage.flash("Sent \(out.outputURL.lastPathComponent) to Stage")
+                Menu {
+                    Button { quickSaveToDownloads(out) } label: {
+                        Label("Save to Downloads", systemImage: "arrow.down.circle")
+                    }
+                    .modifier(ImgPrimaryShortcut(isPrimary: isPrimary, key: "d"))
+                    Button { NSWorkspace.shared.activateFileViewerSelecting([out.outputURL]) } label: {
+                        Label("Reveal in Finder", systemImage: "magnifyingglass")
+                    }
+                    .modifier(ImgPrimaryShortcut(isPrimary: isPrimary, key: "r"))
+                    Button {
+                        SharedStore.stage.addFile(out.outputURL)
+                        SharedStore.stage.flash("Sent \(out.outputURL.lastPathComponent) to Stage")
+                    } label: {
+                        Label("Send to Stage", systemImage: "tray.and.arrow.down")
+                    }
+                    Divider()
+                    Button { copyOutputPath(out) } label: {
+                        Label("Copy Path", systemImage: "doc.on.doc")
+                    }
                 } label: {
-                    Label("Send to Stage", systemImage: "tray.and.arrow.down")
+                    Image(systemName: "ellipsis.circle")
                 }
-                Divider()
-                Button { copyOutputPath(out) } label: {
-                    Label("Copy Path", systemImage: "doc.on.doc")
-                }
-            } label: {
-                Image(systemName: "ellipsis.circle")
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("More actions")
             }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .help("More actions")
         }
         .padding(.vertical, 4)
         // The entire row is draggable — users can drag straight into Finder,
@@ -1373,6 +1539,43 @@ public struct ImageToolsView: View {
             Divider()
             Button { copyOutputPath(out) } label: { Label("Copy Path", systemImage: "doc.on.doc") }
         }
+    }
+
+    /// P1: before/after thumbnail cell used in the output row comparison panel.
+    @ViewBuilder
+    private func beforeAfterThumbCell(
+        thumb: NSImage?,
+        label: String,
+        dimsLabel: String,
+        bytes: Int64
+    ) -> some View {
+        VStack(alignment: .center, spacing: 4) {
+            ZStack {
+                if let t = thumb {
+                    Image(nsImage: t)
+                        .resizable()
+                        .interpolation(.medium)
+                        .scaledToFit()
+                        .padding(3)
+                } else {
+                    ProgressView().controlSize(.mini)
+                }
+            }
+            .frame(width: 96, height: 72)
+            .background(Color.troveBgElev, in: RoundedRectangle(cornerRadius: 6))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+
+            Text(label)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.secondary)
+            Text(dimsLabel)
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+            Text(bytes.human)
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.primary)
+        }
+        .frame(width: 96)
     }
 
     /// Save As… with NSSavePanel. Remembers the last-used directory so the
@@ -1524,7 +1727,7 @@ public struct ImageToolsView: View {
                 HStack {
                     Label("Skipped / errors", systemImage: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange)
-                        .font(.headline)
+                        .headerText()
                     Spacer()
                     Button("Dismiss") { m.failures.removeAll() }
                         .buttonStyle(.borderless)
@@ -1548,13 +1751,15 @@ public struct ImageToolsView: View {
     // Drop / file picker handlers
     // -------------------------------------------------------------------
 
-    /// red-team: the drop accepts everyday images, RAWs, and bare file URLs.
-    /// Computed so the list reflects whatever the current SDK supports.
-    private var dropAcceptedTypes: [UTType] {
+    /// P2: memoized at first use (process-lifetime constant — UTType registry
+    /// doesn't change at runtime). The previous computed property rebuilt the
+    /// array on every SwiftUI body evaluation.
+    private static let _dropAcceptedTypes: [UTType] = {
         var t: [UTType] = [UTType.image, UTType.fileURL]
         if let raw = UTType("public.camera-raw-image") { t.append(raw) }
         return t
-    }
+    }()
+    private var dropAcceptedTypes: [UTType] { Self._dropAcceptedTypes }
 
     private func handleDrop(_ providers: [NSItemProvider]) {
         var collected: [URL] = []
@@ -1684,9 +1889,10 @@ struct ImgToolsFormatRow: View {
             .padding(.horizontal, 10)
             .background(
                 RoundedRectangle(cornerRadius: 8)
+                    // P2: use color token instead of raw Color.gray
                     .fill(isSelected
                           ? AnyShapeStyle(Color.accentColor.opacity(0.10))
-                          : AnyShapeStyle(hover ? Color.gray.opacity(0.08) : Color.clear))
+                          : AnyShapeStyle(hover ? Color.troveFgMute.opacity(0.10) : Color.clear))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
@@ -1716,7 +1922,10 @@ struct ImgToolsFormatRow: View {
 struct ImgToolsSourceCard: View {
     let source: ImgToolsSource
     let onRemove: () -> Void
+    let onSetFormat: (ImgToolsFormat?) -> Void
+    let onSetDimension: (Int?) -> Void
     @State private var hover = false
+    @State private var showOverrides = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1746,7 +1955,8 @@ struct ImgToolsSourceCard: View {
                 }
                 .frame(maxWidth: .infinity)
                 .frame(height: 140)
-                .background(.quaternary.opacity(0.5),
+                // P2: use color token instead of raw .quaternary
+                .background(Color.troveBgElev,
                             in: RoundedRectangle(cornerRadius: 10))
                 .clipShape(RoundedRectangle(cornerRadius: 10))
 
@@ -1773,7 +1983,7 @@ struct ImgToolsSourceCard: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
-            VStack(alignment: .leading, spacing: 1) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(source.url.lastPathComponent)
                     .font(.caption.weight(.medium))
                     .lineLimit(1).truncationMode(.middle)
@@ -1786,6 +1996,94 @@ struct ImgToolsSourceCard: View {
                      : "\(source.formatLabel) · \(source.dimensionsLabel) · \(source.bytes.human)")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+
+                // P1: per-source override badges + expand toggle.
+                HStack(spacing: 4) {
+                    if let fmt = source.overrideFormat {
+                        Label(fmt.rawValue, systemImage: "wand.and.stars")
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(Color.troveAccent)
+                            .padding(.horizontal, 5).padding(.vertical, 2)
+                            .background(Color.troveAccent.opacity(0.12), in: Capsule())
+                    }
+                    if let dim = source.overrideDimension {
+                        Text("\(dim)px")
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(Color.troveAccent)
+                            .padding(.horizontal, 5).padding(.vertical, 2)
+                            .background(Color.troveAccent.opacity(0.12), in: Capsule())
+                    }
+                    Spacer()
+                    if !source.validating {
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.15)) { showOverrides.toggle() }
+                        } label: {
+                            Image(systemName: showOverrides ? "chevron.up" : "slider.horizontal.3")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Per-image overrides")
+                    }
+                }
+
+                // P1: expandable per-source override controls.
+                if showOverrides {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Divider()
+                        // Format override
+                        HStack(spacing: 4) {
+                            Text("Format").font(.caption2).foregroundStyle(.secondary)
+                                .frame(width: 46, alignment: .leading)
+                            Picker("", selection: Binding(
+                                get: { source.overrideFormat ?? .png },
+                                set: { onSetFormat($0) }
+                            )) {
+                                Text("—").tag(Optional<ImgToolsFormat>.none as ImgToolsFormat?)
+                                ForEach(ImgToolsFormat.allCases) { f in
+                                    Text(f.rawValue).tag(Optional(f))
+                                }
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+                            .font(.caption2)
+                            .frame(maxWidth: .infinity)
+                            if source.overrideFormat != nil {
+                                Button { onSetFormat(nil) } label: {
+                                    Image(systemName: "xmark").font(.caption2)
+                                }
+                                .buttonStyle(.plain).foregroundStyle(.secondary)
+                            }
+                        }
+                        // Dimension override
+                        HStack(spacing: 4) {
+                            Text("Max px").font(.caption2).foregroundStyle(.secondary)
+                                .frame(width: 46, alignment: .leading)
+                            Picker("", selection: Binding(
+                                get: { source.overrideDimension ?? 0 },
+                                set: { onSetDimension($0 == 0 ? nil : $0) }
+                            )) {
+                                Text("—").tag(0)
+                                Text("512").tag(512)
+                                Text("1024").tag(1024)
+                                Text("2048").tag(2048)
+                                Text("4096").tag(4096)
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+                            .font(.caption2)
+                            .frame(maxWidth: .infinity)
+                            if source.overrideDimension != nil {
+                                Button { onSetDimension(nil) } label: {
+                                    Image(systemName: "xmark").font(.caption2)
+                                }
+                                .buttonStyle(.plain).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .padding(.top, 2)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
             }
         }
         .onHover { hover = $0 }

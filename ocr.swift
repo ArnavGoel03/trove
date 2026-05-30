@@ -66,7 +66,11 @@ enum OCREngine {
     /// Returns `nil` only on truly catastrophic failure — an image with no text
     /// returns an empty recognition so the caller can show a friendly message
     /// (red-team #2).
-    static func recognize(_ image: NSImage) -> OCRRecognition? {
+    /// P1: `languageHint` is a BCP-47 tag (e.g. "zh-Hans"). When non-empty,
+    /// it is set as `recognitionLanguages` to guide Vision — useful for
+    /// non-Latin scripts where the automatic heuristic struggles. Passing ""
+    /// leaves the property at its default (Vision's own heuristic).
+    static func recognize(_ image: NSImage, languageHint: String = "") -> OCRRecognition? {
         guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             return nil
         }
@@ -86,6 +90,13 @@ enum OCREngine {
         // accuracy. Pin explicitly so OS upgrades don't silently change behavior.
         if VNRecognizeTextRequest.supportedRevisions.contains(VNRecognizeTextRequestRevision3) {
             request.revision = VNRecognizeTextRequestRevision3
+        }
+        // P1: apply language hint when the user has selected one. Setting
+        // recognitionLanguages to a single code dramatically improves accuracy
+        // for non-Latin scripts. When "" (Automatic), we leave the property
+        // unset so Vision uses its built-in heuristic.
+        if !languageHint.isEmpty {
+            request.recognitionLanguages = [languageHint]
         }
         // red-team: setting recognitionLanguages to *every* supported language
         // is actively harmful — Vision uses the list as a hint and degrades
@@ -288,10 +299,13 @@ enum OCRTargets {
     /// language globally). User can still pick whatever they want.
     static func smartDefault() -> OCRTargetLanguage {
         let sys = Locale.current.language.languageCode?.identifier ?? "en"
+        // P2 hardening: `all[0]` traps if the static list were ever emptied
+        // (test, refactor, locale regression). Use the safe English fallback.
+        let fallback = OCRTargetLanguage(code: "en", label: "English")
         if sys.hasPrefix("en") {
-            return all.first { $0.code == "es" } ?? all[0]
+            return all.first { $0.code == "es" } ?? all.first ?? fallback
         }
-        return all[0]
+        return all.first ?? fallback
     }
 
     /// Friendly name for an NLLanguage code, for the "Detected: Spanish" label.
@@ -426,30 +440,32 @@ enum OCRCapture {
         let url = dir.appendingPathComponent("ocr-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.prefix(6)).png")
 
         NSApp.hide(nil)
+        // P1: replace waitUntilExitOffMain with terminationHandler + continuation
+        // so we don't pin a GCD thread for the whole interactive screencapture
+        // session (which can last many seconds while the user selects a region).
         DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) {
-            // red-team: use `executableURL` (modern API since 10.13);
-            // `launchPath` was deprecated and emits warnings. Behavior is
-            // identical — Process resolves the URL to launch the binary.
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
             p.arguments = ["-i", url.path]
+
+            // Set up terminationHandler before run() so we never miss it.
+            p.terminationHandler = { _ in
+                DispatchQueue.main.async {
+                    NSApp.unhide(nil)
+                    NSApp.activate(ignoringOtherApps: true)
+                    InteractiveCaptureGate.release()
+                    if FileManager.default.fileExists(atPath: url.path) {
+                        completion(url)
+                    } else {
+                        // User pressed Esc, or the system declined for some reason.
+                        completion(nil)
+                    }
+                }
+            }
             do { try p.run() } catch {
                 DispatchQueue.main.async {
                     NSApp.unhide(nil)
                     InteractiveCaptureGate.release()
-                    completion(nil)
-                }
-                return
-            }
-            p.waitUntilExitOffMain()
-            DispatchQueue.main.async {
-                NSApp.unhide(nil)
-                NSApp.activate(ignoringOtherApps: true)
-                InteractiveCaptureGate.release()
-                if FileManager.default.fileExists(atPath: url.path) {
-                    completion(url)
-                } else {
-                    // User pressed Esc, or the system declined for some reason.
                     completion(nil)
                 }
             }
@@ -461,6 +477,35 @@ enum OCRCapture {
 // MARK: - View model
 // ===========================================================================
 
+// P1: Recognition language hint — user can tell Vision which language to
+// expect, improving accuracy for non-Latin scripts.
+struct OCRRecognitionLanguage: Hashable, Identifiable {
+    let code: String   // BCP-47 / ISO 639-1 as Vision expects
+    let label: String
+    var id: String { code }
+}
+
+enum OCRRecognitionLanguages {
+    /// "Automatic" means we leave recognitionLanguages unset (Vision's best heuristic).
+    static let automatic = OCRRecognitionLanguage(code: "", label: "Automatic")
+    static let all: [OCRRecognitionLanguage] = [
+        automatic,
+        .init(code: "en-US", label: "English"),
+        .init(code: "fr-FR", label: "French"),
+        .init(code: "de-DE", label: "German"),
+        .init(code: "es-ES", label: "Spanish"),
+        .init(code: "pt-BR", label: "Portuguese"),
+        .init(code: "it-IT", label: "Italian"),
+        .init(code: "zh-Hans", label: "Chinese (Simplified)"),
+        .init(code: "zh-Hant", label: "Chinese (Traditional)"),
+        .init(code: "ja-JP", label: "Japanese"),
+        .init(code: "ko-KR", label: "Korean"),
+        .init(code: "ar-SA", label: "Arabic"),
+        .init(code: "ru-RU", label: "Russian"),
+        .init(code: "hi-IN", label: "Hindi"),
+    ]
+}
+
 @MainActor
 final class OCRViewModel: ObservableObject {
     @Published var capturedImage: NSImage?
@@ -469,10 +514,25 @@ final class OCRViewModel: ObservableObject {
     @Published var working = false
     @Published var statusMessage: String?
 
-    @Published var translationTarget: OCRTargetLanguage = OCRTargets.smartDefault()
+    // P1 fix: persist translation target / opt-in / recognition language across
+    // launches. Previously these reset on every relaunch — OCR is a tool users
+    // return to with the same config (Spanish→English, force English recognition,
+    // etc.) and re-picking from a dropdown every time was the most-cited rough
+    // edge in the polish-pass audit. UserDefaults keys are namespaced under
+    // `trove.ocr.*` consistent with the rest of the persistence audit.
+    @Published var translationTarget: OCRTargetLanguage {
+        didSet { UserDefaults.standard.set(translationTarget.code, forKey: "trove.ocr.translationTargetCode") }
+    }
     @Published var translatedText: String = ""
-    @Published var wantsTranslation: Bool = false
+    @Published var wantsTranslation: Bool {
+        didSet { UserDefaults.standard.set(wantsTranslation, forKey: "trove.ocr.wantsTranslation") }
+    }
     @Published var translationConfigVersion: Int = 0   // bump to re-arm Translation session
+
+    // P1: recognition language hint for Vision.
+    @Published var recognitionLanguage: OCRRecognitionLanguage {
+        didSet { UserDefaults.standard.set(recognitionLanguage.code, forKey: "trove.ocr.recognitionLanguageCode") }
+    }
 
     let history = OCRHistoryStore()
 
@@ -484,6 +544,23 @@ final class OCRViewModel: ObservableObject {
     }
 
     init() {
+        // Restore persisted prefs before any view binds to them so the first
+        // render reflects the user's last config. UserDefaults reads are cheap.
+        let d = UserDefaults.standard
+        if let tCode = d.string(forKey: "trove.ocr.translationTargetCode"),
+           let t = OCRTargets.all.first(where: { $0.code == tCode }) {
+            self.translationTarget = t
+        } else {
+            self.translationTarget = OCRTargets.smartDefault()
+        }
+        self.wantsTranslation = d.bool(forKey: "trove.ocr.wantsTranslation")
+        if let rCode = d.string(forKey: "trove.ocr.recognitionLanguageCode"),
+           let r = OCRRecognitionLanguages.all.first(where: { $0.code == rCode }) {
+            self.recognitionLanguage = r
+        } else {
+            self.recognitionLanguage = OCRRecognitionLanguages.automatic
+        }
+
         // red-team: if the user is currently viewing the entry that's about
         // to be evicted (either by overflow or manual remove), wipe the main
         // pane back to empty state before the file disappears, so we never
@@ -542,6 +619,8 @@ final class OCRViewModel: ObservableObject {
     func runRecognition(url: URL) async {
         working = true
         defer { working = false }
+        // Snapshot the language hint on main before going off-main.
+        let langHint = recognitionLanguage.code
         // speed: decode a small preview thumb on a background thread and push
         // it to the UI before Vision finishes. The preview frame tops out at
         // ~380 pt; 1024 px gives crisp @2x display without paying for a
@@ -555,7 +634,8 @@ final class OCRViewModel: ObservableObject {
         // keeps the full bitmap out of MainActor memory until Vision needs it.
         let recognizeTask = Task.detached(priority: .userInitiated) { () -> OCRRecognition? in
             guard let img = NSImage(contentsOf: url) else { return nil }
-            return OCREngine.recognize(img)
+            // P1: pass language hint to Vision for improved accuracy.
+            return OCREngine.recognize(img, languageHint: langHint)
         }
         if let preview = await previewTask.value {
             self.capturedImage = preview
@@ -727,7 +807,7 @@ public struct OCRView: View {
         Card {
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    Text("Result").font(.headline)
+                    Text("Result").headerText()
                     Spacer()
                     if vm.working {
                         ProgressView().controlSize(.small)
@@ -859,7 +939,33 @@ public struct OCRView: View {
     @ViewBuilder private var actionsCard: some View {
         Card {
             VStack(alignment: .leading, spacing: 14) {
-                if #available(macOS 14, *) {
+                // P1: language hint picker — shown on all macOS versions.
+                HStack(spacing: 10) {
+                    Text("Language hint").font(.callout.weight(.medium))
+                    Picker("", selection: $vm.recognitionLanguage) {
+                        ForEach(OCRRecognitionLanguages.all) { lang in
+                            Text(lang.label).tag(lang)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .frame(maxWidth: 220)
+                    .onChange(of: vm.recognitionLanguage) { _ in
+                        // Re-run recognition on the current capture with the new hint.
+                        if let url = vm.capturedURL {
+                            vm.working = true
+                            Task { await vm.runRecognition(url: url) }
+                        }
+                    }
+                    Spacer()
+                }
+
+                Divider()
+
+                // P1: Translation toggle — only available macOS 15+ (Apple
+                // Translation framework). On macOS 13/14 hide it entirely
+                // so the UI doesn't show an unavailable feature at all.
+                // (Previously it showed on macOS 13 as a disabled label.)
+                if #available(macOS 15.0, *) {
                     HStack(spacing: 12) {
                         Toggle(isOn: $vm.wantsTranslation) {
                             Label("Translate to", systemImage: "character.bubble")
@@ -884,13 +990,10 @@ public struct OCRView: View {
                         }
                         Spacer()
                     }
-                } else {
-                    HStack(spacing: 12) {
-                        Label("Translate requires macOS 14+", systemImage: "character.bubble")
-                            .font(.callout).foregroundStyle(.secondary)
-                        Spacer()
-                    }
                 }
+                // macOS 14 has the Translation framework but only from macOS 15
+                // is .translationTask available in SwiftUI; skip silently on 14
+                // (our OCRTranslationModifier already requires macOS 15).
 
                 Divider()
 
@@ -1212,7 +1315,7 @@ public struct OCRView: View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text("Recent captures").font(.headline)
+                    Text("Recent captures").headerText()
                     Spacer()
                     if !vm.history.entries.isEmpty {
                         Text("\(vm.history.entries.count) of \(OCRHistoryStore.maxEntries)")
@@ -1297,7 +1400,9 @@ private struct OCRHistoryThumb: View {
                             .foregroundStyle(.white, Color.black.opacity(0.55))
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("Clear search")
+                    // P1: was "Clear search" — incorrect. This removes a capture
+                    // from the history strip, not a search query.
+                    .accessibilityLabel("Remove capture")
                     .padding(4)
                 }
             }

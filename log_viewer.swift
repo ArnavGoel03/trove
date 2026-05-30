@@ -883,17 +883,33 @@ public struct LogViewerView: View {
 
     public init() {}
 
-    // Filter state.
-    @State private var mode: LogMode = .show
-    @State private var timeRange: LogTimeRange = .h1
+    // Filter state — persisted via @AppStorage so they survive navigation.
+    @AppStorage("log.mode")           private var modeRaw: String = LogMode.show.rawValue
+    @AppStorage("log.timeRange")      private var timeRangeRaw: String = LogTimeRange.h1.rawValue
+    @AppStorage("log.levelSel")       private var levelSelRaw: String = LogLevelChoice.all.label
+    @AppStorage("log.subsystem")      private var subsystem: String = ""
+    @AppStorage("log.process")        private var process: String = ""
+    @AppStorage("log.contains")       private var contains: String = ""
+    @AppStorage("log.includeInfoDebug") private var includeInfoDebug: Bool = false
+    @AppStorage("log.autoScroll")     private var autoScroll: Bool = true
+    @AppStorage("log.relativeTime")   private var relativeTime: Bool = false
+
+    private var mode: LogMode {
+        get { LogMode(rawValue: modeRaw) ?? .show }
+        nonmutating set { modeRaw = newValue.rawValue }
+    }
+    private var timeRange: LogTimeRange {
+        get { LogTimeRange(rawValue: timeRangeRaw) ?? .h1 }
+        nonmutating set { timeRangeRaw = newValue.rawValue }
+    }
+    // levelSel is stored by label string so it round-trips cleanly.
+    private var levelSel: LogLevelChoice {
+        get { LogLevelChoice.allCases.first { $0.label == levelSelRaw } ?? .all }
+        nonmutating set { levelSelRaw = newValue.label }
+    }
+
     @State private var startDate: Date = Date().addingTimeInterval(-3600)
     @State private var endDate: Date = Date()
-    @State private var levelSel: LogLevelChoice = .all
-    @State private var subsystem: String = ""
-    @State private var process: String = ""
-    @State private var contains: String = ""
-    @State private var includeInfoDebug: Bool = false
-    @State private var autoScroll: Bool = true
 
     // Result UI state.
     @State private var expanded: Set<UUID> = []
@@ -904,22 +920,24 @@ public struct LogViewerView: View {
     public var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                LogFilterCard(mode: $mode,
-                              timeRange: $timeRange,
+                LogFilterCard(mode: Binding(get: { mode }, set: { mode = $0 }),
+                              timeRange: Binding(get: { timeRange }, set: { timeRange = $0 }),
                               startDate: $startDate,
                               endDate: $endDate,
-                              levelSel: $levelSel,
+                              levelSel: Binding(get: { levelSel }, set: { levelSel = $0 }),
                               subsystem: $subsystem,
                               process: $process,
                               contains: $contains,
                               includeInfoDebug: $includeInfoDebug,
-                              autoScroll: $autoScroll)
+                              autoScroll: $autoScroll,
+                              relativeTime: $relativeTime)
 
                 LogPresetsCard(apply: applyPreset)
 
                 LogResultsCard(runner: runner,
                                expanded: $expanded,
                                autoScroll: $autoScroll,
+                               relativeTime: relativeTime,
                                isStreaming: mode == .stream && runner.isRunning)
             }
             .padding(16)
@@ -1232,6 +1250,7 @@ struct LogFilterCard: View {
     @Binding var contains: String
     @Binding var includeInfoDebug: Bool
     @Binding var autoScroll: Bool
+    @Binding var relativeTime: Bool
 
     var body: some View {
         Card {
@@ -1316,6 +1335,9 @@ struct LogFilterCard: View {
                         Toggle("Auto-scroll", isOn: $autoScroll)
                             .toggleStyle(.switch)
                     }
+                    Toggle("Relative time", isOn: $relativeTime)
+                        .toggleStyle(.switch)
+                        .help("Show HH:mm:ss.SSS (relative) instead of full date-time in each row.")
                     Spacer()
                 }
             }
@@ -1384,6 +1406,7 @@ struct LogResultsCard: View {
     @ObservedObject var runner: LogRunner
     @Binding var expanded: Set<UUID>
     @Binding var autoScroll: Bool
+    let relativeTime: Bool
     let isStreaming: Bool
     // Fix 25: gate auto-scroll animation on reduceMotion.
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -1412,6 +1435,7 @@ struct LogResultsCard: View {
                                 ForEach(runner.entries) { e in
                                     LogRow(entry: e,
                                            expanded: expanded.contains(e.id),
+                                           relativeTime: relativeTime,
                                            toggle: { toggle(e.id) })
                                         .id(e.id)
                                     Divider().opacity(0.4)
@@ -1419,7 +1443,7 @@ struct LogResultsCard: View {
                             }
                             .padding(.vertical, 2)
                         }
-                        .frame(minHeight: 320, maxHeight: 560)
+                        .frame(minHeight: 320, maxHeight: .infinity)
                         .background(Color.troveCardSolid.opacity(0.6),
                                     in: RoundedRectangle(cornerRadius: 8))
                         .overlay(
@@ -1427,6 +1451,14 @@ struct LogResultsCard: View {
                                 .strokeBorder(.separator.opacity(0.4), lineWidth: 0.5)
                         )
                         .onChange(of: runner.entries.count) { _ in
+                            // Evict expanded IDs that are no longer in the buffer
+                            // (FIFO eviction in stream mode shrinks the array from
+                            // the front; stale UUIDs in `expanded` would accumulate
+                            // unboundedly otherwise).
+                            if isStreaming && !expanded.isEmpty {
+                                let live = Set(runner.entries.map(\.id))
+                                expanded = expanded.intersection(live)
+                            }
                             if isStreaming && autoScroll,
                                let last = runner.entries.last?.id {
                                 // Fix 25: skip animation when reduceMotion is set.
@@ -1475,6 +1507,7 @@ struct LogEmptyState: View {
 struct LogRow: View {
     let entry: LogEntry
     let expanded: Bool
+    let relativeTime: Bool
     let toggle: () -> Void
 
     var body: some View {
@@ -1484,10 +1517,12 @@ struct LogRow: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .frame(width: 10)
-                Text(LogFormatters.hms.string(from: entry.timestamp))
+                Text(relativeTime
+                     ? LogFormatters.hms.string(from: entry.timestamp)
+                     : LogFormatters.full.string(from: entry.timestamp))
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(.secondary)
-                    .frame(width: 92, alignment: .leading)
+                    .frame(width: relativeTime ? 92 : 160, alignment: .leading)
                 Text(processLabel)
                     .font(.system(.caption, design: .monospaced))
                     .lineLimit(1)
@@ -1559,19 +1594,34 @@ struct LogRow: View {
 
 struct LogLevelPill: View {
     let level: LogLevel
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     var body: some View {
+        let tint = levelToken
         Text(level.label.uppercased())
             .font(.system(.caption2, design: .monospaced).weight(.semibold))
             .padding(.horizontal, 5)
             .padding(.vertical, 1)
-            .foregroundStyle(level.tint)
-            .background(level.tint.opacity(0.12),
-                        in: RoundedRectangle(cornerRadius: 3))
+            .foregroundStyle(tint)
+            .background(
+                reduceTransparency
+                    ? AnyShapeStyle(Color.troveCardSolid)
+                    : AnyShapeStyle(tint.opacity(0.12)),
+                in: RoundedRectangle(cornerRadius: 3))
             .overlay(
                 RoundedRectangle(cornerRadius: 3)
-                    .strokeBorder(level.tint.opacity(0.35), lineWidth: 0.5)
+                    .strokeBorder(tint.opacity(0.35), lineWidth: 0.5)
             )
             .frame(width: 56, alignment: .leading)
+    }
+
+    private var levelToken: Color {
+        switch level {
+        case .fault:   return .troveError
+        case .error:   return .troveWarning
+        case .info:    return .troveAccent
+        case .debug:   return .troveFgMute
+        case .default: return .troveFgDim
+        }
     }
 }
 
@@ -1628,6 +1678,44 @@ final class LogExportControllerState: @unchecked Sendable {
         let p = proc
         os_unfair_lock_unlock(&lock)
         if let p = p, p.isRunning { p.terminate() }
+    }
+}
+
+/// Internal shim that re-exposes `LogRunner.parseLine` for use by save helpers
+/// without breaking its `private` encapsulation inside `LogRunner`. The
+/// function body is a direct copy of the private method; keeping it here means
+/// `LogRunner` stays unchanged and this file still compiles as one module.
+private enum LogRunnerLineParser {
+    private static let isoFmt: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+
+    static func parseLine(_ line: String) -> LogEntry? {
+        guard line.first == "{" else { return nil }
+        guard let data = line.data(using: .utf8) else { return nil }
+        guard let any = try? JSONSerialization.jsonObject(with: data),
+              let obj = any as? [String: Any] else { return nil }
+        let msg = (obj["eventMessage"] as? String) ?? ""
+        let subsystem = (obj["subsystem"] as? String) ?? ""
+        let category = (obj["category"] as? String) ?? ""
+        let process = (obj["processImagePath"] as? String).map { ($0 as NSString).lastPathComponent }
+            ?? (obj["process"] as? String) ?? ""
+        let pid = (obj["processID"] as? Int) ?? (obj["processIdentifier"] as? Int) ?? 0
+        let level = LogLevel.parse(obj["messageType"])
+        var ts = Date()
+        if let s = obj["timestamp"] as? String {
+            if let d = isoFmt.date(from: s) {
+                ts = d
+            } else {
+                let alt = ISO8601DateFormatter()
+                alt.formatOptions = [.withInternetDateTime]
+                if let d = alt.date(from: s) { ts = d }
+            }
+        }
+        return LogEntry(timestamp: ts, level: level, process: process, pid: pid,
+                        subsystem: subsystem, category: category, message: msg)
     }
 }
 
@@ -1772,8 +1860,96 @@ enum LogSaveHelpers {
                     }
                     return
                 }
-                let data = outPipe.fileHandleForReading.readDataToEndOfFile()
-                _ = errPipe.fileHandleForReading.readDataToEndOfFile()
+
+                // ---- STREAMING line-by-line write to avoid OOM ----
+                // Previously: readDataToEndOfFile() into one Data blob, parse,
+                // build String, write. On a broad filter this could load hundreds
+                // of MB into RAM before a single byte hit disk.
+                // Now: open the destination file for writing, drain stdout via a
+                // readabilityHandler, parse each line as it arrives, and write the
+                // plain-text form immediately so the RAM footprint is O(1 line).
+                // Stderr is drained concurrently to prevent child-process deadlock.
+                let errFH = errPipe.fileHandleForReading
+                errFH.readabilityHandler = { h in
+                    let d = h.availableData
+                    if d.isEmpty { h.readabilityHandler = nil }
+                    // discard
+                }
+
+                // Build the header comment block and write it first.
+                let headerFmt = DateFormatter()
+                headerFmt.dateFormat = "yyyy-MM-dd HH:mm:ss"
+                headerFmt.locale = Locale(identifier: "en_US_POSIX")
+                var headerLines: [String] = [
+                    "# Trove — Console export",
+                    "# Exported: \(headerFmt.string(from: Date()))",
+                ]
+                if !predicateLabel.isEmpty { headerLines.append("# Filter: \(predicateLabel)") }
+                if !rangeLabel.isEmpty { headerLines.append("# Range: \(rangeLabel)") }
+                // row count will be appended at the end once we know it
+                let headerPrefix = headerLines.joined(separator: "\n") + "\n"
+
+                // Open dest for writing.
+                guard let destStream = OutputStream(url: dest, append: false) else {
+                    DispatchQueue.main.async {
+                        SharedStore.stage.flash("Couldn't open export file for writing.")
+                    }
+                    return
+                }
+                destStream.open()
+                defer { destStream.close() }
+
+                // Write a helper that flushes a String as UTF-8.
+                func writeStr(_ s: String) {
+                    var bytes = Array(s.utf8)
+                    destStream.write(&bytes, maxLength: bytes.count)
+                }
+                writeStr(headerPrefix)
+
+                let outFH = outPipe.fileHandleForReading
+                var lineBuffer = Data()
+                var rowCount = 0
+
+                // Drain loop: process each newline-delimited chunk synchronously
+                // so we never buffer more than a few KB of partial-line state.
+                var eof = false
+                while !eof {
+                    if controller.isCancelled() { break }
+                    let chunk = outFH.availableData
+                    if chunk.isEmpty {
+                        // EOF (process exited and pipe was drained).
+                        eof = true
+                    } else {
+                        lineBuffer.append(chunk)
+                    }
+                    // Process all complete lines in lineBuffer.
+                    while let nlIdx = lineBuffer.firstIndex(of: 0x0A) {
+                        let lineLen = lineBuffer.distance(from: lineBuffer.startIndex, to: nlIdx)
+                        if lineLen > 0 && lineLen <= LogRunner.maxLineBytes {
+                            let lineData = lineBuffer[lineBuffer.startIndex..<nlIdx]
+                            if let s = String(data: lineData, encoding: .utf8),
+                               let entry = LogRunnerLineParser.parseLine(s) {
+                                writeStr(entry.plainText() + "\n")
+                                rowCount += 1
+                            }
+                        }
+                        lineBuffer.removeSubrange(lineBuffer.startIndex...nlIdx)
+                        // Bound leftover buffer against runaway no-newline output.
+                        if lineBuffer.count > LogRunner.maxStreamBufferBytes {
+                            lineBuffer.removeAll(keepingCapacity: false)
+                        }
+                    }
+                }
+                // Handle any final partial line (shouldn't exist with ndjson, but be safe).
+                if !lineBuffer.isEmpty && lineBuffer.count <= LogRunner.maxLineBytes {
+                    if let s = String(data: lineBuffer, encoding: .utf8),
+                       let entry = LogRunnerLineParser.parseLine(s) {
+                        writeStr(entry.plainText() + "\n")
+                        rowCount += 1
+                    }
+                }
+
+                errFH.readabilityHandler = nil
                 p.waitUntilExitOffMain()
 
                 if controller.isCancelled() {
@@ -1783,22 +1959,14 @@ enum LogSaveHelpers {
                     return
                 }
 
-                // Reuse LogRunner's bulk parser — it returns LogEntry rows.
-                // We pass a generous cap; it's the "no UI cap" path.
-                let (rows, _) = LogRunner.parseNDJSON(data, max: Int.max)
-                let blob = body(entries: rows,
-                                predicate: predicateLabel,
-                                rangeLabel: rangeLabel)
-                do {
-                    try blob.data(using: .utf8)?.write(to: dest, options: .atomic)
-                    DispatchQueue.main.async {
-                        NSWorkspace.shared.activateFileViewerSelecting([dest])
-                        SharedStore.stage.flash("Saved \(rows.count) line\(rows.count == 1 ? "" : "s") to \(dest.lastPathComponent)")
-                    }
-                } catch {
-                    DispatchQueue.main.async {
-                        SharedStore.stage.flash("Couldn't save export: \(error.localizedDescription)")
-                    }
+                // Append the row count trailer.
+                writeStr("# Rows: \(rowCount)\n")
+
+                let savedCount = rowCount
+                let savedName = dest.lastPathComponent
+                DispatchQueue.main.async {
+                    NSWorkspace.shared.activateFileViewerSelecting([dest])
+                    SharedStore.stage.flash("Saved \(savedCount) line\(savedCount == 1 ? "" : "s") to \(savedName)")
                 }
             }
         }

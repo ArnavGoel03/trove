@@ -19,6 +19,7 @@ import Carbon
 import ApplicationServices
 import Foundation
 import CoreGraphics
+import ScreenCaptureKit
 
 // ===========================================================================
 // MARK: - Persisted prefs
@@ -28,6 +29,7 @@ fileprivate enum AltTabKeys {
     static let enabled        = "alttab.enabled"
     static let hotkeyMods     = "alttab.hotkey.mods"   // Carbon modifier mask
     static let hotkeyKey      = "alttab.hotkey.key"    // Carbon keycode
+    static let hotkeyIsCustom = "alttab.hotkey.isCustom" // true when user picked Custom
     static let crossSpace     = "alttab.crossSpace"
     static let includeHidden  = "alttab.includeHidden"
     static let colorCode      = "alttab.colorCode"
@@ -421,6 +423,7 @@ fileprivate final class AltTabOverlayController: NSObject, NSWindowDelegate {
     private var hosting: NSHostingController<AltTabOverlayHost>?
     private let state = AltTabOverlayState()
     private var localKeyMonitor: Any?
+    private var globalKeyMonitor: Any?
     private var isShowing: Bool = false
 
     // red-team: hide the overlay when the screen topology changes — if the
@@ -482,12 +485,18 @@ fileprivate final class AltTabOverlayController: NSObject, NSWindowDelegate {
         if AltTabAX.raise(window: item) {
             AltTabRecency.shared.touch(item.id)
         } else {
-            // Fix 18: if AX is not trusted, flash a warning toast with an action
-            // button — do NOT auto-open TCC settings unprompted (drive-by pop).
-            if !AltTabAX.isTrusted() {
-                Task { @MainActor in
+            // raise() returned false — window matching failed or AX is not trusted.
+            // Flash a toast with a useful action rather than silently swallowing.
+            Task { @MainActor in
+                if !AltTabAX.isTrusted() {
                     SharedStore.stage.flash(
                         "AltTab needs Accessibility — grant it in System Settings",
+                        kind: .warning,
+                        actionLabel: "Open Settings"
+                    ) { TCCDeepLink.accessibility.open() }
+                } else {
+                    SharedStore.stage.flash(
+                        "Couldn't bring \"\(item.displayTitle)\" to front — the window may have closed",
                         kind: .warning
                     )
                 }
@@ -524,18 +533,29 @@ fileprivate final class AltTabOverlayController: NSObject, NSWindowDelegate {
     // Local monitor while panel is up: lets us catch Tab/arrow keys even though
     // the panel is non-activating. We also forward typing to the search field.
     private func installKeyMonitor() {
-        if localKeyMonitor != nil { return }
-        localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) {
-            [weak self] ev in
-            guard let self = self, self.panel?.isVisible == true else { return ev }
-            return self.state.handle(event: ev) ? nil : ev
+        if localKeyMonitor == nil {
+            localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) {
+                [weak self] ev in
+                guard let self = self, self.panel?.isVisible == true else { return ev }
+                return self.state.handle(event: ev) ? nil : ev
+            }
         }
-        // Global monitor too — for when our panel isn't key (it usually isn't).
-        // We re-use the same handler via NSEvent.addGlobalMonitor; it only fires
-        // for events outside our app, which is exactly the AltTab case.
+        // Global monitor fires for events routed to OTHER apps — exactly the
+        // AltTab case (panel is non-activating so keystrokes still go to the
+        // previous app). The global monitor can't swallow events (API limitation),
+        // but it lets us close the overlay when e.g. the user presses Escape
+        // while another app technically has focus.
+        if globalKeyMonitor == nil {
+            globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .flagsChanged]) {
+                [weak self] ev in
+                guard let self = self, self.panel?.isVisible == true else { return }
+                _ = self.state.handle(event: ev)
+            }
+        }
     }
     private func removeKeyMonitor() {
-        if let m = localKeyMonitor { NSEvent.removeMonitor(m); localKeyMonitor = nil }
+        if let m = localKeyMonitor  { NSEvent.removeMonitor(m); localKeyMonitor  = nil }
+        if let m = globalKeyMonitor { NSEvent.removeMonitor(m); globalKeyMonitor = nil }
     }
 }
 
@@ -658,7 +678,7 @@ fileprivate struct AltTabOverlayHost: View {
                             Text(state.items.isEmpty
                                  ? "No other apps with switchable windows"
                                  : "No windows match \"\(state.filter)\"")
-                                .font(.headline)
+                                .headerText()
                             Text(state.items.isEmpty
                                  ? "Open another regular-window app and reopen the switcher."
                                  : "Press Delete to edit the filter, or Esc to cancel.")
@@ -699,11 +719,12 @@ fileprivate struct AltTabOverlayHost: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
-                // Fix 24: solid fill when Reduce Transparency is enabled.
-                .fill(reduceTransparency ? AnyShapeStyle(Color.black.opacity(0.9)) : AnyShapeStyle(.ultraThinMaterial))
+                // Use troveBg token (not raw black) for Reduce Transparency fallback.
+                .fill(reduceTransparency ? AnyShapeStyle(Color.troveBg) : AnyShapeStyle(.ultraThinMaterial))
                 .overlay(
                     RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .strokeBorder(.white.opacity(0.08), lineWidth: 0.5)
+                        // Use troveCardStroke token instead of raw white.opacity(0.08).
+                        .strokeBorder(Color.troveCardStroke, lineWidth: 0.5)
                 )
         )
         .padding(8)
@@ -767,17 +788,44 @@ fileprivate struct AltTabTile: View {
     }
 
     private func loadThumb() {
-        // Note: CGWindowListCreateImage was made unavailable in the current
-        // macOS SDK in favor of ScreenCaptureKit. Capturing per-window
-        // thumbnails via SCK requires permission + an async stream, which is
-        // a larger change. For now we fall back to the app icon (already
-        // shown as an overlay), keeping the switcher functional without
-        // thumbnails. Migration to SCK is a TODO.
+        // Check cache first (max age 1 s — overlay is transient).
         if let cached = AltTabThumbCache.shared.get(item.id) {
             self.thumb = cached
             return
         }
-        // No-op; the parent view renders the app icon when thumb is nil.
+        // Use ScreenCaptureKit (macOS 14+) off-main.
+        // Gate on Screen Recording permission before attempting capture —
+        // CGPreflightScreenCaptureAccess() is non-prompting; the full
+        // SCContentSharingSetting prompt only fires when the user explicitly
+        // grants via the permission card below, not on every tile appear.
+        guard CGPreflightScreenCaptureAccess() else { return }
+        let windowID = item.id
+        Task.detached(priority: .utility) {
+            guard #available(macOS 14.0, *) else { return }
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(
+                    false, onScreenWindowsOnly: false)
+                guard let scw = content.windows.first(where: { $0.windowID == windowID })
+                else { return }
+                let filter = SCContentFilter(desktopIndependentWindow: scw)
+                let cfg = SCStreamConfiguration()
+                cfg.width  = Int(min(scw.frame.width,  360))
+                cfg.height = Int(min(scw.frame.height, 240))
+                cfg.scalesToFit = true
+                cfg.showsCursor = false
+                let cgImage = try await SCScreenshotManager.captureImage(
+                    contentFilter: filter, configuration: cfg)
+                let img = NSImage(cgImage: cgImage,
+                                  size: NSSize(width: cgImage.width, height: cgImage.height))
+                AltTabThumbCache.shared.put(windowID, img)
+                await MainActor.run {
+                    self.thumb = img
+                }
+            } catch {
+                // Capture failed (permission revoked, window gone, etc.) — leave
+                // thumb nil so the tile falls back to the app-icon overlay.
+            }
+        }
     }
 }
 
@@ -816,6 +864,12 @@ fileprivate final class AltTabEngine: ObservableObject {
 
     @Published var statusLine: String = ""
     @Published var hotkeyOK: Bool = true
+    @Published var isCustomHotkey: Bool {
+        didSet {
+            UserDefaults.standard.set(isCustomHotkey, forKey: AltTabKeys.hotkeyIsCustom)
+            if enabled { apply() }
+        }
+    }
 
     init() {
         let d = UserDefaults.standard
@@ -823,6 +877,7 @@ fileprivate final class AltTabEngine: ObservableObject {
         let mods           = d.object(forKey: AltTabKeys.hotkeyMods) as? Int ?? Int(optionKey)
         let kc             = d.object(forKey: AltTabKeys.hotkeyKey)  as? Int ?? kVK_Tab
         self.hotkey        = AltTabHotkey(modifiers: UInt32(mods), keyCode: UInt32(kc))
+        self.isCustomHotkey = (d.object(forKey: AltTabKeys.hotkeyIsCustom) as? Bool) ?? false
         self.crossSpace    = (d.object(forKey: AltTabKeys.crossSpace)    as? Bool) ?? true
         self.includeHidden = (d.object(forKey: AltTabKeys.includeHidden) as? Bool) ?? false
         self.colorCode     = (d.object(forKey: AltTabKeys.colorCode)     as? Bool) ?? true
@@ -871,12 +926,155 @@ fileprivate final class AltTabEngine: ObservableObject {
 }
 
 // ===========================================================================
+// MARK: - Hotkey card with per-option recorder (reuses HotkeyRecorderHost)
+// ===========================================================================
+
+/// Separated into its own struct so @State for the recorder lives here and
+/// doesn't force AltTabView to be regenerated on recording toggle.
+fileprivate struct AltTabHotkeyCard: View {
+    @ObservedObject var engine: AltTabEngine
+    @State private var recording = false
+
+    var body: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Hotkey", systemImage: "command")
+                    .headerText()
+
+                // Preset options
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach([
+                        (AltTabHotkey.optionTab,   "Option + Tab  (⌥⇥)"),
+                        (AltTabHotkey.controlTab,  "Control + Tab  (⌃⇥)"),
+                        (AltTabHotkey.commandTab,  "Command + Tab  (⌘⇥) — reserved by macOS"),
+                    ], id: \.0) { (hk, label) in
+                        HStack(spacing: 8) {
+                            Image(systemName: !engine.isCustomHotkey && engine.hotkey == hk
+                                  ? "largecircle.fill.circle" : "circle")
+                                .foregroundStyle(!engine.isCustomHotkey && engine.hotkey == hk
+                                                 ? Color.accentColor : .secondary)
+                            Text(label).font(.body)
+                            Spacer()
+                        }
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            engine.isCustomHotkey = false
+                            engine.hotkey = hk
+                            recording = false
+                        }
+                    }
+
+                    // Custom option row
+                    HStack(spacing: 8) {
+                        Image(systemName: engine.isCustomHotkey ? "largecircle.fill.circle" : "circle")
+                            .foregroundStyle(engine.isCustomHotkey ? Color.accentColor : .secondary)
+                        Text("Custom…").font(.body)
+                        if engine.isCustomHotkey {
+                            Button {
+                                recording.toggle()
+                            } label: {
+                                Text(recording ? "Press keys…" : engine.hotkey.label)
+                                    .font(.system(.body, design: .monospaced))
+                                    .frame(minWidth: 80)
+                                    .padding(.horizontal, 10).padding(.vertical, 3)
+                                    // P2: use troveCardFill token instead of raw secondary.opacity
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 6)
+                                            .fill(recording
+                                                  ? Color.troveAccent.opacity(0.25)
+                                                  : Color.troveCardFill)
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                            .help("Click, then press your desired modifier + key combination")
+                        }
+                        Spacer()
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        engine.isCustomHotkey = true
+                        recording = true
+                    }
+                }
+
+                if engine.hotkey == .commandTab && !engine.isCustomHotkey {
+                    Label("⌘⇥ is reserved by macOS for the app switcher and won't be delivered to Trove. Pick another.",
+                          systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                        .font(.callout)
+                }
+            }
+        }
+        // Reuse HotkeyRecorderHost from global_hotkeys.swift.
+        .background(AltTabHotkeyRecorder(active: $recording) { event in
+            let flags = event.modifierFlags
+            var mods: UInt32 = 0
+            if flags.contains(.command) { mods |= UInt32(cmdKey) }
+            if flags.contains(.option)  { mods |= UInt32(optionKey) }
+            if flags.contains(.control) { mods |= UInt32(controlKey) }
+            if flags.contains(.shift)   { mods |= UInt32(shiftKey) }
+            // Require at least one non-shift modifier.
+            guard mods & ~UInt32(shiftKey) != 0 else { return }
+            engine.hotkey = AltTabHotkey(modifiers: mods, keyCode: UInt32(event.keyCode))
+            engine.isCustomHotkey = true
+            recording = false
+        })
+    }
+}
+
+/// Minimal key recorder that wraps an NSView local monitor. Shares the same
+/// pattern as HotkeyRecorderHost in global_hotkeys.swift but is fileprivate
+/// to avoid redefining the shared struct.
+fileprivate struct AltTabHotkeyRecorder: NSViewRepresentable {
+    @Binding var active: Bool
+    let onCapture: (NSEvent) -> Void
+
+    final class Coord {
+        var monitor: Any?
+        var onCapture: ((NSEvent) -> Void)?
+    }
+
+    func makeCoordinator() -> Coord {
+        let c = Coord(); c.onCapture = onCapture; return c
+    }
+    func makeNSView(context: Context) -> NSView { NSView() }
+    func updateNSView(_ nsView: NSView, context: Context) {
+        let c = context.coordinator
+        c.onCapture = onCapture
+        if active && c.monitor == nil {
+            c.monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { ev in
+                if ev.keyCode == UInt16(kVK_Escape)
+                    && ev.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty {
+                    if let m = c.monitor { NSEvent.removeMonitor(m); c.monitor = nil }
+                    DispatchQueue.main.async { active = false }
+                    return nil
+                }
+                c.onCapture?(ev)
+                return nil
+            }
+        } else if !active, let m = c.monitor {
+            NSEvent.removeMonitor(m); c.monitor = nil
+        }
+    }
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coord) {
+        if let m = coordinator.monitor { NSEvent.removeMonitor(m); coordinator.monitor = nil }
+    }
+}
+
+// ===========================================================================
 // MARK: - SwiftUI surface (settings pane)
 // ===========================================================================
 
 public struct AltTabView: View {
     @StateObject private var engine = AltTabEngine.shared
     @State private var axTrusted: Bool = AltTabAX.isTrusted()
+    // P1 fix (DEVELOP_RULES §1): the @State default expression runs synchronously
+    // on the main thread during view construction. `CGPreflightScreenCaptureAccess()`
+    // reads the TCC database — on a cold tccd (first call after sleep / a slow
+    // SSD) it can take 50–200 ms, the exact AttributeGraph watchdog window that
+    // caused the AccountView SIGTRAP. Seed with `false`; refresh in `.task` and
+    // again whenever the app becomes active (wiring below already does both).
+    @State private var screenRecordingAllowed: Bool = false
 
     public init() {}
 
@@ -884,6 +1082,7 @@ public struct AltTabView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 if !axTrusted { accessibilityCard }
+                if !screenRecordingAllowed { screenRecordingCard }
                 enableCard
                 hotkeyCard
                 behaviorCard
@@ -914,28 +1113,59 @@ public struct AltTabView: View {
             }
         }
         .onAppear { axTrusted = AltTabAX.isTrusted() }
-        // Fix 18 (existing): re-check axTrusted when the user returns to Trove from System Settings.
+        // Re-check permissions when the user returns from System Settings.
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             axTrusted = AltTabAX.isTrusted()
+            screenRecordingAllowed = CGPreflightScreenCaptureAccess()
             if axTrusted { engine.apply() }
         }
-        // Fix 19: 5-second periodic poll while the pane is visible so AX revocation surfaces without app switch.
+        // 5-second periodic poll while the pane is visible.
         .onReceive(Timer.publish(every: 5, on: .main, in: .common).autoconnect()) { _ in
             let trusted = AltTabAX.isTrusted()
             if trusted != axTrusted {
                 axTrusted = trusted
                 if trusted { engine.apply() }
             }
+            screenRecordingAllowed = CGPreflightScreenCaptureAccess()
         }
     }
 
     // ---------- Cards ----------
 
+    private var screenRecordingCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 10) {
+                Label("Screen Recording access needed for thumbnails", systemImage: "camera.fill")
+                    .headerText()
+                Text("Window thumbnails in the switcher overlay use ScreenCaptureKit, which requires Screen Recording permission. Without it, tiles show the app icon instead of a live screenshot.")
+                    .font(.callout).foregroundStyle(.secondary)
+                HStack {
+                    Button {
+                        // CGRequestScreenCaptureAccess() shows the system prompt.
+                        CGRequestScreenCaptureAccess()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                            screenRecordingAllowed = CGPreflightScreenCaptureAccess()
+                        }
+                    } label: {
+                        Label("Request access", systemImage: "camera.badge.ellipsis")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Button {
+                        TCCDeepLink.screenRecording.open()
+                    } label: {
+                        Label("Open System Settings", systemImage: "gearshape")
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+        }
+    }
+
     private var accessibilityCard: some View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
                 Label("Accessibility access needed", systemImage: "lock.shield")
-                    .font(.headline)
+                    .headerText()
                 Text("To raise other apps' windows, macOS requires Trove to have Accessibility permission. AltTab will still appear without it, but pressing Enter on a window won't bring it to the front.")
                     .font(.callout).foregroundStyle(.secondary)
                 HStack {
@@ -965,7 +1195,7 @@ public struct AltTabView: View {
             VStack(alignment: .leading, spacing: 10) {
                 Toggle(isOn: $engine.enabled) {
                     Label("Enable AltTab switcher", systemImage: "rectangle.stack")
-                        .font(.headline)
+                        .headerText()
                 }
                 .toggleStyle(.switch)
                 Text("Switch through individual windows (not just apps) with thumbnails. Type to filter, arrow keys or Tab to cycle, Enter to commit.")
@@ -981,34 +1211,13 @@ public struct AltTabView: View {
     }
 
     private var hotkeyCard: some View {
-        Card {
-            VStack(alignment: .leading, spacing: 12) {
-                Label("Hotkey", systemImage: "command")
-                    .font(.headline)
-                Picker("Combo", selection: Binding(
-                    get: { engine.hotkey },
-                    set: { engine.hotkey = $0 }
-                )) {
-                    Text("Option + Tab  (⌥⇥)").tag(AltTabHotkey.optionTab)
-                    Text("Control + Tab  (⌃⇥)").tag(AltTabHotkey.controlTab)
-                    Text("Command + Tab  (⌘⇥) — reserved by macOS").tag(AltTabHotkey.commandTab)
-                }
-                .pickerStyle(.radioGroup)
-
-                if engine.hotkey == .commandTab {
-                    Label("⌘⇥ is reserved by macOS for the app switcher and won't be delivered to Trove. Pick another.",
-                          systemImage: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
-                        .font(.callout)
-                }
-            }
-        }
+        AltTabHotkeyCard(engine: engine)
     }
 
     private var behaviorCard: some View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
-                Label("Behavior", systemImage: "slider.horizontal.3").font(.headline)
+                Label("Behavior", systemImage: "slider.horizontal.3").headerText()
                 Toggle("Include windows on other Spaces", isOn: $engine.crossSpace)
                 Toggle("Show hidden / minimized windows",  isOn: $engine.includeHidden)
                 Toggle("Recency-weighted ordering (last-used at position 2)",
@@ -1020,7 +1229,7 @@ public struct AltTabView: View {
     private var appearanceCard: some View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
-                Label("Appearance", systemImage: "paintpalette").font(.headline)
+                Label("Appearance", systemImage: "paintpalette").headerText()
                 Toggle("Color-code by app (thin colored border per tile)",
                        isOn: $engine.colorCode)
                 Text("Each app gets a stable accent hue derived from its bundle ID, so windows of the same app share a colored bottom-stripe.")

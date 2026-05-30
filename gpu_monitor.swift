@@ -705,20 +705,23 @@ final class GPUMonitorModel: ObservableObject {
     private let bufferCap = 60
     private var timer: Timer?
     private var thermalObserver: NSObjectProtocol?
-    private var appResignObserver: NSObjectProtocol?
-    private var appActiveObserver: NSObjectProtocol?
+    // appResignObserver / appActiveObserver removed: auto-pausing on app-switch
+    // defeats stress-testing workflows. Users can pause manually via the toolbar.
     private var statusItem: NSStatusItem?
     private let powerQueue = DispatchQueue(label: "trove.gpu.power")
+    // Dedicated background queue for IORegistry / SMC sampling so tick() never
+    // stalls the main thread (IORegistry traversal + SMC calls: 10–30 ms each).
+    private let probeQueue = DispatchQueue(label: "trove.gpu.probe", qos: .utility)
     // Fix 16: pmsetTick removed — IOPSCopyPowerSourcesInfo is cheap enough to call every tick.
 
     init() {
-        // red-team: read the persisted toggle BEFORE the property is observed,
-        // otherwise the `didSet` would fire during init and try to start HID
-        // before the rest of the model is ready. Direct UD read sidesteps that.
-        self.experimentalSensors = UserDefaults.standard.bool(forKey: Self.kExperimentalKey)
-        // Same pattern for the unit toggle — its didSet only writes back to UD,
-        // which is idempotent, but the spurious write at init is still noise.
-        self.temperatureFahrenheit = UserDefaults.standard.bool(forKey: Self.kFahrenheitKey)
+        // Read persisted toggles with a single read BEFORE assignment so the
+        // `didSet` observers don't fire during init (they'd try to start/stop
+        // HID before the model is fully initialised).
+        let savedSensors = UserDefaults.standard.bool(forKey: Self.kExperimentalKey)
+        let savedFahr    = UserDefaults.standard.bool(forKey: Self.kFahrenheitKey)
+        self.experimentalSensors   = savedSensors
+        self.temperatureFahrenheit = savedFahr
         thermalObserver = NotificationCenter.default.addObserver(
             forName: ProcessInfo.thermalStateDidChangeNotification,
             object: nil, queue: .main) { [weak self] _ in
@@ -726,12 +729,6 @@ final class GPUMonitorModel: ObservableObject {
                 self.thermal = ProcessInfo.processInfo.thermalState
                 self.refreshAlertIcon()
         }
-        appResignObserver = NotificationCenter.default.addObserver(
-            forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
-        ) { [weak self] _ in guard let self = self, !self.paused else { return }; self.stop() }
-        appActiveObserver = NotificationCenter.default.addObserver(
-            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
-        ) { [weak self] _ in guard let self = self, !self.paused else { return }; self.start() }
         // NOTE: `start()` used to fire here, which triggered an immediate
         // synchronous `tick()` — and `tick()` does IOKit / IORegistry
         // traversal + `MTLCopyAllDevices()`, all of which is OK off-main but
@@ -741,9 +738,7 @@ final class GPUMonitorModel: ObservableObject {
 
     deinit {
         timer?.invalidate()
-        if let o = thermalObserver   { NotificationCenter.default.removeObserver(o) }
-        if let o = appResignObserver { NotificationCenter.default.removeObserver(o) }
-        if let o = appActiveObserver { NotificationCenter.default.removeObserver(o) }
+        if let o = thermalObserver { NotificationCenter.default.removeObserver(o) }
         if let s = statusItem { NSStatusBar.system.removeStatusItem(s) }
         // red-team: drop the .floating window level so a torn-down model
         // doesn't leave the user's window stuck above all others.
@@ -871,45 +866,69 @@ final class GPUMonitorModel: ObservableObject {
     }
 
     func tick() {
-        // GPU probe + thermal are cheap. Fix 16: IOPSCopyPowerSourcesInfo is
-        // pure IPC (no fork), so power can be read every tick without throttling.
-        let probed = GPUProbe.snapshot()
-        let rpms: [Int]? = GPUSMC.fanRPMs()
-        // Power read is cheap now — call directly on background queue.
-        powerQueue.async { [weak self] in
-            let r = GPUPower.read()
-            Task { @MainActor [weak self] in self?.power = r }
-        }
+        // Reentry guard: if the previous tick's detached probe is still running
+        // (possible at 1 s interval on a slow IORegistry), skip this tick
+        // rather than piling up concurrent IOKit calls.
+        guard !probing else { return }
+        probing = true
 
-        self.gpus = probed
-        self.fanRPMs = rpms
-        self.thermal = ProcessInfo.processInfo.thermalState
+        // Snapshot main-actor state we need on the probe queue.
+        let wantSensors = experimentalSensors
+        // Capture `hid` as a local so the probeQueue closure doesn't cross
+        // the @MainActor isolation boundary when calling sampleAsync.
+        let hidRef = hid
 
-        // Experimental HID sensors — fire-and-forget; result lands on main.
-        if experimentalSensors {
-            hid.sampleAsync { [weak self] readings in
+        // Move IORegistry + SMC off the main thread. GPUProbe.snapshot() and
+        // GPUSMC.fanRPMs() each take 10–30 ms; running them on the main actor
+        // causes visible UI hitches every second.
+        probeQueue.async { [weak self] in
+            guard let self = self else { return }
+            let probed = GPUProbe.snapshot()
+            let rpms: [Int]? = GPUSMC.fanRPMs()
+            let power = GPUPower.read()
+            let thermal = ProcessInfo.processInfo.thermalState
+
+            Task { @MainActor [weak self] in
                 guard let self = self else { return }
-                self.sensorLatest = readings
-                self.appendHistoryTick(readings)
+                self.probing = false
+                self.gpus = probed
+                self.fanRPMs = rpms
+                self.power = power
+                self.thermal = thermal
+                self.refreshAlertIcon()
+
+                var perGPU: [UInt64: (activity: Double, mem: Int64)] = [:]
+                for g in probed {
+                    perGPU[g.id] = (g.gpuActivity ?? 0, g.inUseSystemMemory ?? 0)
+                }
+                let sample = GPUSample(
+                    t: Date(),
+                    perGPU: perGPU,
+                    thermal: thermal,
+                    fanRPMs: rpms,
+                    acWatts: power.acWatts,
+                    batteryPercent: power.batteryPercent,
+                    onAC: power.onAC
+                )
+                self.samples.append(sample)
+                if self.samples.count > self.bufferCap {
+                    self.samples.removeFirst(self.samples.count - self.bufferCap)
+                }
+            }
+
+            // Experimental HID sensors — fire-and-forget; result lands on main.
+            if wantSensors {
+                hidRef.sampleAsync { [weak self] readings in
+                    guard let self = self else { return }
+                    self.sensorLatest = readings
+                    self.appendHistoryTick(readings)
+                }
             }
         }
-
-        var perGPU: [UInt64: (activity: Double, mem: Int64)] = [:]
-        for g in probed {
-            perGPU[g.id] = (g.gpuActivity ?? 0, g.inUseSystemMemory ?? 0)
-        }
-        let sample = GPUSample(
-            t: Date(),
-            perGPU: perGPU,
-            thermal: thermal,
-            fanRPMs: rpms,
-            acWatts: power.acWatts,
-            batteryPercent: power.batteryPercent,
-            onAC: power.onAC
-        )
-        samples.append(sample)
-        if samples.count > bufferCap { samples.removeFirst(samples.count - bufferCap) }
     }
+
+    // Prevents concurrent IORegistry/SMC calls from the tick loop.
+    private var probing: Bool = false
 
     // ---- pin window ---------------------------------------------------------
 
@@ -1638,7 +1657,7 @@ public struct GPUMonitorView: View {
         .overlay(alignment: .bottom) { toastView }
         .navigationTitle("GPU & Thermals")
         .onAppear { model.start(); if model.experimentalSensors { model.startHID() } }
-        .onDisappear { model.stop(); if model.experimentalSensors { model.stopHID() } }
+        .onDisappear { model.stop(); model.stopHID() }  // stopHID is idempotent
     }
 
     @ViewBuilder

@@ -15,9 +15,9 @@ import CommonCrypto
 // MARK: - Streaming hash core
 // ===========================================================================
 
-/// Three-in-one CommonCrypto streaming hasher. One pass over the file feeds
-/// MD5, SHA1, SHA256 simultaneously — one read of (potentially gigabytes of)
-/// data, three digests out the other end.
+/// Four-in-one CommonCrypto streaming hasher. One pass over the file feeds
+/// MD5, SHA1, SHA256, and SHA512 simultaneously — one read of (potentially
+/// gigabytes of) data, four digests out the other end.
 ///
 /// Red-team #1 (huge files): we never materialize the file in memory; chunks
 /// are 1 MiB and reused. `Data.withUnsafeBytes` hands us a stable pointer per
@@ -31,11 +31,15 @@ final class HashTripleHasher {
     private var md5 = CC_MD5_CTX()
     private var sha1 = CC_SHA1_CTX()
     private var sha256 = CC_SHA256_CTX()
+    // P1 FIX: add SHA-512 as a fourth CC context in the same single-pass read.
+    // No extra I/O cost — the file bytes already flow through the other three.
+    private var sha512 = CC_SHA512_CTX()
 
     init() {
         CC_MD5_Init(&md5)
         CC_SHA1_Init(&sha1)
         CC_SHA256_Init(&sha256)
+        CC_SHA512_Init(&sha512)
     }
 
     func update(_ data: Data) {
@@ -46,17 +50,21 @@ final class HashTripleHasher {
             CC_MD5_Update(&md5, base, len)
             CC_SHA1_Update(&sha1, base, len)
             CC_SHA256_Update(&sha256, base, len)
+            CC_SHA512_Update(&sha512, base, len)
         }
     }
 
-    func finalize() -> (md5: String, sha1: String, sha256: String) {
+    func finalize() -> (md5: String, sha1: String, sha256: String, sha512: String) {
         var md5Out  = [UInt8](repeating: 0, count: Int(CC_MD5_DIGEST_LENGTH))
         var sha1Out = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
         var sha2Out = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        var sha5Out = [UInt8](repeating: 0, count: Int(CC_SHA512_DIGEST_LENGTH))
         CC_MD5_Final(&md5Out, &md5)
         CC_SHA1_Final(&sha1Out, &sha1)
         CC_SHA256_Final(&sha2Out, &sha256)
-        return (HashHex.encode(md5Out), HashHex.encode(sha1Out), HashHex.encode(sha2Out))
+        CC_SHA512_Final(&sha5Out, &sha512)
+        return (HashHex.encode(md5Out), HashHex.encode(sha1Out),
+                HashHex.encode(sha2Out), HashHex.encode(sha5Out))
     }
 }
 
@@ -74,12 +82,12 @@ enum HashHex {
     }
 }
 
-/// Streaming three-hash computation for a single URL.
+/// Streaming four-hash computation for a single URL.
 /// - Throws if the URL is unreadable, is a directory, or any chunk read fails.
 /// - Honors `Task.checkCancellation()` between chunks so cancelled rows stop fast.
 func computeHashes(of url: URL,
                    progress: @escaping (Double) -> Void) async throws
-                   -> (md5: String, sha1: String, sha256: String) {
+                   -> (md5: String, sha1: String, sha256: String, sha512: String) {
     let fm = FileManager.default
 
     // Red-team #4 (directory dropped): refuse early with a clear error.
@@ -227,8 +235,8 @@ final class HashRow: ObservableObject, Identifiable {
     }
 
     /// Begin hashing. Acquires the gate before opening the file handle.
-    func start(gate: HashConcurrencyGate) {
-        task = Task { [weak self] in
+    func start(gate: HashConcurrencyGate, vm: HashViewModel) {
+        task = Task { [weak self, weak vm] in
             guard let self else { return }
             // red-team: track acquisition. If the task is cancelled before we
             // ever held a permit we must not call release() — see gate.release
@@ -242,7 +250,10 @@ final class HashRow: ObservableObject, Identifiable {
                     self.progress = p
                 }
                 if Task.isCancelled { return }
-                self.state = .done(md5: result.md5, sha1: result.sha1, sha256: result.sha256)
+                self.state = .done(md5: result.md5, sha1: result.sha1,
+                                   sha256: result.sha256, sha512: result.sha512)
+                // P2: increment O(1) done counter on the ViewModel.
+                vm?.incrementDoneCount()
             } catch is CancellationError {
                 // Row was removed; nothing to surface.
                 return
@@ -260,7 +271,7 @@ final class HashRow: ObservableObject, Identifiable {
 
 enum HashRowState {
     case computing
-    case done(md5: String, sha1: String, sha256: String)
+    case done(md5: String, sha1: String, sha256: String, sha512: String)
     case error(String)
 }
 
@@ -273,8 +284,13 @@ final class HashViewModel: ObservableObject {
     @Published var rows: [HashRow] = []
     @Published var compareText: String = ""
 
-    // speed: hashing is part I/O, part CPU (MD5+SHA1+SHA256 simultaneously on
-    // every chunk is non-trivial AES-NI-free CPU work). Scale concurrency with
+    // P1 FIX: gate auto-copy behind a persisted pref (default OFF).
+    // Previously the single-file-complete path silently clobbered the
+    // clipboard; the user now opts in explicitly.
+    @AppStorage("file_hash.autoCopySHA256") var autoCopySHA256: Bool = false
+
+    // speed: hashing is part I/O, part CPU (MD5+SHA1+SHA256+SHA512 simultaneously
+    // on every chunk is non-trivial AES-NI-free CPU work). Scale concurrency with
     // core count instead of the previous fixed 4, capped at 8 so we don't
     // thrash SSD parallel-queue depth or context-switch storm on big-iron Macs.
     private let gate = HashConcurrencyGate(
@@ -304,19 +320,33 @@ final class HashViewModel: ObservableObject {
             if rows.contains(where: { $0.url.path == resolved.path }) { continue }
             let row = HashRow(url: resolved)
             rows.append(row)
-            row.start(gate: gate)
+            row.start(gate: gate, vm: self)
         }
     }
 
     func remove(_ row: HashRow) {
         row.cancel()
+        // P2: decrement done counter if this row was completed.
+        if case .done = row.state { decrementDoneCount() }
         rows.removeAll { $0.id == row.id }
     }
 
     func clearAll() {
         for r in rows { r.cancel() }
         rows.removeAll()
+        // P2: reset the counter when all rows are removed.
+        doneRowCount = 0
     }
+
+    /// P2: O(1) done-count. Incremented by HashRow when it transitions to
+    /// .done; decremented when a row is removed. This replaces the O(n) scan
+    /// that `hasDoneRows` previously forced on every toolbar render pass.
+    @Published private(set) var doneRowCount: Int = 0
+
+    /// Called from HashRow.start() completion path via MainActor to increment
+    /// the counter. Using a simple increment avoids re-scanning rows[].
+    func incrementDoneCount() { doneRowCount += 1 }
+    func decrementDoneCount() { if doneRowCount > 0 { doneRowCount -= 1 } }
 
     /// True if any row is still hashing — drives the toolbar Cancel button
     /// visibility.
@@ -383,17 +413,30 @@ public struct FileHashView: View {
         .navigationSubtitle("\(vm.rows.count) file\(vm.rows.count == 1 ? "" : "s")")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                // Bulk export — write a canonical shasum-style SHA256SUMS file
-                // across every completed row. Drives the CI/verify workflow
-                // users actually do with hash output.
-                if HashSaveHelpers.hasDoneRows(vm.rows) {
-                    Button {
-                        HashSaveHelpers.saveAllSHA256SUMS(rows: vm.rows, stage: stage)
+                // P1 FIX: export menu for MD5SUMS / SHA1SUMS / SHA256SUMS /
+                // SHA512SUMS variants — replaces the single SHA256SUMS button.
+                // P2: use O(1) counter instead of O(n) hasDoneRows scan.
+                if vm.doneRowCount > 0 {
+                    Menu {
+                        ForEach(HashAlgorithmExport.allCases) { alg in
+                            Button {
+                                HashSaveHelpers.saveSUMS(rows: vm.rows, algorithm: alg, stage: stage)
+                            } label: {
+                                Label(alg.filename, systemImage: "doc.text")
+                            }
+                        }
                     } label: {
-                        Label("Save All…", systemImage: "square.and.arrow.down.on.square")
+                        Label("Export…", systemImage: "square.and.arrow.down.on.square")
                     }
-                    .help("Write a SHA256SUMS-style file (one line per file) you can verify with `shasum -c`")
+                    .help("Export MD5SUMS / SHA1SUMS / SHA256SUMS / SHA512SUMS")
                 }
+
+                // P1 FIX: auto-copy pref toggle (default OFF).
+                Toggle(isOn: $vm.autoCopySHA256) {
+                    Label("Auto-copy SHA256", systemImage: "doc.on.clipboard")
+                }
+                .help("When ON: automatically copies the SHA256 hash to the clipboard when a single file finishes hashing. Default: OFF.")
+                .toggleStyle(.checkbox)
 
                 if vm.hasComputingRows {
                     Button(role: .destructive) {
@@ -427,17 +470,24 @@ public struct FileHashView: View {
             }
         }
         .onReceive(vm.objectWillChange) { _ in
-            // Fix #26: auto-copy SHA256 when a single file finishes hashing.
-            // objectWillChange fires before the update; defer to next run loop.
+            // P1 FIX: auto-copy SHA256 is now gated behind vm.autoCopySHA256
+            // (default OFF) to avoid silently clobbering the clipboard.
+            // When enabled and a single file finishes, copy SHA256 and show
+            // a toast. When disabled, still show a toast (without copying) so
+            // the user knows hashing completed.
             DispatchQueue.main.async {
                 guard vm.rows.count == 1,
-                      case .done(_, _, let sha256) = vm.rows[0].state,
+                      case .done(_, _, let sha256, _) = vm.rows[0].state,
                       sha256 != lastAutoCopiedSHA256 else { return }
                 lastAutoCopiedSHA256 = sha256
-                let pb = NSPasteboard.general
-                pb.clearContents()
-                pb.setString(sha256, forType: .string)
-                stage.flash("SHA256 copied")
+                if vm.autoCopySHA256 {
+                    let pb = NSPasteboard.general
+                    pb.clearContents()
+                    pb.setString(sha256, forType: .string)
+                    stage.flash("SHA256 copied")
+                } else {
+                    stage.flash("Hashing complete")
+                }
             }
         }
     }
@@ -449,7 +499,7 @@ public struct FileHashView: View {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 8) {
                     Image(systemName: "checkmark.shield").foregroundStyle(.secondary)
-                    Text("Compare against").font(.headline)
+                    Text("Compare against").headerText()
                     Spacer()
                     if !vm.compareNormalized.isEmpty {
                         Text("\(vm.compareNormalized.count) chars")
@@ -626,11 +676,12 @@ private struct HashRowCard: View {
                     .textSelection(.enabled)
                 Spacer()
             }
-        case .done(let md5, let sha1, let sha256):
+        case .done(let md5, let sha1, let sha256, let sha512):
             VStack(alignment: .leading, spacing: 6) {
                 HashLine(label: "MD5",    value: md5,    matched: vm.matches(md5),    sourceURL: row.url, stage: stage)
                 HashLine(label: "SHA1",   value: sha1,   matched: vm.matches(sha1),   sourceURL: row.url, stage: stage)
                 HashLine(label: "SHA256", value: sha256, matched: vm.matches(sha256), sourceURL: row.url, stage: stage)
+                HashLine(label: "SHA512", value: sha512, matched: vm.matches(sha512), sourceURL: row.url, stage: stage)
             }
         }
     }
@@ -742,15 +793,22 @@ private enum HashSaveHelpers {
     private static let kSaveDirKey = "file_hash.saveDir.last"
 
     /// Build the canonical shasum format: one row per completed file,
-    /// `<sha256>  <basename>` with EXACTLY two spaces between hash and name
-    /// (this is the format `shasum -a 256 -c SHA256SUMS` expects).
+    /// `<hash>  <basename>` with EXACTLY two spaces between hash and name
+    /// (this is the format `shasum -a N -c <file>` expects).
     /// MainActor-isolated because HashRow's `state` is.
     @MainActor
-    static func sha256SumsBody(_ rows: [HashRow]) -> String {
+    static func sumsBody(_ rows: [HashRow], algorithm: HashAlgorithmExport) -> String {
         var lines: [String] = []
         for r in rows {
-            if case .done(_, _, let sha256) = r.state {
-                lines.append("\(sha256)  \(r.url.lastPathComponent)")
+            if case .done(let md5, let sha1, let sha256, let sha512) = r.state {
+                let hash: String
+                switch algorithm {
+                case .md5:    hash = md5
+                case .sha1:   hash = sha1
+                case .sha256: hash = sha256
+                case .sha512: hash = sha512
+                }
+                lines.append("\(hash)  \(r.url.lastPathComponent)")
             }
         }
         return lines.joined(separator: "\n") + "\n"
@@ -763,19 +821,19 @@ private enum HashSaveHelpers {
         }
     }
 
-    /// Write a SHA256SUMS-style file via NSSavePanel. Remembers last directory.
+    /// Write a SUMS-style file via NSSavePanel for the given algorithm.
     @MainActor
-    static func saveAllSHA256SUMS(rows: [HashRow], stage: Stage) {
-        let body = sha256SumsBody(rows)
+    static func saveSUMS(rows: [HashRow], algorithm: HashAlgorithmExport, stage: Stage) {
+        let body = sumsBody(rows, algorithm: algorithm)
         guard !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             stage.flash("Nothing to save — no completed hashes yet")
             return
         }
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "SHA256SUMS"
+        panel.nameFieldStringValue = algorithm.filename
         panel.canCreateDirectories = true
         panel.directoryURL = lastSaveDir() ?? downloadsDir()
-        panel.message = "Save a `shasum -c`-compatible checksum file."
+        panel.message = "Save a `\(algorithm.verifyCommand)`-compatible checksum file."
         panel.begin { resp in
             guard resp == .OK, let dest = panel.url else { return }
             setLastSaveDir(dest.deletingLastPathComponent())
@@ -799,5 +857,24 @@ private enum HashSaveHelpers {
     }
     static func downloadsDir() -> URL? {
         FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+    }
+}
+
+/// P1 FIX: export algorithm selector for MD5SUMS / SHA1SUMS / SHA256SUMS /
+/// SHA512SUMS variants.
+private enum HashAlgorithmExport: String, CaseIterable, Identifiable {
+    case md5    = "MD5"
+    case sha1   = "SHA1"
+    case sha256 = "SHA256"
+    case sha512 = "SHA512"
+    var id: String { rawValue }
+    var filename: String { "\(rawValue)SUMS" }
+    var verifyCommand: String {
+        switch self {
+        case .md5:    return "md5 -c"
+        case .sha1:   return "shasum -a 1 -c"
+        case .sha256: return "shasum -a 256 -c"
+        case .sha512: return "shasum -a 512 -c"
+        }
     }
 }

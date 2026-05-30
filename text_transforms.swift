@@ -161,15 +161,43 @@ struct XformError: LocalizedError {
 // ===========================================================================
 
 /// One chip in the pipeline. Carries its own kind + parameter bag.
-struct XformStep: Identifiable, Hashable {
-    let id = UUID()
+/// P1: Codable for pipeline persistence (serialize to disk on every mutation).
+struct XformStep: Identifiable, Hashable, Codable {
+    // `id` has a default — synthesized Codable won't include it by default so
+    // we provide custom coding to round-trip it through the JSON store.
+    let id: UUID
     var kind: XformKind
     /// `param1` is the primary user-supplied argument (regex pattern, prefix text).
-    var param1: String = ""
+    var param1: String
     /// `param2` is a secondary argument (regex replacement).
-    var param2: String = ""
+    var param2: String
+
+    /// Memberwise init so existing callers (`XformStep(kind:)`) still compile.
+    init(kind: XformKind, param1: String = "", param2: String = "") {
+        self.id = UUID()
+        self.kind = kind
+        self.param1 = param1
+        self.param2 = param2
+    }
 
     var title: String { XformCatalog.descriptor(kind).title }
+
+    // Custom Codable to preserve the UUID id across serialization.
+    enum CodingKeys: String, CodingKey { case id, kind, param1, param2 }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id     = (try? c.decode(UUID.self,     forKey: .id))     ?? UUID()
+        self.kind   = try  c.decode(XformKind.self, forKey: .kind)
+        self.param1 = (try? c.decode(String.self,   forKey: .param1)) ?? ""
+        self.param2 = (try? c.decode(String.self,   forKey: .param2)) ?? ""
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id,     forKey: .id)
+        try c.encode(kind,   forKey: .kind)
+        try c.encode(param1, forKey: .param1)
+        try c.encode(param2, forKey: .param2)
+    }
 }
 
 /// Result of running one step. Either we got a string, or we caught an error.
@@ -270,7 +298,8 @@ enum XformEngine {
             // flow-style nested maps, multi-line literals) it will not
             // restructure anything. Documented behavior: collapse blank-line
             // runs, trim trailing whitespace, normalize tabs→two-spaces.
-            return yamlTidy(s)
+            // P1 fix: throws XformError when anchors/aliases are detected.
+            return try yamlTidy(s)
         case .xmlPretty:
             return try xmlPretty(s)
 
@@ -407,21 +436,22 @@ enum XformEngine {
 /// Restore base64url → base64 and pad to a multiple of four. Tolerant decoder.
 // red-team: catastrophic-backtracking guard. NSRegularExpression has no
 // timeout, so we unconditionally reject patterns that nest unbounded
-// quantifiers (`(.*)+`, `(a+)+`, `(.+)*`, `(\w+\s?)+`, `(a*b*)+`, `([a-z]+)+`)
+// quantifiers (`(.*)+`, `(a+)+`, `(.+)*`, `(\w+\s?)+`, `(a*b*)+`, `([a-z]+)+`,
+// `(a|a)+` — the alternation-in-quantified-group ReDoS variant)
 // which can take exponential time. Threshold lowered to 0 so even tiny inputs
 // are protected — hung UI on any size input is unacceptable.
 // This is a heuristic — false positives are acceptable because the user can
 // rewrite the pattern; false negatives (hung UI) are not.
-private func rejectCatastrophicRegex(_ pattern: String, inputBytes: Int) throws {
+// `internal` (default) so rename.swift can apply the same ReDoS guard before
+// constructing NSRegularExpression. Throws an `XformError`; callers in
+// non-xform contexts should treat that as a generic "pattern unsafe" error.
+func rejectCatastrophicRegex(_ pattern: String, inputBytes: Int) throws {
     // Always check, regardless of input size.
     _ = inputBytes
     // Category 1: group ending in a quantifier that is itself quantified.
     // Cheap textual check: detect "*)+", "+)+", "*)*", "+)*", "*)?+", etc.
     let danger = ["*)+", "+)+", "*)*", "+)*", "*)?", "+)?",
-                  // Additional: groups with a nested quantifier followed by outer *
-                  "*)+" , "+)+", "?)+",
-                  // Outer * variants
-                  "*)*", "+)*", "?)*"]
+                  "?)+", "?)*"]
     for d in danger where pattern.contains(d) {
         throw XformError("pattern looks catastrophic (\(d)) — refusing to run")
     }
@@ -433,6 +463,61 @@ private func rejectCatastrophicRegex(_ pattern: String, inputBytes: Int) throws 
     let hasOuterGroupQuant = pattern.contains(")+") || pattern.contains(")*") || pattern.contains(")?")
     if quantCount >= 2 && hasOuterGroupQuant {
         throw XformError("pattern contains nested quantifiers inside a quantified group — refusing to run")
+    }
+    // P0 fix: Category 3 — alternation inside a quantified group: `(a|b)+`,
+    // `(foo|bar)*`, `(a|a)+`. A group containing `|` immediately followed (possibly
+    // after whitespace) by `+`, `*`, or `{n,}` is a ReDoS-prone pattern even when
+    // quantCount == 1 (the above Category 2 check would miss it).
+    // Walk the pattern character-by-character; track group depth and whether the
+    // current group contains an alternation. When a group closes and is followed by
+    // an unbounded quantifier, reject if the group body contained `|`.
+    try rejectAlternationInQuantifiedGroup(pattern)
+}
+
+/// Walk through `pattern` and throw if any group `(…|…)+` or `(…|…)*` is found.
+private func rejectAlternationInQuantifiedGroup(_ pattern: String) throws {
+    var depth = 0
+    var hasAlternation: [Int: Bool] = [:]  // depth → seen `|` at this depth
+    let chars = Array(pattern)
+    var i = 0
+    while i < chars.count {
+        let c = chars[i]
+        // Skip escaped characters — `\(`, `\|`, etc.
+        if c == "\\" {
+            i += 2
+            continue
+        }
+        if c == "(" {
+            // Entering a group. Reset alternation tracking for this depth.
+            depth += 1
+            hasAlternation[depth] = false
+        } else if c == ")" {
+            let thisDepth = depth
+            depth = max(0, depth - 1)
+            // Check what follows the closing paren.
+            let next = i + 1 < chars.count ? chars[i + 1] : "\0"
+            let isUnboundedQuant: Bool
+            if next == "+" || next == "*" {
+                isUnboundedQuant = true
+            } else if next == "{" {
+                // `{n,}` — check for comma with no upper bound
+                var j = i + 2
+                while j < chars.count && chars[j] != "}" { j += 1 }
+                let body = String(chars[(i+2)..<j])
+                // `{n,}` (trailing comma, no upper bound) counts as unbounded;
+                // `{n,m}` (both bounds present) does not.
+                isUnboundedQuant = body.contains(",") && body.hasSuffix(",")
+            } else {
+                isUnboundedQuant = false
+            }
+            if isUnboundedQuant && (hasAlternation[thisDepth] == true) {
+                throw XformError("pattern contains alternation inside a quantified group (ReDoS risk) — refusing to run")
+            }
+            hasAlternation.removeValue(forKey: thisDepth)
+        } else if c == "|" && depth > 0 {
+            hasAlternation[depth] = true
+        }
+        i += 1
     }
 }
 
@@ -523,7 +608,20 @@ private func jsonReformat(_ s: String, sortKeys: Bool, minify: Bool) throws -> S
     return String(data: out, encoding: .utf8) ?? s
 }
 
-private func yamlTidy(_ s: String) -> String {
+private func yamlTidy(_ s: String) throws -> String {
+    // P1 fix: YAML tidy silently mangles anchors (`&anchor`) and aliases (`*alias`).
+    // We have no real YAML parser; textual operations on anchored YAML will corrupt
+    // cross-references. Detect these tokens and surface an explicit error so the
+    // user knows structural reformat is not available for this input.
+    let anchorAliasPattern = try? NSRegularExpression(
+        pattern: #"(?m)^\s*[&*][A-Za-z_][A-Za-z0-9_]*"#
+    )
+    let nsInput = s as NSString
+    if let re = anchorAliasPattern,
+       re.firstMatch(in: s, range: NSRange(location: 0, length: nsInput.length)) != nil {
+        throw XformError("YAML input contains anchors (&) or aliases (*) — structural tidy is not safe without a full YAML parser. Edit manually or remove anchors first.")
+    }
+
     let normalized = s.replacingOccurrences(of: "\t", with: "  ")
     let lines = normalized.split(separator: "\n", omittingEmptySubsequences: false)
                           .map { $0.trimmingTrailingWhitespace() }
@@ -731,12 +829,9 @@ enum XformAutoDetect {
             && s.filter({ !$0.isWhitespace }).count % 2 == 0 {
             out.append(("Hex decode", [.hexDecode]))
         }
-        if matches(s, "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}") {
-            // ISO timestamp — surface a no-op formatting chip via lines/trim so
-            // the user has a hint that we detected it. No timestamp transform
-            // exists yet; keep the suggestion list informative.
-            out.append(("Trim each line", [.linesTrim]))
-        }
+        // P1 fix: ISO-timestamp detection previously mapped to no-op "Trim each line".
+        // There is no timestamp-parse transform — removed the misleading suggestion
+        // entirely rather than suggesting a step that does nothing useful.
 
         return out
     }
@@ -773,10 +868,12 @@ final class XformModel: ObservableObject {
     /// `true` once we've hit the hard refuse threshold; pipeline won't run.
     @Published var inputBlocked: Bool = false
 
-    /// Debounce token: increments on every input/pipeline change, and the
-    /// scheduled re-evaluation no-ops if the token changed under it. Lets us
-    /// debounce massive pastes without piling up `Task`s.
+    /// P0 fix: generation counter guards against a stale async Task result
+    /// overwriting the output from a newer run. Increment before every dispatch;
+    /// discard if the counter changed by the time the Task publishes back.
     private var revision: UInt64 = 0
+    /// P1: `isRunning` flag drives the ProgressView in the output header.
+    @Published private(set) var isRunning: Bool = false
 
     /// Size thresholds — warn at 1 MB, refuse at 50 MB. Matches the spec.
     /// `nonisolated` so XformEngine.run (nonisolated) can read them without
@@ -784,7 +881,9 @@ final class XformModel: ObservableObject {
     nonisolated static let warnBytes: Int = 1_000_000
     nonisolated static let refuseBytes: Int = 50_000_000
 
-    init() {}
+    init() {
+        loadPipeline()  // P1: restore persisted pipeline on launch
+    }
 
     func setInput(_ s: String) {
         input = s
@@ -793,6 +892,7 @@ final class XformModel: ObservableObject {
 
     func addStep(_ kind: XformKind) {
         steps.append(XformStep(kind: kind))
+        savePipeline()
         recomputeSoon()
     }
 
@@ -800,6 +900,7 @@ final class XformModel: ObservableObject {
     func prependPipeline(_ kinds: [XformKind]) {
         let newSteps = kinds.map { XformStep(kind: $0) }
         steps.insert(contentsOf: newSteps, at: 0)
+        savePipeline()
         recomputeSoon()
     }
 
@@ -808,11 +909,13 @@ final class XformModel: ObservableObject {
         if inspectedStepIdx != nil, inspectedStepIdx ?? -1 >= steps.count {
             inspectedStepIdx = nil
         }
+        savePipeline()
         recomputeSoon()
     }
 
     func moveStep(from src: IndexSet, to dst: Int) {
         steps.move(fromOffsets: src, toOffset: dst)
+        savePipeline()
         recomputeSoon()
     }
 
@@ -820,13 +923,15 @@ final class XformModel: ObservableObject {
         guard let i = steps.firstIndex(where: { $0.id == stepID }) else { return }
         if let p = param1 { steps[i].param1 = p }
         if let p = param2 { steps[i].param2 = p }
+        savePipeline()
         recomputeSoon()
     }
 
     func clearPipeline() {
         steps.removeAll()
         inspectedStepIdx = nil
-        recompute()
+        savePipeline()
+        recompute(input: input, steps: [], token: revision)
     }
 
     /// Snapshot — what the user is currently viewing in the output box.
@@ -841,6 +946,42 @@ final class XformModel: ObservableObject {
         return output
     }
 
+    // MARK: - Pipeline persistence (P1)
+
+    private static let pipelinePersistenceURL: URL = {
+        let base = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        let dir = base.appendingPathComponent("Trove", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("xform-pipeline.json")
+    }()
+
+    private func savePipeline() {
+        guard let data = try? JSONEncoder().encode(steps) else { return }
+        let url = Self.pipelinePersistenceURL
+        let tmp = url.deletingLastPathComponent()
+            .appendingPathComponent(".xform-pipeline-\(UUID().uuidString.prefix(8)).tmp")
+        do {
+            try data.write(to: tmp, options: .atomic)
+            if FileManager.default.fileExists(atPath: url.path) {
+                _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+            } else {
+                try FileManager.default.moveItem(at: tmp, to: url)
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: tmp)
+        }
+    }
+
+    private func loadPipeline() {
+        guard let data = try? Data(contentsOf: Self.pipelinePersistenceURL),
+              let decoded = try? JSONDecoder().decode([XformStep].self, from: data),
+              !decoded.isEmpty
+        else { return }
+        steps = decoded
+    }
+
     // MARK: - Debounce + execution
 
     /// Big inputs would lag the UI if we recomputed on every keystroke. Schedule
@@ -852,12 +993,18 @@ final class XformModel: ObservableObject {
         let token = revision
         let bytes = input.utf8.count
         let delayMs: Int = bytes > 200_000 ? 220 : 40
-        Task { [weak self] in
+        let capturedInput = input
+        let capturedSteps = steps
+        // P0 fix: run in Task.detached so heavy JSON/XML/regex/SHA work doesn't
+        // block the MainActor. Publish results back on @MainActor; discard if
+        // the generation changed under us (newer edit arrived).
+        Task.detached(priority: .utility) { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
             guard let self else { return }
-            await MainActor.run {
-                if self.revision == token { self.recompute() }
-            }
+            let stillCurrent = await self.revision == token
+            guard stillCurrent else { return }
+            await MainActor.run { self.isRunning = true }
+            self.recompute(input: capturedInput, steps: capturedSteps, token: token)
         }
     }
 
@@ -875,15 +1022,26 @@ final class XformModel: ObservableObject {
         }
     }
 
-    private func recompute() {
-        if inputBlocked {
-            outcomes = Array(repeating: .skipped, count: steps.count)
-            output = ""
+    /// P0 fix: runs off-main (called from Task.detached); publishes back on @MainActor.
+    /// `nonisolated` so Swift does not restrict this to the actor.
+    nonisolated private func recompute(input: String, steps: [XformStep], token: UInt64) {
+        let blocked = input.utf8.count >= Self.refuseBytes
+        if blocked {
+            Task { @MainActor [weak self] in
+                guard let self, self.revision == token else { return }
+                self.outcomes = Array(repeating: .skipped, count: steps.count)
+                self.output = ""
+                self.isRunning = false
+            }
             return
         }
         let (outs, final) = XformEngine.run(input: input, steps: steps)
-        outcomes = outs
-        output = final
+        Task { @MainActor [weak self] in
+            guard let self, self.revision == token else { return }
+            self.outcomes = outs
+            self.output = final
+            self.isRunning = false
+        }
     }
 
     private func byteString(_ b: Int) -> String {
@@ -943,9 +1101,10 @@ public struct XformView: View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text("Input").font(.headline)
+                    Text("Input").headerText()
                     Spacer()
                     if let banner = model.inputBanner {
+                        // P2: use design tokens instead of raw .red/.orange
                         HStack(spacing: 6) {
                             Image(systemName: model.inputBlocked
                                   ? "exclamationmark.octagon.fill"
@@ -954,9 +1113,9 @@ public struct XformView: View {
                         }
                         .font(.caption)
                         .padding(.horizontal, 8).padding(.vertical, 4)
-                        .background((model.inputBlocked ? Color.red : Color.orange).opacity(0.18),
+                        .background((model.inputBlocked ? Color.troveError : Color.troveWarning).opacity(0.18),
                                     in: Capsule())
-                        .foregroundStyle(model.inputBlocked ? .red : .orange)
+                        .foregroundStyle(model.inputBlocked ? Color.troveError : Color.troveWarning)
                     }
                     Button {
                         if let s = NSPasteboard.general.string(forType: .string) {
@@ -1006,7 +1165,7 @@ public struct XformView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(spacing: 6) {
                             Image(systemName: "wand.and.stars").foregroundStyle(.tint)
-                            Text("Suggested transforms").font(.headline)
+                            Text("Suggested transforms").headerText()
                         }
                         ScrollView(.horizontal, showsIndicators: false) {
                             HStack(spacing: 8) {
@@ -1038,7 +1197,7 @@ public struct XformView: View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text("Pipeline").font(.headline)
+                    Text("Pipeline").headerText()
                     if !model.steps.isEmpty {
                         Text("· click a chip to inspect that step's output")
                             .font(.caption).foregroundStyle(.secondary)
@@ -1069,7 +1228,15 @@ public struct XformView: View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 8) {
-                    Text(outputTitle).font(.headline)
+                    Text(outputTitle).headerText()
+                    // P1: show a progress indicator while the pipeline is computing
+                    // (especially relevant for large inputs off-main).
+                    if model.isRunning {
+                        ProgressView()
+                            .progressViewStyle(.circular)
+                            .scaleEffect(0.6)
+                            .frame(width: 16, height: 16)
+                    }
                     Spacer()
                     Button {
                         let pb = NSPasteboard.general
@@ -1300,22 +1467,106 @@ public struct XformView: View {
 // MARK: - Add-transform menu
 // ===========================================================================
 
+/// P1: Searchable popover over the ~40 transform descriptors.
+/// When the search field is empty the full category-grouped menu is shown;
+/// as the user types, a flat filtered list replaces it.
 struct XformAddMenu: View {
     @ObservedObject var model: XformModel
+    /// Show the searchable popover instead of the nested Menu.
+    @State private var showSearch = false
+    @State private var query: String = ""
+
+    private var filtered: [XformDescriptor] {
+        if query.isEmpty { return XformCatalog.all }
+        let q = query.lowercased()
+        return XformCatalog.all.filter {
+            $0.title.lowercased().contains(q) || $0.category.rawValue.lowercased().contains(q)
+        }
+    }
 
     var body: some View {
-        Menu {
-            ForEach(XformCategory.allCases) { cat in
-                Menu(cat.rawValue) {
-                    ForEach(XformCatalog.all.filter { $0.category == cat }) { d in
-                        Button(d.title) { model.addStep(d.kind) }
-                    }
-                }
-            }
+        Button {
+            showSearch = true
         } label: {
             Label("Add transform", systemImage: "plus")
         }
-        .menuStyle(.button)
+        .popover(isPresented: $showSearch, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 0) {
+                // Search field
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    TextField("Search transforms…", text: $query)
+                        .textFieldStyle(.plain)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(.separator.opacity(0.3))
+
+                Divider()
+
+                // Results list
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        if filtered.isEmpty {
+                            Text("No transforms match \"\(query)\"")
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 12)
+                        } else if query.isEmpty {
+                            // Group by category when not searching
+                            ForEach(XformCategory.allCases) { cat in
+                                let catItems = XformCatalog.all.filter { $0.category == cat }
+                                if !catItems.isEmpty {
+                                    Text(cat.rawValue)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.secondary)
+                                        .padding(.horizontal, 16)
+                                        .padding(.top, 10)
+                                        .padding(.bottom, 2)
+                                    ForEach(catItems) { d in
+                                        addRow(d)
+                                    }
+                                }
+                            }
+                        } else {
+                            // Flat list while searching
+                            ForEach(filtered) { d in
+                                addRow(d)
+                            }
+                        }
+                    }
+                    .padding(.bottom, 8)
+                }
+                .frame(height: min(CGFloat(max(filtered.isEmpty ? 1 : filtered.count, 4)) * 36 + 8, 320))
+            }
+            .frame(width: 260)
+            .onExitCommand {
+                showSearch = false
+                query = ""
+            }
+        }
+    }
+
+    @ViewBuilder private func addRow(_ d: XformDescriptor) -> some View {
+        Button {
+            model.addStep(d.kind)
+            showSearch = false
+            query = ""
+        } label: {
+            HStack {
+                Text(d.title)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if !query.isEmpty {
+                    Text(d.category.rawValue)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -1362,11 +1613,12 @@ struct XformChipRow: View {
 
     var body: some View {
         let desc = XformCatalog.descriptor(step.kind)
+        // P2: use design-token colors instead of raw `.green`/`.red`.
         let outcomeColor: Color = {
             switch outcome {
-            case .ok:      return .green
-            case .error:   return .red
-            case .skipped: return .secondary
+            case .ok:      return .troveSuccess
+            case .error:   return .troveError
+            case .skipped: return .troveFgMute
             }
         }()
 
@@ -1397,7 +1649,7 @@ struct XformChipRow: View {
                 if case .error(let msg) = outcome {
                     Text(msg)
                         .font(.caption)
-                        .foregroundStyle(.red)
+                        .foregroundStyle(Color.troveError)
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
@@ -1428,7 +1680,9 @@ struct XformChipRow: View {
             Button { model.removeStep(id: step.id) } label: {
                 Image(systemName: "xmark.circle.fill")
                     .symbolRenderingMode(.palette)
-                    .foregroundStyle(.white, .red.opacity(0.7))
+                    // P2: was `.white` raw color; use troveBg so the icon
+                    // reads correctly on both light and dark backgrounds.
+                    .foregroundStyle(Color.troveBg, Color.troveError.opacity(0.7))
             }
             .buttonStyle(.plain)
             .help("Remove this step")
@@ -1445,6 +1699,9 @@ struct XformChipRow: View {
                               lineWidth: isInspected ? 1.5 : 0.5)
         )
         .contentShape(Rectangle())
+        // P2: accessibility label and hint so VoiceOver users understand the chip.
+        .accessibilityLabel(chipAccessibilityLabel)
+        .accessibilityHint("Tap to inspect this step's output")
         .onTapGesture {
             // Real-time intermediate preview — clicking a chip scrubs the
             // output panel to that step's result.
@@ -1466,12 +1723,26 @@ struct XformChipRow: View {
 
     private func paramSummary(_ s: XformStep) -> String {
         switch s.kind {
-        case .linesAddPrefix: return s.param1.isEmpty ? "(no prefix)" : "“\(s.param1)”"
-        case .linesAddSuffix: return s.param1.isEmpty ? "(no suffix)" : "“\(s.param1)”"
+        case .linesAddPrefix: return s.param1.isEmpty ? "(no prefix)"  : "\"\(s.param1)\""
+        case .linesAddSuffix: return s.param1.isEmpty ? "(no suffix)"  : "\"\(s.param1)\""
         case .regexExtract:   return s.param1.isEmpty ? "(no pattern)" : "/\(s.param1)/"
-        case .regexReplace:   return s.param1.isEmpty ? "(no pattern)" : "/\(s.param1)/→\(s.param2)"
+        case .regexReplace:   return s.param1.isEmpty ? "(no pattern)" : "/\(s.param1)/ → \(s.param2)"
         default: return ""
         }
+    }
+
+    // P2: accessibility label for VoiceOver.
+    private var chipAccessibilityLabel: String {
+        let statusText: String
+        switch outcome {
+        case .ok:           statusText = "succeeded"
+        case .error(let m): statusText = "error: \(m)"
+        case .skipped:      statusText = "skipped"
+        }
+        let desc = XformCatalog.descriptor(step.kind)
+        let param = paramSummary(step)
+        let paramPart = param.isEmpty ? "" : ", \(param)"
+        return "Step \(index + 1): \(desc.title)\(paramPart), \(statusText)"
     }
 }
 
@@ -1510,25 +1781,25 @@ struct XformStepParamEditor: View {
         VStack(alignment: .leading, spacing: 10) {
             switch step.kind {
             case .linesAddPrefix:
-                Text("Prefix").font(.headline)
+                Text("Prefix").headerText()
                 TextField("e.g. >>> ", text: bindingForParam1())
                     .textFieldStyle(.roundedBorder)
             case .linesAddSuffix:
-                Text("Suffix").font(.headline)
+                Text("Suffix").headerText()
                 TextField("e.g. ;", text: bindingForParam1())
                     .textFieldStyle(.roundedBorder)
             case .regexExtract:
-                Text("Regex (NSRegularExpression syntax)").font(.headline)
+                Text("Regex (NSRegularExpression syntax)").headerText()
                 TextField("pattern, e.g. \\d+", text: bindingForParam1())
                     .textFieldStyle(.roundedBorder)
                     .font(.system(.body, design: .monospaced))
                 Text("Matches are joined with newlines.").font(.caption).foregroundStyle(.secondary)
             case .regexReplace:
-                Text("Regex").font(.headline)
+                Text("Regex").headerText()
                 TextField("pattern", text: bindingForParam1())
                     .textFieldStyle(.roundedBorder)
                     .font(.system(.body, design: .monospaced))
-                Text("Replacement").font(.headline)
+                Text("Replacement").headerText()
                 TextField("template, $1 backrefs supported", text: bindingForParam2())
                     .textFieldStyle(.roundedBorder)
                     .font(.system(.body, design: .monospaced))

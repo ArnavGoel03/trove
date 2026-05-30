@@ -41,7 +41,8 @@ private let qrCIContext = CIContext(options: nil)
 enum QRGenerator {
     /// Render `text` to a high-resolution NSImage. Throws on empty or too-long input,
     /// since CIQRCodeGenerator silently returns nil for unencodable payloads.
-    static func render(_ text: String, correction: QRCorrection, targetSize: CGFloat = 1024) throws -> NSImage {
+    static func render(_ text: String, correction: QRCorrection, targetSize: CGFloat = 1024,
+                       fgColor: NSColor = .black, bgColor: NSColor = .white) throws -> NSImage {
         if text.isEmpty { throw QRGenError.empty }
 
         // Red-team #3: encode as UTF-8 so emoji / non-ASCII round-trip cleanly.
@@ -55,7 +56,20 @@ enum QRGenerator {
         let filter = CIFilter.qrCodeGenerator()
         filter.message = data
         filter.correctionLevel = correction.rawValue
-        guard let output = filter.outputImage else { throw QRGenError.tooLong }
+        guard var output = filter.outputImage else { throw QRGenError.tooLong }
+
+        // P1: apply custom foreground/background colors via CIFalseColor.
+        // CIQRCodeGenerator produces a B&W image; CIFalseColor maps dark→fgColor,
+        // light→bgColor, letting power users brand their QR codes.
+        if fgColor != .black || bgColor != .white {
+            let falseColor = CIFilter(name: "CIFalseColor")!
+            falseColor.setValue(output, forKey: kCIInputImageKey)
+            falseColor.setValue(CIColor(cgColor: fgColor.cgColor), forKey: "inputColor0")
+            falseColor.setValue(CIColor(cgColor: bgColor.cgColor), forKey: "inputColor1")
+            if let colored = falseColor.outputImage {
+                output = colored
+            }
+        }
 
         // Red-team #4: native output is ~25–177px square. Scale to ≥1024 with
         // nearest-neighbor (default for CIImage transformed) so module edges stay crisp.
@@ -69,6 +83,68 @@ enum QRGenerator {
         }
         let pxSize = NSSize(width: cg.width, height: cg.height)
         return NSImage(cgImage: cg, size: pxSize)
+    }
+
+    // P1: SVG vector export. QR modules are rendered as filled rectangles so
+    // the output scales losslessly to any size. moduleSize determines the
+    // SVG unit size per module — 10 = 10px per module in the SVG coordinate
+    // space (scalable, so it doesn't matter for screen; larger = more readable
+    // when opened in a text editor).
+    static func svgString(_ text: String, correction: QRCorrection,
+                          moduleSize: Int = 10,
+                          fgHex: String = "#000000",
+                          bgHex: String = "#FFFFFF") throws -> String {
+        guard !text.isEmpty else { throw QRGenError.empty }
+        guard let data = text.data(using: .utf8) else { throw QRGenError.encoderFailed }
+        if data.count > 4296 { throw QRGenError.tooLong }
+
+        let filter = CIFilter.qrCodeGenerator()
+        filter.message = data
+        filter.correctionLevel = correction.rawValue
+        guard let output = filter.outputImage else { throw QRGenError.tooLong }
+        let extent = output.extent
+        guard extent.width > 0, extent.height > 0 else { throw QRGenError.encoderFailed }
+
+        // Render to a 1px-per-module bitmap to read individual modules.
+        let w = Int(extent.width)
+        let h = Int(extent.height)
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB) else {
+            throw QRGenError.encoderFailed
+        }
+        var raw = [UInt8](repeating: 0, count: w * h * 4)
+        guard let ctx = CGContext(data: &raw, width: w, height: h,
+                                  bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+              let cg = qrCIContext.createCGImage(output, from: extent) else {
+            throw QRGenError.encoderFailed
+        }
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+
+        let totalPx = w * moduleSize
+        var rects: [String] = []
+        for row in 0..<h {
+            for col in 0..<w {
+                let idx = (row * w + col) * 4
+                // Dark module = R channel < 128.
+                if raw[idx] < 128 {
+                    let x = col * moduleSize
+                    // SVG Y axis is top-down; CGImage row 0 is bottom in Core Graphics
+                    // but CIQRCodeGenerator renders top-down naturally (row 0 = top).
+                    let y = row * moduleSize
+                    rects.append("<rect x=\"\(x)\" y=\"\(y)\" width=\"\(moduleSize)\" height=\"\(moduleSize)\"/>")
+                }
+            }
+        }
+        let header = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 \(totalPx) \(totalPx)" \
+        width="\(totalPx)" height="\(totalPx)">
+        <rect width="100%" height="100%" fill="\(bgHex)"/>
+        <g fill="\(fgHex)">
+        """
+        let footer = "\n</g>\n</svg>"
+        return header + "\n" + rects.joined(separator: "\n") + footer
     }
 
     /// PNG bytes for an NSImage backed by a single CGImage. Prefers the
@@ -100,7 +176,12 @@ public struct QRView: View {
     @EnvironmentObject var stage: Stage
 
     @State private var text: String = ""
-    @State private var correction: QRCorrection = .M
+    // P1: persist last-used correction level across sessions.
+    @AppStorage("qr.correctionLevel") private var correctionRaw: String = QRCorrection.M.rawValue
+    private var correction: QRCorrection {
+        get { QRCorrection(rawValue: correctionRaw) ?? .M }
+        nonmutating set { correctionRaw = newValue.rawValue }
+    }
     @State private var image: NSImage? = nil
     @State private var errorText: String? = nil
     @State private var debounceTask: Task<Void, Never>? = nil
@@ -108,6 +189,18 @@ public struct QRView: View {
     /// the Save / drag / Save-to-Downloads affordances can treat it like
     /// any other on-disk capture (matching the pdf.swift pattern).
     @State private var materializedURL: URL? = nil
+
+    // P1: custom foreground/background colors for QR modules.
+    @State private var fgColor: Color = .black
+    @State private var bgColor: Color = .white
+    // P1: export size / resolution control (px on the longest side).
+    @State private var exportSize: CGFloat = 1024
+    private let exportSizeOptions: [(String, CGFloat)] = [
+        ("512 px",  512),
+        ("1024 px", 1024),
+        ("2048 px", 2048),
+        ("4096 px", 4096),
+    ]
 
     public init() {}
 
@@ -127,7 +220,10 @@ public struct QRView: View {
         .navigationSubtitle(subtitle)
         .toolbar { toolbar() }
         .onChange(of: text) { _ in scheduleRegen() }
-        .onChange(of: correction) { _ in scheduleRegen() }
+        .onChange(of: correctionRaw) { _ in scheduleRegen() }
+        .onChange(of: fgColor) { _ in scheduleRegen() }
+        .onChange(of: bgColor) { _ in scheduleRegen() }
+        .onChange(of: exportSize) { _ in scheduleRegen() }
         .onAppear {
             ingestSmartQRPayload(StageSmartActionQueue.shared.drain(.troveSmartOpenInQR))
         }
@@ -176,15 +272,40 @@ public struct QRView: View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text("Input").font(.headline)
+                    Text("Input").headerText()
                     Spacer()
-                    Picker("Error correction", selection: $correction) {
+                    // P1: @AppStorage-backed correction level picker.
+                    Picker("Error correction", selection: Binding(
+                        get: { correction },
+                        set: { correction = $0 }
+                    )) {
                         ForEach(QRCorrection.allCases) { Text($0.label).tag($0) }
                     }
                     .pickerStyle(.segmented)
                     .frame(maxWidth: 320)
                     .labelsHidden()
                     .help("Higher levels survive more damage but pack less data per pixel.")
+                }
+                // P1: custom colors + export resolution.
+                HStack(spacing: 16) {
+                    ColorPicker("Modules", selection: $fgColor, supportsOpacity: false)
+                        .labelsHidden()
+                    Text("on")
+                        .font(.caption).foregroundStyle(.secondary)
+                    ColorPicker("Background", selection: $bgColor, supportsOpacity: false)
+                        .labelsHidden()
+                    Text("bg")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Divider().frame(height: 22)
+                    Picker("Size", selection: $exportSize) {
+                        ForEach(exportSizeOptions, id: \.1) { label, val in
+                            Text(label).tag(val)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .frame(maxWidth: 120)
+                    .help("Raster export resolution (PNG/JPEG). SVG is always lossless.")
+                    Spacer()
                 }
                 ZStack(alignment: .topLeading) {
                     TextEditor(text: $text)
@@ -228,7 +349,7 @@ public struct QRView: View {
         Card {
             VStack(spacing: 12) {
                 HStack {
-                    Text("Preview").font(.headline)
+                    Text("Preview").headerText()
                     Spacer()
                     if let img = image {
                         Text("\(Int(img.size.width))×\(Int(img.size.height)) px")
@@ -400,6 +521,9 @@ public struct QRView: View {
         debounceTask?.cancel()
         let snapshotText = text
         let snapshotLevel = correction
+        let snapshotFg = fgColor
+        let snapshotBg = bgColor
+        let snapshotSize = exportSize
         if snapshotText.isEmpty {
             // Red-team #1: empty state — clear preview, keep actions disabled.
             image = nil
@@ -410,16 +534,23 @@ public struct QRView: View {
         debounceTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 200_000_000)
             if Task.isCancelled { return }
-            await regenerate(text: snapshotText, level: snapshotLevel)
+            await regenerate(text: snapshotText, level: snapshotLevel,
+                             fg: snapshotFg, bg: snapshotBg, size: snapshotSize)
         }
     }
 
     @MainActor
-    private func regenerate(text: String, level: QRCorrection) async {
+    private func regenerate(text: String, level: QRCorrection,
+                             fg: Color, bg: Color, size: CGFloat) async {
+        let fgNS = NSColor(fg)
+        let bgNS = NSColor(bg)
         // Off-main render so a 4 KB payload doesn't hitch the editor.
         let result: Result<NSImage, QRGenError> = await Task.detached(priority: .userInitiated) {
             do {
-                let img = try QRGenerator.render(text, correction: level)
+                let img = try QRGenerator.render(text, correction: level,
+                                                 targetSize: size,
+                                                 fgColor: fgNS,
+                                                 bgColor: bgNS)
                 return .success(img)
             } catch let e as QRGenError {
                 return .failure(e)
@@ -493,22 +624,69 @@ public struct QRView: View {
         }
     }
 
-    /// NSSavePanel-driven save: lets the user pick PNG / JPEG / PDF and the
-    /// destination. Remembers the last-used directory across sessions so the
-    /// repeat-save flow is one Return-key away. Mirrors the pdf.swift pattern.
+    // P1: derive a default filename from the payload (URL hostname, first word,
+    // or fallback to "qr"). Sanitise for filesystem safety.
+    private func defaultFilename(ext: String = "png") -> String {
+        let raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // If the payload looks like a URL, use the hostname.
+        if let url = URL(string: raw), let host = url.host, !host.isEmpty {
+            let safe = host.replacingOccurrences(of: "/", with: "-")
+                          .replacingOccurrences(of: ":", with: "-")
+                          .prefix(40)
+            return "qr-\(safe).\(ext)"
+        }
+        // Use the first word (up to 24 chars) of plain text.
+        let word = raw.components(separatedBy: .whitespacesAndNewlines).first ?? ""
+        let safe = word.prefix(24)
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+            .trimmingCharacters(in: .punctuationCharacters)
+        return safe.isEmpty ? "qr.\(ext)" : "qr-\(safe).\(ext)"
+    }
+
+    /// NSSavePanel-driven save: lets the user pick PNG / JPEG / PDF / SVG and
+    /// the destination. Remembers the last-used directory across sessions.
     private func saveAs() {
         guard let img = image else { return }
-        let stamp = Int(Date().timeIntervalSince1970)
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "qr-\(stamp).png"
-        // PNG default — QR is lossless; JPEG / PDF available via the format
-        // popup the panel renders from `allowedContentTypes`.
-        panel.allowedContentTypes = [.png, .jpeg, .pdf]
+        // P1: derive default name from payload.
+        panel.nameFieldStringValue = defaultFilename(ext: "png")
+        // PNG default — QR is lossless; JPEG / PDF / SVG available.
+        var types: [UTType] = [.png, .jpeg, .pdf]
+        if let svgType = UTType("public.svg-image") ?? UTType(filenameExtension: "svg") {
+            types.append(svgType)
+        }
+        panel.allowedContentTypes = types
         panel.canCreateDirectories = true
         panel.directoryURL = QRSaver.lastSaveDir() ?? QRSaver.downloadsDir()
+        let snapshotText = text
+        let snapshotLevel = correction
+        let snapshotFg = NSColor(fgColor)
+        let snapshotBg = NSColor(bgColor)
         panel.begin { resp in
             guard resp == .OK, let dest = panel.url else { return }
             QRSaver.setLastSaveDir(dest.deletingLastPathComponent())
+            // P1: SVG export path.
+            if dest.pathExtension.lowercased() == "svg" {
+                do {
+                    let fgHex = snapshotFg.hexString
+                    let bgHex = snapshotBg.hexString
+                    let svg = try QRGenerator.svgString(snapshotText,
+                                                        correction: snapshotLevel,
+                                                        fgHex: fgHex, bgHex: bgHex)
+                    if FileManager.default.fileExists(atPath: dest.path) {
+                        try FileManager.default.removeItem(at: dest)
+                    }
+                    try svg.data(using: .utf8)?.write(to: dest, options: .atomic)
+                    NSWorkspace.shared.activateFileViewerSelecting([dest])
+                    SharedStore.stage.flash("Saved \(dest.lastPathComponent)")
+                    OutputsLibrary.shared.record(url: dest, producer: "qr.svg",
+                                                  sourceLabel: "QR Code", kind: "image")
+                } catch {
+                    SharedStore.stage.flash("SVG save failed: \(error.localizedDescription)")
+                }
+                return
+            }
             do {
                 try QRSaver.write(img, to: dest)
                 NSWorkspace.shared.activateFileViewerSelecting([dest])
@@ -529,8 +707,8 @@ public struct QRView: View {
         let fm = FileManager.default
         let downloads = fm.urls(for: .downloadsDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: "\(NSHomeDirectory())/Downloads")
-        let stamp = Int(Date().timeIntervalSince1970)
-        let url = QRSaver.collisionFreeURL(in: downloads, name: "qr-\(stamp).png")
+        // P1: use payload-derived filename.
+        let url = QRSaver.collisionFreeURL(in: downloads, name: defaultFilename(ext: "png"))
         do {
             try png.write(to: url, options: .atomic)
             NSWorkspace.shared.activateFileViewerSelecting([url])
@@ -541,7 +719,7 @@ public struct QRView: View {
             // an NSSavePanel — the user-driven panel grants implicit access to
             // the chosen URL via Powerbox, no TCC prompt required.
             let panel = NSSavePanel()
-            panel.nameFieldStringValue = "qr-\(stamp).png"
+            panel.nameFieldStringValue = defaultFilename(ext: "png")
             panel.allowedContentTypes = [.png]
             panel.canCreateDirectories = true
             panel.directoryURL = downloads
@@ -586,6 +764,27 @@ public struct QRView: View {
         guard let img = image else { return }
         stage.addImage(img)
         stage.flash("QR added to Stage")
+    }
+}
+
+// ===========================================================================
+// MARK: - NSColor hex helper
+// ===========================================================================
+
+private extension NSColor {
+    /// Returns "#RRGGBB" in sRGB. Used for SVG export color attributes.
+    var hexString: String {
+        let c = usingColorSpace(.sRGB) ?? self
+        let r = Int((c.redComponent   * 255).rounded().clamped(to: 0...255))
+        let g = Int((c.greenComponent * 255).rounded().clamped(to: 0...255))
+        let b = Int((c.blueComponent  * 255).rounded().clamped(to: 0...255))
+        return String(format: "#%02X%02X%02X", r, g, b)
+    }
+}
+
+private extension Comparable {
+    func clamped(to range: ClosedRange<Self>) -> Self {
+        min(max(self, range.lowerBound), range.upperBound)
     }
 }
 

@@ -19,6 +19,7 @@
 import AppKit
 import Foundation
 import CryptoKit
+import os
 
 // ===========================================================================
 // MARK: - AutoInstaller
@@ -80,13 +81,25 @@ final class AutoInstaller: NSObject, URLSessionDownloadDelegate {
     private static let maxDownloadBytes: Int64 = 200 * 1024 * 1024  // 200 MB
     private static let downloadTimeout: TimeInterval = 300           // 5 min
 
-    private static let stagingDir = URL(
-        fileURLWithPath: "/tmp/trove-update-staging", isDirectory: true)
-    private static let zipTmp = URL(
-        fileURLWithPath: "/tmp/trove-update.zip", isDirectory: false)
+    // P0 fix: use per-run UUID-namespaced staging paths instead of fixed /tmp
+    // paths so two rapid installs (e.g. double-click of "Install Now") cannot
+    // collide on the same file and leave a leaked continuation hanging forever.
+    private static func makeStagingDir() -> URL {
+        let base = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        return base.appendingPathComponent("trove-update-\(UUID().uuidString)", isDirectory: true)
+    }
+    private static func makeZipTmp(in dir: URL) -> URL {
+        dir.appendingPathComponent("trove-update.zip", isDirectory: false)
+    }
 
-    // Continuation that receives the downloaded file URL from the delegate.
-    private var downloadContinuation: CheckedContinuation<URL, Error>?
+    // P0 fix: protect downloadContinuation with os_unfair_lock so concurrent
+    // delegate callbacks (didFinish / didComplete arriving on different threads)
+    // can never double-resume the continuation, which would trap.
+    // The lock is `nonisolated(unsafe)` because URLSessionDownloadDelegate
+    // callbacks arrive on arbitrary queues (not the @MainActor), yet they need
+    // to mutate downloadContinuation atomically.
+    nonisolated(unsafe) private var _contLock = os_unfair_lock_s()
+    nonisolated(unsafe) private var downloadContinuation: CheckedContinuation<URL, Error>?
 
     private override init() {}
 
@@ -98,6 +111,9 @@ final class AutoInstaller: NSObject, URLSessionDownloadDelegate {
     /// On success this method does NOT return — the process exits after
     /// handing off to the new app instance.
     func installUpdate(zipURL: URL, expectedVersion: String) async throws {
+        // P0 fix: inProgress guard is the very first op so a double-click on
+        // "Install Now" immediately throws on the second call — the first
+        // downloadContinuation is never raced or leaked.
         guard !inProgress else { throw InstallError.alreadyInProgress }
         inProgress = true
         defer { inProgress = false }
@@ -109,27 +125,29 @@ final class AutoInstaller: NSObject, URLSessionDownloadDelegate {
         // Refuse MAS builds.
         try await assertNotMASBuild(bundleURL)
 
+        // P0 fix: per-run unique staging directory so two rapid invocations
+        // can never step on each other's staged files.
+        let stagingDir = Self.makeStagingDir()
+        let zipTmp = Self.makeZipTmp(in: stagingDir)
+        try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+
         // Cleanup staging artefacts whether we succeed or fail.
         defer {
-            try? FileManager.default.removeItem(at: Self.zipTmp)
-            try? FileManager.default.removeItem(at: Self.stagingDir)
+            try? FileManager.default.removeItem(at: stagingDir)
         }
 
         // ── 1. Download ────────────────────────────────────────────────────
         await setStatus("Downloading update…")
-        let localZip = try await downloadZip(from: zipURL)
+        let localZip = try await downloadZip(from: zipURL, stagingDir: stagingDir, zipTmp: zipTmp)
 
-        // ── 2. Size sanity ─────────────────────────────────────────────────
-        let attrs = try FileManager.default.attributesOfItem(atPath: localZip.path)
-        let fileSize = attrs[.size] as? Int ?? 0
-        guard fileSize > 0 else { throw InstallError.downloadEmpty }
+        // ── 2. Size sanity (done inside downloadZip) ───────────────────────
 
         // ── 3. Unpack ──────────────────────────────────────────────────────
         await setStatus("Unpacking…")
-        try await unpackZip(at: localZip, to: Self.stagingDir)
+        try await unpackZip(at: localZip, to: stagingDir)
 
         // ── 4. Locate .app ─────────────────────────────────────────────────
-        let newApp = Self.stagingDir.appendingPathComponent("Trove.app")
+        let newApp = stagingDir.appendingPathComponent("Trove.app")
         guard FileManager.default.fileExists(atPath: newApp.path) else {
             throw InstallError.appNotFound
         }
@@ -178,15 +196,14 @@ final class AutoInstaller: NSObject, URLSessionDownloadDelegate {
     // MARK: Download
     // -----------------------------------------------------------------------
 
-    private func downloadZip(from remoteURL: URL) async throws -> URL {
+    private func downloadZip(from remoteURL: URL,
+                              stagingDir: URL,
+                              zipTmp: URL) async throws -> URL {
         // Fix 5: validate URL scheme and host before making any network call.
         guard remoteURL.scheme == "https",
               let host = remoteURL.host,
               host == "github.com" || host.hasSuffix(".github.com")
         else { throw InstallError.invalidDownloadURL }
-
-        // Remove any leftover zip from a previous failed attempt.
-        try? FileManager.default.removeItem(at: Self.zipTmp)
 
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest  = Self.downloadTimeout
@@ -199,17 +216,30 @@ final class AutoInstaller: NSObject, URLSessionDownloadDelegate {
         defer { session.invalidateAndCancel() }
 
         let localURL: URL = try await withCheckedThrowingContinuation { cont in
+            // P0 fix: serialize continuation assignment under the lock so
+            // two concurrent delegate callbacks can't double-resume.
+            os_unfair_lock_lock(&_contLock)
             self.downloadContinuation = cont
+            os_unfair_lock_unlock(&_contLock)
             let task = session.downloadTask(with: remoteURL)
             task.resume()
         }
 
-        // Move temp download to our known path so cleanup is deterministic.
-        if localURL != Self.zipTmp {
-            try? FileManager.default.removeItem(at: Self.zipTmp)
-            try FileManager.default.moveItem(at: localURL, to: Self.zipTmp)
+        // Move temp download to our known stable path so cleanup is deterministic.
+        if localURL != zipTmp {
+            try? FileManager.default.removeItem(at: zipTmp)
+            try FileManager.default.moveItem(at: localURL, to: zipTmp)
         }
-        return Self.zipTmp
+
+        // P0 fix: verify download size > 0 and within allowed cap before proceeding.
+        let attrs = try FileManager.default.attributesOfItem(atPath: zipTmp.path)
+        let downloadedSize = (attrs[.size] as? Int64) ?? 0
+        guard downloadedSize > 0 else { throw InstallError.downloadEmpty }
+        guard downloadedSize <= Self.maxDownloadBytes else {
+            throw InstallError.downloadFailed(0)
+        }
+
+        return zipTmp
     }
 
     // -----------------------------------------------------------------------
@@ -226,10 +256,7 @@ final class AutoInstaller: NSObject, URLSessionDownloadDelegate {
         // Hard cap: abort if the download grows past the limit.
         if totalBytesWritten > AutoInstaller.maxDownloadBytes {
             downloadTask.cancel()
-            Task { @MainActor in
-                self.downloadContinuation?.resume(throwing: InstallError.downloadFailed(0))
-                self.downloadContinuation = nil
-            }
+            resumeAndClearContinuation(throwing: InstallError.downloadFailed(0))
             return
         }
         let frac: Double
@@ -252,26 +279,19 @@ final class AutoInstaller: NSObject, URLSessionDownloadDelegate {
         // Validate HTTP status before accepting.
         let code = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(code) else {
-            Task { @MainActor in
-                self.downloadContinuation?.resume(throwing: InstallError.downloadFailed(code))
-                self.downloadContinuation = nil
-            }
+            resumeAndClearContinuation(throwing: InstallError.downloadFailed(code))
             return
         }
-        // Copy to a stable path before URLSession deletes the temp file.
-        let stable = AutoInstaller.zipTmp
+        // Copy to a stable temp path before URLSession deletes the temp file.
+        // We copy (not move) because URLSession owns the temp file's lifetime
+        // and may delete it immediately after this callback returns.
+        let stable = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("trove-dl-stable-\(UUID().uuidString).zip")
         do {
-            try? FileManager.default.removeItem(at: stable)
             try FileManager.default.copyItem(at: location, to: stable)
-            Task { @MainActor in
-                self.downloadContinuation?.resume(returning: stable)
-                self.downloadContinuation = nil
-            }
+            resumeAndClearContinuation(returning: stable)
         } catch {
-            Task { @MainActor in
-                self.downloadContinuation?.resume(throwing: error)
-                self.downloadContinuation = nil
-            }
+            resumeAndClearContinuation(throwing: error)
         }
     }
 
@@ -281,11 +301,28 @@ final class AutoInstaller: NSObject, URLSessionDownloadDelegate {
         didCompleteWithError error: Error?
     ) {
         guard let err = error else { return }
-        Task { @MainActor in
-            // If the continuation was already resumed (success path), this is a no-op.
-            self.downloadContinuation?.resume(throwing: err)
-            self.downloadContinuation = nil
-        }
+        // P0 fix: if the continuation was already resumed (success path), the
+        // lock ensures this is a no-op — the nil check is atomic under the lock.
+        resumeAndClearContinuation(throwing: err)
+    }
+
+    /// P0 fix: atomically consume the continuation under the lock, then resume
+    /// it outside the lock. This ensures double-resume is structurally impossible
+    /// regardless of which delegate callback arrives first.
+    nonisolated private func resumeAndClearContinuation(throwing error: Error) {
+        os_unfair_lock_lock(&_contLock)
+        let cont = downloadContinuation
+        downloadContinuation = nil
+        os_unfair_lock_unlock(&_contLock)
+        cont?.resume(throwing: error)
+    }
+
+    nonisolated private func resumeAndClearContinuation(returning value: URL) {
+        os_unfair_lock_lock(&_contLock)
+        let cont = downloadContinuation
+        downloadContinuation = nil
+        os_unfair_lock_unlock(&_contLock)
+        cont?.resume(returning: value)
     }
 
     // -----------------------------------------------------------------------
@@ -329,10 +366,17 @@ final class AutoInstaller: NSObject, URLSessionDownloadDelegate {
 
         // Fix 1: verify that the signing authority is a Developer ID Application
         // cert (not a free-tier Apple Development / Mac Developer cert).
-        let escaped = appURL.path.replacingOccurrences(of: "\"", with: "\\\"")
+        // P1 fix: the previous `"\(escaped)"` quote pattern only escaped `"`
+        // — `$` and backticks were still live in the shell string. With Trove
+        // installed at `/Applications` the path is trusted, but adversarial
+        // paths (e.g. an attacker-controlled `~/Downloads/Trove.app`) could
+        // execute arbitrary subshells. Single-quote the path with the POSIX
+        // `'\''` close-reopen pattern; that suppresses ALL shell interpolation
+        // for arbitrary path content.
+        let singleQuoted = Self.posixSingleQuote(appURL.path)
         let (displayOut, _): (String, Int32) = try await Task.detached {
             runShell("/bin/sh",
-                     ["-c", "/usr/bin/codesign --display --verbose=4 \"\(escaped)\" 2>&1"],
+                     ["-c", "/usr/bin/codesign --display --verbose=4 \(singleQuoted) 2>&1"],
                      timeout: 15)
         }.value
 
@@ -346,6 +390,18 @@ final class AutoInstaller: NSObject, URLSessionDownloadDelegate {
         }
     }
 
+    /// POSIX-safe single-quote wrap for arbitrary strings embedded in a
+    /// `/bin/sh -c "…"` command. Inside single quotes, every character is
+    /// literal except `'` itself — so to embed a literal `'` we close the
+    /// single-quoted run with `'`, escape the `'` with `\'`, then re-open the
+    /// single-quoted run with `'`. The whole compound is `'\''`. Result: a
+    /// path containing `$(rm -rf /)` is rendered as the literal seven-char
+    /// substring with no shell interpretation. Cheaper and safer than
+    /// rewriting to use Process+executableURL+second-Pipe just for stderr.
+    nonisolated static func posixSingleQuote(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
     // -----------------------------------------------------------------------
     // MARK: MAS detection
     // -----------------------------------------------------------------------
@@ -353,10 +409,12 @@ final class AutoInstaller: NSObject, URLSessionDownloadDelegate {
     private func assertNotMASBuild(_ appURL: URL) async throws {
         // Fix 4: codesign --display --verbose=4 writes Authority lines to stderr;
         // redirect 2>&1 through /bin/sh so we capture them.
-        let escaped = appURL.path.replacingOccurrences(of: "\"", with: "\\\"")
+        // P1 fix: see codesign-verify above — single-quote with POSIX escape
+        // to suppress shell interpolation of `$`/backtick on adversarial paths.
+        let singleQuoted = Self.posixSingleQuote(appURL.path)
         let (out, _): (String, Int32) = try await Task.detached {
             runShell("/bin/sh",
-                     ["-c", "/usr/bin/codesign --display --verbose=4 \"\(escaped)\" 2>&1"],
+                     ["-c", "/usr/bin/codesign --display --verbose=4 \(singleQuoted) 2>&1"],
                      timeout: 15)
         }.value
 

@@ -287,6 +287,58 @@ enum FinderTweakCatalog {
             warning: nil,
             isApplyAll: true
         ),
+        // 10. Disable window resize/open animation (snappier feel, no visual noise)
+        FinderTweak(
+            id: "noanim",
+            title: "Disable window open/close animation",
+            explanation: "Sets the window animation duration to 0 — Finder windows open and close instantly instead of zooming in from the Dock. Much closer to Windows behavior.",
+            domain: "NSGlobalDomain",
+            key: "NSAutomaticWindowAnimationsEnabled",
+            onValue: .bool(false),
+            off: .bool,
+            restart: .none,
+            warning: nil,
+            isApplyAll: true
+        ),
+        // 11. ⌘Q quits Finder (instead of just closing windows)
+        FinderTweak(
+            id: "cmdqfinder",
+            title: "⌘Q quits Finder",
+            explanation: "Without this, ⌘Q in Finder does nothing. Enable it to make Finder behave like every other app — ⌘Q terminates the process. You can always relaunch it.",
+            domain: "com.apple.finder",
+            key: "QuitMenuItem",
+            onValue: .bool(true),
+            off: .bool,
+            restart: .finder,
+            warning: nil,
+            isApplyAll: true
+        ),
+        // 12. Expanded save/open dialogs by default
+        FinderTweak(
+            id: "expandsave",
+            title: "Expanded save dialogs by default",
+            explanation: "Shows the full filesystem navigator when saving files instead of the minimal name-only dialog. Windows refugees miss this every single day.",
+            domain: "NSGlobalDomain",
+            key: "NSNavPanelExpandedStateForSaveMode",
+            onValue: .bool(true),
+            off: .bool,
+            restart: .none,
+            warning: nil,
+            isApplyAll: true
+        ),
+        // 13. Disable Resume (don't reopen windows from last session)
+        FinderTweak(
+            id: "noresume",
+            title: "Disable window resume across app restarts",
+            explanation: "Prevents macOS from reopening the windows each app had open last session. Speeds up restarts and avoids \"why did this open automatically?\" surprise.",
+            domain: "com.apple.systempreferences",
+            key: "NSQuitAlwaysKeepsWindows",
+            onValue: .bool(false),
+            off: .bool,
+            restart: .none,
+            warning: nil,
+            isApplyAll: false
+        ),
     ]
 }
 
@@ -302,35 +354,54 @@ enum FinderPath {
         case error(String)
     }
 
+    /// Async version — never blocks main. The synchronous DispatchGroup.wait
+    /// could stall main for up to 5 s (SECURITY: AppleScript calls Finder via
+    /// XPC, which can deadlock if main is busy). Run entirely off-main and
+    /// return the outcome via async/await so callers can stay on @MainActor.
+    static func currentPathAsync() async -> Outcome {
+        return await Task.detached(priority: .userInitiated) {
+            let src = #"tell application "Finder" to get POSIX path of (target of front window as alias)"#
+            guard let script = NSAppleScript(source: src) else {
+                return Outcome.error("Could not compile AppleScript")
+            }
+            var errInfo: NSDictionary?
+            let descriptor = script.executeAndReturnError(&errInfo)
+
+            if let info = errInfo {
+                let num = (info[NSAppleScript.errorNumber] as? Int) ?? 0
+                let msg = (info[NSAppleScript.errorMessage] as? String) ?? "Unknown AppleScript error"
+                if num == -1728 || msg.localizedCaseInsensitiveContains("can't get target of front window") {
+                    return .noWindow
+                }
+                if num == -1743 || num == 1002
+                    || msg.localizedCaseInsensitiveContains("not authorized")
+                    || msg.localizedCaseInsensitiveContains("not allowed") {
+                    return .automationDenied
+                }
+                return .error("AppleScript error \(num): \(msg)")
+            }
+            guard let path = descriptor.stringValue, !path.isEmpty else {
+                return .noWindow
+            }
+            return .ok(path)
+        }.value
+    }
+
+    // Keep the synchronous variant for any callers that are already off-main.
     static func currentPath() -> Outcome {
         let src = #"tell application "Finder" to get POSIX path of (target of front window as alias)"#
         guard let script = NSAppleScript(source: src) else {
             return .error("Could not compile AppleScript")
         }
-        let group = DispatchGroup()
-        group.enter()
         var errInfo: NSDictionary?
-        var descriptor: NSAppleEventDescriptor?
-        DispatchQueue.global(qos: .userInitiated).async {
-            var err: NSDictionary?
-            descriptor = script.executeAndReturnError(&err)
-            errInfo = err
-            group.leave()
-        }
-        if group.wait(timeout: .now() + 5.0) == .timedOut {
-            return .error("Finder is unresponsive — AppleScript timed out")
-        }
+        let descriptor = script.executeAndReturnError(&errInfo)
 
         if let info = errInfo {
             let num = (info[NSAppleScript.errorNumber] as? Int) ?? 0
             let msg = (info[NSAppleScript.errorMessage] as? String) ?? "Unknown AppleScript error"
-            // -1728: object not found (no front Finder window).
             if num == -1728 || msg.localizedCaseInsensitiveContains("can't get target of front window") {
                 return .noWindow
             }
-            // -1743: not authorized to send Apple events.
-            //  -600: application isn't running.
-            // 1002 / "not allowed assistive access" — Automation privacy gate.
             if num == -1743 || num == 1002
                 || msg.localizedCaseInsensitiveContains("not authorized")
                 || msg.localizedCaseInsensitiveContains("not allowed") {
@@ -338,10 +409,7 @@ enum FinderPath {
             }
             return .error("AppleScript error \(num): \(msg)")
         }
-
-        // Keep the AppleScript result as String — `stringValue` honors UTF-16,
-        // so non-ASCII path components (e.g. ~/Документы) round-trip cleanly.
-        guard let path = descriptor?.stringValue, !path.isEmpty else {
+        guard let path = descriptor.stringValue, !path.isEmpty else {
             return .noWindow
         }
         return .ok(path)
@@ -387,6 +455,7 @@ final class FinderTweaksModel: ObservableObject {
     /// or replaced by a non-permission error.
     @Published var pathAutomationDenied: Bool = false
     @Published var didConfirmRestart: Bool = false        // once-per-session NSAlert gate
+    @Published var isRevertingAll: Bool = false
 
     let tweaks: [FinderTweak] = FinderTweakCatalog.all
 
@@ -644,47 +713,95 @@ final class FinderTweaksModel: ObservableObject {
     }
 
     // -----------------------------------------------------------------------
-    // Path actions
+    // Revert all to system defaults
     // -----------------------------------------------------------------------
 
-    /// Fetch + clipboard. Returns the tildified path (or nil on failure).
-    @discardableResult
-    func copyCurrentFinderPath() -> String? {
-        switch FinderPath.currentPath() {
-        case .ok(let p):
-            let tilde = FinderPath.tildify(p)
+    /// Destructive-confirm for reverting every tweak back to its system default.
+    func confirmRevertAll() -> Bool {
+        let a = NSAlert()
+        a.alertStyle = .critical
+        a.messageText = "Revert all Finder tweaks to macOS defaults?"
+        a.informativeText = "This will undo all active toggles and restart Finder and the Dock. Your previous customisations cannot be recovered unless you re-apply them manually."
+        a.addButton(withTitle: "Revert All")
+        a.addButton(withTitle: "Cancel")
+        return a.runModal() == .alertFirstButtonReturn
+    }
+
+    /// Revert every currently-active tweak back to its OFF state, then restart.
+    func revertAllToDefaults() async -> (reverted: Int, failed: Int) {
+        // Phase 1: confirm on main (NSAlert must be main).
+        guard confirmRevertAll() else { return (0, 0) }
+        isRevertingAll = true
+        defer { Task { @MainActor [weak self] in self?.isRevertingAll = false } }
+
+        // Snapshot which tweaks are ON so we can turn them off.
+        let activeRows = rows.filter { $0.on }
+        let activePairs: [(FinderTweak, FinderTweakRowState)] = activeRows.compactMap { state in
+            guard let t = tweak(state.id) else { return nil }
+            return (t, state)
+        }
+
+        return await Task.detached(priority: .userInitiated) { [weak self] in
+            var reverted = 0, failed = 0
+            var nfr = false, ndr = false
+            for (t, state) in activePairs {
+                // Restore prior raw value if we captured one, otherwise apply(false).
+                let err: String?
+                if let prior = state.priorRawOnEnable {
+                    err = FinderTweaksModel.restorePriorRawSync(tweak: t, raw: prior)
+                } else {
+                    err = t.apply(false)
+                }
+                if err != nil { failed += 1; continue }
+                reverted += 1
+                switch t.restart {
+                case .finder: nfr = true
+                case .dock:   ndr = true
+                case .none:   break
+                }
+            }
+            if nfr { _ = FinderShell.run("/usr/bin/killall", ["Finder"]) }
+            if ndr { _ = FinderShell.run("/usr/bin/killall", ["Dock"]) }
+            await MainActor.run { self?.refreshAll() }
+            return (reverted, failed)
+        }.value
+    }
+
+    // -----------------------------------------------------------------------
+    // Path actions (fully off-main via async API)
+    // -----------------------------------------------------------------------
+
+    /// Fetch path off-main, then copy to clipboard on @MainActor.
+    func copyCurrentFinderPath() async -> String? {
+        let outcome = await FinderPath.currentPathAsync()
+        // Apply result on @MainActor (this method is already @MainActor via class isolation).
+        return applyPathOutcome(outcome) { tilde in
             let pb = NSPasteboard.general
             pb.clearContents()
             pb.setString(tilde, forType: .string)
-            lastPath = tilde
-            pathStatus = nil
-            pathAutomationDenied = false
-            return tilde
-        case .noWindow:
-            pathStatus = "No Finder window open."
-            pathAutomationDenied = false
-            return nil
-        case .automationDenied:
-            pathStatus = "Finder automation not allowed — grant in System Settings → Privacy & Security → Automation → Trove → Finder."
-            pathAutomationDenied = true
-            return nil
-        case .error(let msg):
-            pathStatus = msg
-            pathAutomationDenied = false
-            return nil
         }
     }
 
-    /// Fetch + send to Stage as a text item. Returns the tildified path (or nil).
+    /// Fetch path off-main, then send to Stage on @MainActor.
+    func sendCurrentFinderPathToStage(via stage: Stage) async -> String? {
+        let outcome = await FinderPath.currentPathAsync()
+        return applyPathOutcome(outcome) { tilde in
+            stage.addText(tilde)
+        }
+    }
+
+    /// Common outcome handler — must be called on @MainActor.
+    @MainActor
     @discardableResult
-    func sendCurrentFinderPathToStage(via stage: Stage) -> String? {
-        switch FinderPath.currentPath() {
+    private func applyPathOutcome(_ outcome: FinderPath.Outcome,
+                                  onSuccess: (String) -> Void) -> String? {
+        switch outcome {
         case .ok(let p):
             let tilde = FinderPath.tildify(p)
-            stage.addText(tilde)
             lastPath = tilde
             pathStatus = nil
             pathAutomationDenied = false
+            onSuccess(tilde)
             return tilde
         case .noWindow:
             pathStatus = "No Finder window open."
@@ -742,7 +859,7 @@ public struct FinderTweaksView: View {
                     .font(.system(size: 36, weight: .light))
                     .foregroundStyle(.orange)
                 Text("Finder isn't running")
-                    .font(.headline)
+                    .headerText()
                 Text("Toggles still work (they write to defaults), but \"Copy current Finder path\" and any restart-Finder side effects won't fire until Finder is back. Trove can re-launch it for you.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -781,26 +898,46 @@ public struct FinderTweaksView: View {
                         .font(.title2)
                         .foregroundStyle(.tint)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Day-1 Finder defaults").font(.headline)
+                        Text("Day-1 Finder defaults").headerText()
                         Text("Plain-English toggles for the same `defaults write` recipes every Mac-tips blog tells you to copy-paste. Every change is reversible.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Button {
-                        Task {
-                            let r = await model.applyAllSwitcherDefaults()
-                            if r.failed == 0 {
-                                stage.flash("Applied \(r.applied) Finder tweaks")
-                            } else {
-                                stage.flash("Applied \(r.applied), \(r.failed) failed — see rows")
+                    VStack(alignment: .trailing, spacing: 6) {
+                        Button {
+                            Task {
+                                let r = await model.applyAllSwitcherDefaults()
+                                if r.failed == 0 {
+                                    stage.flash("Applied \(r.applied) Finder tweaks")
+                                } else {
+                                    stage.flash("Applied \(r.applied), \(r.failed) failed — see rows")
+                                }
                             }
+                        } label: {
+                            Label("Apply all switcher defaults", systemImage: "checkmark.circle.fill")
                         }
-                    } label: {
-                        Label("Apply all switcher defaults", systemImage: "checkmark.circle.fill")
+                        .controlSize(.large)
+                        .help("Turns on all non-security toggles at once and restarts Finder/Dock once.")
+
+                        // Destructive revert — only show when at least one tweak is ON.
+                        if model.rows.contains(where: { $0.on }) {
+                            Button(role: .destructive) {
+                                Task {
+                                    let r = await model.revertAllToDefaults()
+                                    if r.reverted > 0 {
+                                        stage.flash("Reverted \(r.reverted) tweaks to macOS defaults")
+                                    } else if r.failed > 0 {
+                                        stage.flash("Revert had \(r.failed) errors — check individual rows", kind: .warning)
+                                    }
+                                }
+                            } label: {
+                                Label("Revert all to defaults", systemImage: "arrow.counterclockwise.circle")
+                            }
+                            .disabled(model.isRevertingAll)
+                            .help("Undo all active tweaks and restart Finder/Dock.")
+                        }
                     }
-                    .controlSize(.large)
-                    .help("Turns on all non-security toggles at once and restarts Finder/Dock once.")
                 }
             }
         }
@@ -816,7 +953,7 @@ public struct FinderTweaksView: View {
                 HStack {
                     Image(systemName: "folder.fill")
                         .foregroundStyle(.tint)
-                    Text("Current Finder path").font(.headline)
+                    Text("Current Finder path").headerText()
                     Spacer()
                     if let p = model.lastPath {
                         Text(p)
@@ -832,10 +969,12 @@ public struct FinderTweaksView: View {
 
                 HStack(spacing: 10) {
                     Button {
-                        if let p = model.copyCurrentFinderPath() {
-                            stage.flash("Copied: \(p)")
-                        } else if let err = model.pathStatus {
-                            flashPathError(err)
+                        Task { @MainActor in
+                            if let p = await model.copyCurrentFinderPath() {
+                                stage.flash("Copied: \(p)")
+                            } else if let err = model.pathStatus {
+                                flashPathError(err)
+                            }
                         }
                     } label: {
                         Label("Copy current Finder path", systemImage: "doc.on.doc")
@@ -844,10 +983,12 @@ public struct FinderTweaksView: View {
                     .help("⌘⇧C — copies the frontmost Finder window's path to the clipboard with ~ substitution.")
 
                     Button {
-                        if let p = model.sendCurrentFinderPathToStage(via: stage) {
-                            stage.flash("Sent to Stage: \(p)")
-                        } else if let err = model.pathStatus {
-                            flashPathError(err)
+                        Task { @MainActor in
+                            if let p = await model.sendCurrentFinderPathToStage(via: stage) {
+                                stage.flash("Sent to Stage: \(p)")
+                            } else if let err = model.pathStatus {
+                                flashPathError(err)
+                            }
                         }
                     } label: {
                         Label("Send Finder path to Stage", systemImage: "tray.and.arrow.up")
@@ -893,7 +1034,7 @@ public struct FinderTweaksView: View {
     private var togglesSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Toggles").font(.headline)
+                Text("Toggles").headerText()
                 Spacer()
                 Text("\(model.rows.filter { $0.on }.count) / \(model.rows.count) on")
                     .font(.caption.monospacedDigit())
@@ -925,10 +1066,12 @@ public struct FinderTweaksView: View {
             .help("Re-read every toggle's current state from `defaults` — handy if you changed something outside Trove.")
 
             Button {
-                if let p = model.copyCurrentFinderPath() {
-                    stage.flash("Copied: \(p)")
-                } else if let err = model.pathStatus {
-                    flashPathError(err)
+                Task { @MainActor in
+                    if let p = await model.copyCurrentFinderPath() {
+                        stage.flash("Copied: \(p)")
+                    } else if let err = model.pathStatus {
+                        flashPathError(err)
+                    }
                 }
             } label: {
                 Label("Copy Finder Path", systemImage: "doc.on.doc")
@@ -1003,7 +1146,7 @@ private struct FinderTweakRow: View {
                                     .foregroundStyle(.orange)
                                     .help(tweak.warning ?? "")
                             }
-                            Text(tweak.title).font(.headline)
+                            Text(tweak.title).headerText()
                             statusBadge
                             if let r = restartLabel {
                                 Text(r)

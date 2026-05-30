@@ -204,8 +204,8 @@ enum PermsCatalogue {
             id: "network",
             name: "Network",
             symbol: "network",
-            explanation: "macOS has no per-app TCC pane for outbound network. Manage via Network Extensions or third-party firewalls (Little Snitch, LuLu).",
-            deepLink: prefBase + "Privacy_Advertising", // best available landing inside Privacy
+            explanation: "macOS has no per-app TCC pane for outbound network. Manage via Network Extensions or third-party firewalls (Little Snitch, LuLu). The button below opens the Privacy & Security root pane.",
+            deepLink: prefBase + "Privacy",   // Privacy_Advertising is unrelated; use the root
             hasQuery: false),
     ]
 }
@@ -226,6 +226,11 @@ final class PermsStore: ObservableObject {
     // "unsafe" is fine in practice.
     nonisolated(unsafe) private var becomeActiveObserver: NSObjectProtocol?
 
+    /// Minimum seconds between successive auto-refresh calls. Prevents a rapid
+    /// app-active/resign cycle (e.g. an Alert dialog flashing in and out) from
+    /// queuing multiple back-to-back expensive TCC scans.
+    private static let minRefreshInterval: TimeInterval = 2.0
+
     init() {
         // red-team #1: user may flip a permission in System Settings while
         // this pane is open. Re-query on every app-active to keep the UI
@@ -237,7 +242,13 @@ final class PermsStore: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in await self?.refreshAll() }
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                // Debounce: skip if we refreshed very recently (< 2 s ago).
+                if let last = self.lastRefresh,
+                   Date().timeIntervalSince(last) < PermsStore.minRefreshInterval { return }
+                await self.refreshAll()
+            }
         }
     }
 
@@ -422,6 +433,12 @@ public struct PermissionsView: View {
                 .disabled(store.refreshing)
                 .keyboardShortcut("r", modifiers: .command)
             }
+        }
+        // .task fires only on first mount. .onAppear fires every time the user
+        // navigates back to this pane — necessary so stale statuses from a
+        // previous visit are refreshed without waiting for an app-activate cycle.
+        .onAppear {
+            Task { await store.refreshAll() }
         }
         .task {
             await store.refreshAll()
@@ -612,7 +629,7 @@ struct PermsCaveatCard: View {
                     .foregroundStyle(.secondary)
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Why can't Trove list every app's permissions?").headerText()
-                    Text("The macOS TCC database (`~/Library/Application Support/com.apple.TCC/TCC.db` and `/Library/Application Support/com.apple.TCC/TCC.db`) is owned by root and protected by SIP. Reading it requires Full Disk Access AND elevated privileges — neither is appropriate for a regular app. This pane shows what Trove itself has been granted (where the OS exposes a query) and gives you one-click access to every Privacy sub-pane so you can audit per-app grants there.")
+                    Text("macOS stores per-app privacy grants in a system-managed TCC database that is protected by SIP and owned by root. Reading it requires elevated privileges that are inappropriate for a regular app. This pane shows what Trove itself has been granted (where the OS exposes a query API) and gives you one-click access to every Privacy sub-pane so you can audit per-app grants there.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

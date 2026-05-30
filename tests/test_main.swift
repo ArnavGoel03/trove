@@ -478,10 +478,11 @@ func testCalc_has_currency() {
 func testFileHash_empty() async {
     let url = writeFixture("empty.bin", Data())
     do {
-        let (md5, sha1, sha2) = try await computeHashes(of: url, progress: { _ in })
+        let (md5, sha1, sha2, sha5) = try await computeHashes(of: url, progress: { _ in })
         assertEqual(md5, "d41d8cd98f00b204e9800998ecf8427e", "filehash.empty.md5")
         assertEqual(sha1, "da39a3ee5e6b4b0d3255bfef95601890afd80709", "filehash.empty.sha1")
         assertEqual(sha2, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "filehash.empty.sha256")
+        assertEqual(sha5, "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e", "filehash.empty.sha512")
     } catch {
         assertTrue(false, "filehash.empty", "threw: \(error)")
     }
@@ -490,10 +491,11 @@ func testFileHash_empty() async {
 func testFileHash_oneByte() async {
     let url = writeFixture("one.bin", Data([0x61]))  // "a"
     do {
-        let (md5, sha1, sha2) = try await computeHashes(of: url, progress: { _ in })
+        let (md5, sha1, sha2, sha5) = try await computeHashes(of: url, progress: { _ in })
         assertEqual(md5, "0cc175b9c0f1b6a831c399e269772661", "filehash.one.md5")
         assertEqual(sha1, "86f7e437faa5a7fce15d1ddcb9eaeaea377667b8", "filehash.one.sha1")
         assertEqual(sha2, "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb", "filehash.one.sha256")
+        assertEqual(sha5, "1f40fc92da241694750979ee6cf582f2d5d7d28e18335de05abc54d0560e0f5302860c652bf08d560252aa5e74210546f369fbbbce8c12cfc7957b2652fe9a75", "filehash.one.sha512")
     } catch {
         assertTrue(false, "filehash.one", "threw: \(error)")
     }
@@ -502,11 +504,16 @@ func testFileHash_oneByte() async {
 func testFileHash_oneMB_zeros() async {
     let url = writeFixture("zeros1mb.bin", Data(count: 1 << 20))
     do {
-        let (md5, sha1, sha2) = try await computeHashes(of: url, progress: { _ in })
+        let (md5, sha1, sha2, sha5) = try await computeHashes(of: url, progress: { _ in })
         // canonical: 1 MiB of zero bytes
         assertEqual(md5, "b6d81b360a5672d80c27430f39153e2c", "filehash.zeros1mb.md5")
         assertEqual(sha1, "3b71f43ff30f4b15b5cd85dd9e95ebc7e84eb5a3", "filehash.zeros1mb.sha1")
         assertEqual(sha2, "30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58", "filehash.zeros1mb.sha256")
+        // Cross-check sha5 against CryptoKit (canonical value for 1 MiB of zeros
+        // isn't memorized; structural check + independent compute is sufficient).
+        let cryptoSHA5 = SHA512.hash(data: Data(count: 1 << 20)).map { String(format: "%02x", $0) }.joined()
+        assertEqual(sha5, cryptoSHA5, "filehash.zeros1mb.sha512")
+        assertEqual(sha5.count, 128, "filehash.zeros1mb.sha512.length")
     } catch {
         assertTrue(false, "filehash.zeros1mb", "threw: \(error)")
     }
@@ -520,15 +527,18 @@ func testFileHash_5MB_chunked() async {
     let url = writeFixture("chunked5mb.bin", data)
     let ref = HashTripleHasher()
     ref.update(data)
-    let (refMD5, refSHA1, refSHA2) = ref.finalize()
-    // sanity vs CryptoKit's independent SHA256:
+    let (refMD5, refSHA1, refSHA2, refSHA5) = ref.finalize()
+    // sanity vs CryptoKit's independent SHA256 + SHA512:
     let cryptoKitSHA2 = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    let cryptoKitSHA5 = SHA512.hash(data: data).map { String(format: "%02x", $0) }.joined()
     assertEqual(refSHA2, cryptoKitSHA2, "filehash.5mb.ref.sha256.matches.cryptoKit")
+    assertEqual(refSHA5, cryptoKitSHA5, "filehash.5mb.ref.sha512.matches.cryptoKit")
     do {
-        let (md5, sha1, sha2) = try await computeHashes(of: url, progress: { _ in })
+        let (md5, sha1, sha2, sha5) = try await computeHashes(of: url, progress: { _ in })
         assertEqual(md5, refMD5, "filehash.5mb.md5")
         assertEqual(sha1, refSHA1, "filehash.5mb.sha1")
         assertEqual(sha2, refSHA2, "filehash.5mb.sha256")
+        assertEqual(sha5, refSHA5, "filehash.5mb.sha512")
     } catch {
         assertTrue(false, "filehash.5mb", "threw: \(error)")
     }
@@ -1119,6 +1129,76 @@ func runAllTests() async {
     await testPreconditionNotMainThread_returnsCleanlyOffMain()
     testCleanModel_init_does_not_blockMain()
     testFinderTweaksModel_init_does_not_blockMain()
+
+    // ---------- Semver-aware version comparator ----------
+    testVersion_numericSegmentCompare()
+    testVersion_doubleDigit_minor()
+    testVersion_releaseBeatsPrerelease()
+    testVersion_prereleaseNumeric()
+    testVersion_prereleaseAlphaBeatsNumeric()
+    testVersion_betaToRcPromotion()
+    testVersion_buildMetadataIgnored()
+    testVersion_isBetaBuild_detection()
+}
+
+// ===========================================================================
+// MARK: - Version comparator tests
+// ===========================================================================
+//
+// Documents the contract that `UpdateChecker._versionIsNewer` implements
+// semver §11 pre-release ordering: pre-release < release; numeric pre-release
+// identifiers compare numerically; numeric < alphanumeric per §11.4.4. Without
+// this comparator, a user on `1.1.0-beta.5` would never be offered the matching
+// stable `1.1.0` (the old comparator stripped the suffix and called them equal).
+
+func testVersion_numericSegmentCompare() {
+    assertTrue(UpdateChecker._versionIsNewer("1.10.0", than: "1.9.0"),  "version.numeric.tenGtNine")
+    assertTrue(UpdateChecker._versionIsNewer("2.0.0",  than: "1.99.9"), "version.numeric.majorWins")
+    assertFalse(UpdateChecker._versionIsNewer("1.0.7", than: "1.1.0"),  "version.numeric.lower")
+}
+
+func testVersion_doubleDigit_minor() {
+    assertTrue(UpdateChecker._versionIsNewer("1.10.0", than: "1.9.99"), "version.doubleDigit.minor.tenWins")
+}
+
+func testVersion_releaseBeatsPrerelease() {
+    assertTrue(UpdateChecker._versionIsNewer("1.1.0",  than: "1.1.0-beta.1"), "version.releaseBeatsBeta")
+    assertTrue(UpdateChecker._versionIsNewer("1.1.0",  than: "1.1.0-beta.99"), "version.releaseBeatsHighBeta")
+    assertFalse(UpdateChecker._versionIsNewer("1.1.0-beta.1", than: "1.1.0"), "version.betaLosesToRelease")
+}
+
+func testVersion_prereleaseNumeric() {
+    assertTrue(UpdateChecker._versionIsNewer("1.1.0-beta.2", than: "1.1.0-beta.1"),  "version.beta.2GtBeta.1")
+    assertTrue(UpdateChecker._versionIsNewer("1.1.0-beta.10", than: "1.1.0-beta.2"), "version.beta.numericNotLex")
+}
+
+func testVersion_prereleaseAlphaBeatsNumeric() {
+    // semver §11.4.3 + §11.4.4: numeric identifiers always rank lower than
+    // alphanumeric ones. So "1.1.0-rc.1" > "1.1.0-1"; and within the SAME
+    // first identifier, "rc" > "beta" lexically.
+    assertTrue(UpdateChecker._versionIsNewer("1.1.0-rc.1",  than: "1.1.0-beta.5"), "version.rcGtBeta")
+}
+
+func testVersion_betaToRcPromotion() {
+    // Beta → RC → Stable promotion path.
+    assertTrue(UpdateChecker._versionIsNewer("1.1.0-rc.1",   than: "1.1.0-beta.7"), "version.promote.betaToRc")
+    assertTrue(UpdateChecker._versionIsNewer("1.1.0",        than: "1.1.0-rc.3"),   "version.promote.rcToStable")
+}
+
+func testVersion_buildMetadataIgnored() {
+    // Per semver §10, build metadata after `+` MUST NOT affect precedence.
+    assertFalse(UpdateChecker._versionIsNewer("1.1.0+sha.abc", than: "1.1.0+sha.def"), "version.buildMeta.ignored")
+    assertTrue(UpdateChecker._versionIsNewer("1.1.0+sha.abc",  than: "1.0.9"),         "version.buildMeta.notLeading")
+}
+
+func testVersion_isBetaBuild_detection() {
+    // Sanity: the running build's own version is what `currentVersion()`
+    // returns. The fallback constant in updater.swift is the source of truth
+    // when CFBundleShortVersionString is the placeholder. As long as that
+    // constant carries a `-` suffix (1.1.0-beta.N), `isBetaBuild` is true.
+    let v = UpdateChecker.currentVersion() ?? ""
+    let hasDash = v.contains("-")
+    assertEqual(UpdateChecker.isBetaBuild(), hasDash, "version.isBetaBuild.matches.currentVersion")
 }
 
 // Documents the contract for `FinderTweaksModel.init()`: must not block main

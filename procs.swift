@@ -190,11 +190,18 @@ struct ProcGroup: Identifiable {
 /// PIDs we refuse to kill from the UI. `launchd` (1) and `kernel_task` (0) are
 /// the obvious ones — killing launchd reboots the box, kernel_task is unkillable
 /// anyway and the attempt just logs noise. WindowServer / loginwindow are also
-/// foot-guns. Red-team #3.
+/// foot-guns. Red-team #3. Extended with critical daemons per P1 requirements.
 private let procKillBlacklistPIDs: Set<Int32> = [0, 1]
 private let procKillBlacklistNames: Set<String> = [
     "kernel_task", "launchd", "WindowServer", "loginwindow",
     "logind", "coreaudiod", "systemstats", "powerd",
+    // P1: additional critical daemons whose kill would corrupt system state.
+    "cfprefsd",         // system preferences daemon — kill corrupts plist writes in-flight
+    "distnoted",        // distributed notifications — kills break IPC for many subsystems
+    "securityd",        // security services daemon — kills break Keychain, code-signing
+    "trustd",           // Trust daemon — kills break TLS cert validation systemwide
+    "mDNSResponder",    // Bonjour / local DNS — kills break network discovery
+    "UserEventAgent",   // system event dispatch — kills break notifications
 ]
 
 @MainActor
@@ -244,6 +251,8 @@ final class ProcModel: ObservableObject {
         }
     }
     @Published var lastError: String? = nil
+    @Published var showAll: Bool = false
+    @Published var totalGroupCount: Int = 0
 
     /// PID → row. Survives across ticks so sparkline histories accrue.
     private var rows: [Int32: ProcRow] = [:]
@@ -371,7 +380,8 @@ final class ProcModel: ObservableObject {
                 return a.primary.pid < b.primary.pid
             }
         }
-        groups = Array(built.prefix(20))
+        totalGroupCount = built.count
+        groups = showAll ? built : Array(built.prefix(20))
     }
 
     /// Deterministic ordering for "which row is the bucket's primary".
@@ -537,7 +547,7 @@ func procAdminKill(_ pid: Int32) async -> ProcKillResult {
             .replacingOccurrences(of: "\"", with: "\\\"")
         let script = "do shell script \"/bin/kill -9 \(pid)\" with prompt \"\(safePrompt)\" with administrator privileges"
         let p = Process()
-        p.launchPath = "/usr/bin/osascript"
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         p.arguments = ["-e", script]
         let errPipe = Pipe()
         p.standardError = errPipe
@@ -664,6 +674,109 @@ struct ProcRowView: View {
 }
 
 // ===========================================================================
+// MARK: - Per-process detail panel
+// ===========================================================================
+
+/// Fetches argv / cwd / open-file-count via `lsof` off-main.
+@MainActor
+final class ProcDetailModel: ObservableObject {
+    let pid: Int32
+    let comm: String
+    @Published var argv: String = "Loading…"
+    @Published var cwd: String = "Loading…"
+    @Published var openFileCount: String = "Loading…"
+
+    init(pid: Int32, comm: String, args: String) {
+        self.pid = pid
+        self.comm = comm
+        self.argv = args.isEmpty ? "(no args)" : args
+        fetch()
+    }
+
+    private func fetch() {
+        let p = pid
+        Task.detached(priority: .utility) {
+            // cwd via lsof -a -p <pid> -d cwd -Fn (first line after ^p is ^n<path>)
+            var cwdResult = "unavailable"
+            let lsofCwd = Process()
+            lsofCwd.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+            lsofCwd.arguments = ["-a", "-p", "\(p)", "-d", "cwd", "-Fn"]
+            let cwdPipe = Pipe()
+            lsofCwd.standardOutput = cwdPipe
+            lsofCwd.standardError = Pipe()
+            if (try? lsofCwd.run()) != nil {
+                lsofCwd.waitUntilExitOffMain()
+                if let out = String(data: cwdPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) {
+                    for line in out.split(separator: "\n") where line.hasPrefix("n") {
+                        cwdResult = String(line.dropFirst())
+                        break
+                    }
+                }
+            }
+
+            // Open file count via lsof -p <pid> (count non-header lines)
+            var fds = "unavailable"
+            let lsofFds = Process()
+            lsofFds.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+            lsofFds.arguments = ["-p", "\(p)"]
+            let fdsPipe = Pipe()
+            lsofFds.standardOutput = fdsPipe
+            lsofFds.standardError = Pipe()
+            if (try? lsofFds.run()) != nil {
+                lsofFds.waitUntilExitOffMain()
+                if let out = String(data: fdsPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) {
+                    let count = out.split(separator: "\n").count
+                    // Subtract 1 for the header line.
+                    fds = "\(max(0, count - 1)) open files/fds"
+                }
+            }
+
+            await MainActor.run { [weak self] in
+                self?.cwd = cwdResult
+                self?.openFileCount = fds
+            }
+        }
+    }
+}
+
+/// Sheet that shows argv / cwd / open-file-count for a process.
+fileprivate struct ProcDetailSheet: View {
+    @ObservedObject var detail: ProcDetailModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text(detail.comm).headerText()
+                Text("PID \(detail.pid)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
+            }
+            Divider()
+            detailRow(label: "argv", value: detail.argv)
+            detailRow(label: "cwd",  value: detail.cwd)
+            detailRow(label: "fds",  value: detail.openFileCount)
+        }
+        .padding(20)
+        .frame(minWidth: 480, minHeight: 160)
+    }
+
+    @ViewBuilder
+    private func detailRow(label: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            Text(value)
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+                .lineLimit(4)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+// ===========================================================================
 // MARK: - Main view
 // ===========================================================================
 
@@ -672,6 +785,7 @@ public struct ProcView: View {
     @State private var expanded: Set<String> = []
     @State private var pendingKill: ProcKillTarget? = nil
     @State private var killStatus: String? = nil
+    @State private var detailRow: ProcRow? = nil
     /// Red-team #7: don't sample when this pane isn't visible.
     @State private var visible = false
 
@@ -705,6 +819,9 @@ public struct ProcView: View {
                 secondaryButton: .cancel()
             )
         }
+        .sheet(item: $detailRow) { row in
+            ProcDetailSheet(detail: ProcDetailModel(pid: row.pid, comm: row.comm, args: row.args))
+        }
     }
 
     private var subtitle: String {
@@ -723,7 +840,7 @@ public struct ProcView: View {
                         .font(.system(size: 36, weight: .light))
                         .foregroundStyle(.tertiary)
                     Text("No processes match \"\(m.search)\"")
-                        .font(.headline)
+                        .headerText()
                     Text("Try a PID, a partial app name, or a launch-arg fragment. Clear the filter to see the top hogs.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
@@ -754,14 +871,24 @@ public struct ProcView: View {
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)
-                // Smooth position changes — red-team for the "jumpy reorder"
-                // problem. The animation observes the list-of-PIDs only, so
-                // value updates (CPU bouncing) don't trigger position anims.
-                // red-team: also honor Reduce Motion — animated reordering
-                // can be disorienting and the list updates every tick.
                 .animation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
                            ? nil : .easeInOut(duration: 0.25),
                            value: m.groups.map { $0.id })
+
+                // "Show all N" button — appears only when there are more than 20.
+                if m.totalGroupCount > 20 {
+                    Button {
+                        m.showAll.toggle()
+                    } label: {
+                        Label(m.showAll
+                              ? "Show top 20 only"
+                              : "Show all \(m.totalGroupCount) groups",
+                              systemImage: m.showAll ? "chevron.up" : "chevron.down")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                    .padding(.vertical, 8)
+                }
             }
         }
     }
@@ -792,6 +919,7 @@ public struct ProcView: View {
                     totalRSS: g.totalRSS,
                     killer: { row in Task { await initiateKill(row) } }
                 )
+                .onTapGesture { detailRow = g.primary }
             }
             if isOpen {
                 ForEach(g.children) { child in
@@ -805,6 +933,7 @@ public struct ProcView: View {
                             totalRSS: child.rssBytes,
                             killer: { row in Task { await initiateKill(row) } }
                         )
+                        .onTapGesture { detailRow = child }
                     }
                     .background(.quaternary.opacity(0.25))
                 }

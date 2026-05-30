@@ -148,13 +148,30 @@ struct ColorToolValue: Hashable {
 
 /// One entry in the pick history. UUID identity so SwiftUI lists are stable
 /// when the user renames them.
-struct ColorToolHistoryEntry: Identifiable, Hashable {
-    let id = UUID()
+struct ColorToolHistoryEntry: Identifiable, Hashable, Codable {
+    // Codable: synthesised — UUIDs round-trip cleanly.
+    var id: UUID = UUID()
     var value: ColorToolValue
     var name: String = ""
     var tags: [String] = []
     var capturedAt: Date = Date()
     var source: String = "Picker"  // "Picker", "Image", "Manual"
+}
+
+extension ColorToolValue: Codable {
+    enum CodingKeys: String, CodingKey { case r, g, b, a }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        r = try c.decode(Double.self, forKey: .r)
+        g = try c.decode(Double.self, forKey: .g)
+        b = try c.decode(Double.self, forKey: .b)
+        a = try c.decodeIfPresent(Double.self, forKey: .a) ?? 1
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(r, forKey: .r); try c.encode(g, forKey: .g)
+        try c.encode(b, forKey: .b); try c.encode(a, forKey: .a)
+    }
 }
 
 // ===========================================================================
@@ -175,7 +192,31 @@ final class ColorToolStore: ObservableObject {
 
     @Published var pickerError: String? = nil
 
+    /// P1 confirm/retake: after NSColorSampler completes, hold the pending
+    /// value here until the user either accepts or discards it.
+    @Published var pendingPickedValue: ColorToolValue? = nil
+
     static let maxHistory = 60
+    private static let kHistoryKey = "color.tool.history.v1"
+
+    init() {
+        loadHistory()
+    }
+
+    // MARK: Persistence
+
+    private func loadHistory() {
+        guard let data = UserDefaults.standard.data(forKey: Self.kHistoryKey),
+              let entries = try? JSONDecoder().decode([ColorToolHistoryEntry].self, from: data) else {
+            return
+        }
+        history = entries
+    }
+
+    private func saveHistory() {
+        guard let data = try? JSONEncoder().encode(history) else { return }
+        UserDefaults.standard.set(data, forKey: Self.kHistoryKey)
+    }
 
     func record(_ value: ColorToolValue, source: String = "Picker") {
         // Dedup against the most recent identical pick to avoid duplicate spam.
@@ -186,14 +227,22 @@ final class ColorToolStore: ObservableObject {
         if history.count > Self.maxHistory {
             history.removeLast(history.count - Self.maxHistory)
         }
+        saveHistory()
     }
 
-    func remove(_ id: UUID) { history.removeAll { $0.id == id } }
-    func clearHistory() { history.removeAll() }
+    func remove(_ id: UUID) {
+        history.removeAll { $0.id == id }
+        saveHistory()
+    }
+    func clearHistory() {
+        history.removeAll()
+        saveHistory()
+    }
 
     func rename(_ id: UUID, to newName: String) {
         if let i = history.firstIndex(where: { $0.id == id }) {
             history[i].name = newName
+            saveHistory()
         }
     }
 
@@ -211,10 +260,12 @@ final class ColorToolStore: ObservableObject {
         for t in parts where !history[i].tags.contains(t) {
             history[i].tags.append(t)
         }
+        saveHistory()
     }
     func removeTag(_ id: UUID, _ tag: String) {
         if let i = history.firstIndex(where: { $0.id == id }) {
             history[i].tags.removeAll { $0 == tag }
+            saveHistory()
         }
     }
 
@@ -261,6 +312,67 @@ enum ColorToolPicker {
                 DispatchQueue.main.async { onResult(value) }
             }
         }
+    }
+}
+
+// ===========================================================================
+// MARK: - NSColorPanel proxy (continuous callback)
+// ===========================================================================
+
+/// P1: NSColorPanel requires a target+action to deliver picked colors.
+/// We install a thin singleton as the target; the view wires `onColor` before
+/// opening the panel so picked values flow into the store.
+final class ColorPanelProxy: NSObject {
+    static let shared = ColorPanelProxy()
+    var onColor: ((NSColor) -> Void)?
+
+    @objc func colorPanelColorDidChange(_ sender: NSColorPanel) {
+        onColor?(sender.color)
+    }
+}
+
+// ===========================================================================
+// MARK: - Confirm / retake card
+// ===========================================================================
+
+/// P1: Shown after NSColorSampler or NSColorPanel returns a value. Lets the
+/// user confirm, retake, or discard the pick before it enters history, so a
+/// misclick doesn't pollute history.
+private struct ColorToolPickConfirmCard: View {
+    let value: ColorToolValue
+    let onAccept:  () -> Void
+    let onRetake:  () -> Void
+    let onDiscard: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(value.swiftUI)
+                .frame(width: 48, height: 48)
+                .overlay(RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(.separator, lineWidth: 0.5))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(value.hex)
+                    .font(.system(.body, design: .monospaced).weight(.semibold))
+                Text("\(value.rgbString)  ·  \(value.hslString)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Retake", action: onRetake)
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+            Button("Discard", action: onDiscard)
+                .buttonStyle(.borderless)
+                .foregroundStyle(.red)
+            Button("Use", action: onAccept)
+                .buttonStyle(.borderedProminent)
+        }
+        .padding(10)
+        .background(Color.troveCardSolid.opacity(0.8), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8)
+            .strokeBorder(Color.troveAccent.opacity(0.5), lineWidth: 1))
+        .transition(.opacity.combined(with: .move(edge: .top)))
     }
 }
 
@@ -516,6 +628,13 @@ public struct ColorToolView: View {
     @State private var dropError: String? = nil
     @State private var lastImagePreview: NSImage? = nil
 
+    /// P1: cached temp CSV URL for onDrag — materialized once per palette,
+    /// invalidated when the palette changes. Avoids writing a new file on
+    /// every drag-gesture tick.
+    @State private var cachedPaletteCSVURL: URL? = nil
+    /// Tracks the palette we last wrote so we can invalidate if it changes.
+    @State private var cachedPaletteSignature: [String] = []
+
     public init() {}
 
     public var body: some View {
@@ -575,13 +694,17 @@ public struct ColorToolView: View {
     private var pickSection: some View {
         Card {
             VStack(alignment: .leading, spacing: 12) {
-                Text("Pick").font(.headline)
+                Text("Pick").headerText()
                 Text("Click the button, then click anywhere on screen with the loupe to sample a pixel. macOS may prompt for **Screen Recording** the first time — accept it for accurate reads.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                 HStack(spacing: 12) {
                     Button {
                         store.pickerError = nil
+                        // P1 confirm/retake: clear any prior pending value so
+                        // the confirmation card doesn't linger from a previous
+                        // pick session.
+                        store.pendingPickedValue = nil
                         ColorToolPicker.pick { value in
                             // Red-team #1: hop back to main; nil means cancel/denied.
                             DispatchQueue.main.async {
@@ -597,8 +720,10 @@ public struct ColorToolView: View {
                                     return
                                 }
                                 store.pickerError = nil
-                                store.record(value, source: "Picker")
-                                SharedStore.stage.flash("Picked \(value.hex)")
+                                // P1: hold in pendingPickedValue for confirm/retake
+                                // instead of recording immediately. A misclick
+                                // would have polluted history before this fix.
+                                store.pendingPickedValue = value
                             }
                         }
                     } label: {
@@ -611,20 +736,56 @@ public struct ColorToolView: View {
                     .keyboardShortcut("p", modifiers: [.command])
 
                     Button {
-                        // Pick uses macOS color panel — useful when you want
-                        // to dial in a specific value rather than sample one.
+                        // P1: open a *continuous* NSColorPanel and wire it to
+                        // pendingPickedValue via NSApp's changeColor(_:) handler
+                        // (the standard AppKit callback mechanism). The shared
+                        // panel is continuous so every user interaction calls
+                        // changeColor on the first responder; we install a thin
+                        // proxy responder that forwards the picked color.
+                        ColorPanelProxy.shared.onColor = { nsColor in
+                            let v = ColorToolValue(nsColor: nsColor)
+                            store.pendingPickedValue = v
+                        }
                         let panel = NSColorPanel.shared
-                        panel.color = .white
-                        panel.isContinuous = false
+                        panel.color = store.contrastA.nsColor
+                        panel.isContinuous = true
+                        panel.showsAlpha = false
+                        panel.setTarget(ColorPanelProxy.shared)
+                        panel.setAction(#selector(ColorPanelProxy.colorPanelColorDidChange(_:)))
                         panel.makeKeyAndOrderFront(nil)
                         NSApp.activate(ignoringOtherApps: true)
-                        // No callback hook in NSColorPanel; user can grab from
-                        // panel and use "Manual" via contrast pickers below.
                     } label: {
                         Label("Open color panel…", systemImage: "paintpalette")
                     }
                     .controlSize(.large)
                 }
+
+                // P1: confirm / retake card — shown after NSColorSampler or
+                // NSColorPanel returns a value, before it enters history.
+                if let pending = store.pendingPickedValue {
+                    ColorToolPickConfirmCard(
+                        value: pending,
+                        onAccept: {
+                            store.record(pending, source: "Picker")
+                            SharedStore.stage.flash("Picked \(pending.hex)")
+                            store.pendingPickedValue = nil
+                        },
+                        onRetake: {
+                            store.pendingPickedValue = nil
+                            // Immediately re-open the sampler for retake.
+                            ColorToolPicker.pick { value in
+                                DispatchQueue.main.async {
+                                    guard let value = value else { return }
+                                    store.pendingPickedValue = value
+                                }
+                            }
+                        },
+                        onDiscard: {
+                            store.pendingPickedValue = nil
+                        }
+                    )
+                }
+
                 if store.pickerError == "denied" {
                     // Fix 20: render an actionable button instead of a static path string.
                     HStack(spacing: 8) {
@@ -655,7 +816,7 @@ public struct ColorToolView: View {
         Card {
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    Text("From image").font(.headline)
+                    Text("From image").headerText()
                     Spacer()
                     Button {
                         chooseImage()
@@ -717,12 +878,20 @@ public struct ColorToolView: View {
                         }
                     }
                     // Row-level drag — drag the palette CSV straight into
-                    // Finder, Mail, Slack, etc. Written to a temp file on
-                    // demand so we always reflect the current palette.
+                    // Finder, Mail, Slack, etc.
+                    // P1 fix: materialize the CSV once and cache the URL.
+                    // onDrag fires repeatedly during the drag gesture; the old
+                    // code wrote a fresh file every tick — unnecessary disk
+                    // churn. We invalidate only when the palette signature changes.
                     .onDrag {
-                        let url = Self.writePaletteToTempCSV(store.palette,
-                                                            sourceName: store.paletteSourceName)
-                        return url.map { NSItemProvider(contentsOf: $0) ?? NSItemProvider() }
+                        let sig = store.palette.map { $0.hex }
+                        if sig != cachedPaletteSignature || cachedPaletteCSVURL == nil {
+                            cachedPaletteCSVURL = Self.writePaletteToTempCSV(
+                                store.palette, sourceName: store.paletteSourceName)
+                            cachedPaletteSignature = sig
+                        }
+                        return cachedPaletteCSVURL
+                            .map { NSItemProvider(contentsOf: $0) ?? NSItemProvider() }
                             ?? NSItemProvider()
                     }
                     .contextMenu {
@@ -988,7 +1157,7 @@ public struct ColorToolView: View {
     private var contrastSection: some View {
         Card {
             VStack(alignment: .leading, spacing: 14) {
-                Text("Contrast").font(.headline)
+                Text("Contrast").headerText()
                 Text("Two colors → WCAG 2.x contrast ratio. AA passes at 4.5:1 (normal text), 3:1 (large/UI). AAA passes at 7:1 (normal), 4.5:1 (large).")
                     .font(.callout).foregroundStyle(.secondary)
 
@@ -1017,8 +1186,8 @@ public struct ColorToolView: View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text("History").font(.headline)
-                    Text("(in-memory, up to \(ColorToolStore.maxHistory))")
+                    Text("History").headerText()
+                    Text("(persisted, up to \(ColorToolStore.maxHistory))")
                         .font(.caption).foregroundStyle(.tertiary)
                     Spacer()
                     if !store.history.isEmpty {

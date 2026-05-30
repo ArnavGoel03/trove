@@ -1,0 +1,424 @@
+# Changelog
+
+All notable changes to Trove. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+Versioning: [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
+
+Trove ships two release channels via the in-app updater:
+
+- **Stable** (default) — only `vX.Y.Z` releases (no pre-release suffix).
+- **Beta** (opt-in via Settings → Updates → Update channel) — receives `vX.Y.Z-beta.N` builds before they promote to Stable.
+
+The in-app updater (Settings → Updates) reads the active channel from
+`updater.includePrereleases` in UserDefaults. Switch any time; the next check
+will surface whatever's newest on the chosen channel.
+
+---
+
+## [1.1.0-beta.7] — Unreleased
+
+### Added
+
+- **Comprehensive menu-bar overhaul** — went from 5 minimal items to a full
+  professional macOS menu surface:
+  - **Trove** menu now includes "What's New", "Trove Website", "Privacy
+    Policy", "Send Feedback…" alongside About + Check for Updates.
+  - **File** menu got real content: New Snippet (⌘N), Open Files into Stage…
+    (⌘O), Import / Export Snippets…, Export My Trove Data….
+  - **Edit** menu extends the Stage cluster with "Copy All Staged as Text"
+    (⌘⇧⌥C), "Capture Region → OCR" (⌘⌥4), "Capture Region → Snip" (⌘⌥5)
+    alongside the existing Paste-into-Stage / Copy-as-Files / Screenshot
+    / Clear-Stage bindings.
+  - **View** menu gains a **Theme** submenu (Dark / Light / System / Linear
+    / Cron / Custom) and an **Accent** submenu (Neutral / Magenta / Sky /
+    Warm) so the user never has to dig into Settings for either.
+  - **NEW Tools menu** — first-class power-user surface with submenus for
+    Stage, Capture, Quick… (all 8 utility tools as one-click jumps),
+    System (all 10 system panes), Storage (Overview / Scan / Clean /
+    Sweep / Library), and **Keep Awake** (1 hour / 4 hours / Until Quit /
+    Release Assertion ⌘.).
+  - **Help** menu keeps its Keyboard Shortcuts (⌘/) + What's New + Report
+    an Issue (prefilled with `Trove vX.Y.Z`) + Website surface.
+- **Inline "Continue with…" submenu on every PDF output row.** When you
+  finish merging two PDFs, the output row now exposes "Merge with another
+  PDF" / "Split into pages" / "Organize / rearrange" / "Compress further" /
+  "Rotate pages" / "Add page numbers" / "Watermark" / "Crop" /
+  "Password-protect" / "OCR text layer" / "Re-save via PDFKit" as one-click
+  continuations. Posts the same `.troveOpenInPDFTool` payload the existing
+  Library reEditMenu uses, so the PDFView listener auto-switches the op +
+  loads the URL as a source. No more "save → close → re-drop → pick op
+  again" friction; you can chain a 6-step pipeline without leaving the pane.
+- **Routing notification names** declared centrally so any future feature
+  (or pane) can listen for the same menu-driven actions:
+  `troveSnippetsNewItem`, `troveSnippetsImport`, `troveSnippetsExport`,
+  `troveExportAllData`, `troveCaptureRegionToOCR`, `troveCaptureRegionToSnip`,
+  `troveColorPickFromScreen`, `troveMirrorOpenFloating`, `troveDiskSpeedRunNow`.
+
+### Changed
+
+- The previously-minimal File menu (collapsed to just Close) now carries
+  real content. macOS users expect a File menu to do something.
+- The Edit menu's Stage cluster moved its capture shortcuts up so all three
+  capture destinations (Stage / OCR / Snip) sit next to each other.
+
+---
+
+## [1.1.0-beta.6] — Unreleased
+
+### Added
+
+- **Native macOS QuickLook for Stage / Library / History items.**
+  Press Space (or pick "Quick Look" from the context menu) on any image or
+  file item to open the macOS-native preview panel — same surface Finder
+  uses. Renders images, PDFs, source code, audio, video, archives, plain
+  text — whatever the system supports. No app-switching, no opening Preview.
+  A single `TroveQuickLook` singleton (`@MainActor`, `QLPreviewPanelDataSource`)
+  holds the URL list so the panel sees stable indices across arrow-key
+  navigation; future multi-select adoption in Stage / Library can pass a
+  whole array via `show([URL], start:)`.
+
+### Changed
+
+- **`.headerText()` coherence sweep — 87 call sites across 25 files.**
+  Every section / card title that previously used raw `.font(.headline)` now
+  uses the existing `.headerText()` modifier, which combines headline font +
+  `accessibilityAddTraits(.isHeader)`. VoiceOver's Headings rotor now
+  navigates to every section title in every pane (Stage / Calc / Color /
+  QR / OCR / Image Tools / PDF / Hash / Rename / Recorder / Snip / Snap /
+  AltTab / Finder / Procs / Awake / Permissions / Log / GPU / Network /
+  Disk Speed / Account / Updater / Mirror / History). Mechanically
+  scripted; one self-recursion in the `headerText()` definition itself was
+  swept and immediately reverted to the literal `.font(.headline)` body.
+- macOS Finder had created `" 2.swift"` duplicate copies of nine files
+  during the concurrent-edit window; removed (zero unique content vs the
+  originals).
+
+---
+
+## [1.1.0-beta.5] — Unreleased
+
+### Added
+
+- **Live previews for every PDF op** (no run/save needed to see the result):
+  - **Merge** — horizontal strip of first-page thumbnails in the current
+    source order, each with index badge + filename + page count. Reorder
+    in the source list above and the strip reflects it instantly. Total
+    output page count shown in the header.
+  - **Split** — full thumbnail grid of the source PDF with per-page badges
+    showing which output (`p3 → #1`) each page lands in. Pages outside any
+    range are dimmed + tagged "dropped" so the user can spot off-by-one
+    range mistakes before running. Reuses the actor-serialized
+    `PDFOpsThumbRenderer` so opening a 500-page doc still feels snappy.
+  - **Rotate** — thumbnail grid with the rotation applied per cell via
+    `.rotationEffect`. Animated transition so picking 90° CW → 180° → 90°
+    CCW is immediately legible. Honors the "Apply to all pages" toggle +
+    range field; un-affected pages render un-rotated.
+  - **Compress** — sample page rendered at the chosen quality + projected
+    output size estimate (per-page JPEG re-encode × page count). Updates
+    on a 180 ms debounce as the slider drags so heavy re-encodes don't pin
+    the slider. Header turns success-green when the projected reduction
+    crosses 30%.
+- All four previews live in `pdf.swift` as `fileprivate` SwiftUI structs
+  (`PDFOpsMergePreview` / `PDFOpsSplitPreview` / `PDFOpsRotatePreview` /
+  `PDFOpsCompressPreview`) and reuse the existing `PDFOpsThumbRenderer`
+  actor for off-main PDFKit access. No new threading hazards introduced.
+
+### Changed
+
+- `PDFOpsDetailView.body` now inserts the live preview between `parameters`
+  and `runRow`, so the visual feedback sits where the user's eye is already
+  tracking after tweaking inputs.
+
+---
+
+## [1.1.0-beta.4] — Unreleased
+
+### Fixed
+
+- **Version auto-update across rebuilds.** Two bugs were keeping the sidebar
+  footer showing `v1.0.4-dev` after the source version bumped to `1.1.0-beta.3`:
+  - `~/bin/build-macapp` defaulted to baking `"1.0"` whenever `BUILD_VERSION`
+    env was unset. Now it reads the project's `VERSION` file as fallback, so
+    every plain `build-macapp` rebuild picks up the bumped semver without env
+    juggling. Stripping CR/LF prevents an editor's trailing newline from
+    silently breaking the GitHub-Releases comparator.
+  - `UpdateChecker.currentVersion()` only fell back to the source-tracked
+    `fallbackVersion` when the bundle was the exact placeholder `"1.0"`. A
+    binary built once with `BUILD_VERSION=1.0.4-dev` therefore kept showing
+    `1.0.4-dev` forever. Now any of: missing key, empty key, `"1.0"`, contains
+    `-dev`, or strictly-older-than-fallback per semver hands off to the source
+    version. Notarized releases (≥ fallback, no `-dev`) still show their own
+    real version string.
+
+---
+
+## [1.1.0-beta.3] — Unreleased
+
+### Fixed
+
+- **P0 visual: giant vertical-capsule toast blob** on the right side of any
+  pane (most visible on Keep Awake). Root cause: `ToastCapsule` used
+  `Capsule(.continuous)` for its background fill — `Capsule` adapts to bounds
+  with hemispherical ends, so when a parent overlay gave it taller bounds the
+  toast morphed into a giant vertical pill that ate the right half of the
+  window. Switched the background + overlay to `RoundedRectangle(cornerRadius: 18)`
+  so the shape can never stretch into a vertical-pill; capped the toast's
+  outer frame with `maxHeight: 96` + `.fixedSize(horizontal:false, vertical:true)`
+  so even if a future parent layout misbehaves, the toast stays toast-sized;
+  height-capped the leading kind-tint stripe so it can't stretch the inner
+  HStack vertically either.
+
+---
+
+## [1.1.0-beta.2] — Unreleased
+
+Round-two audit-driven hardening. All 18 items on the carry-over list landed.
+Tests: 233/233 pass.
+
+### Added
+
+- **`SnippetLoadOutcome`** — explicit result type for the off-main snippet
+  loader (.ok / .empty / .corrupt(msg) / .noFile), so the @StateObject init
+  can return synchronously while the actual disk I/O happens off-main.
+- **`AutoInstaller.posixSingleQuote`** — POSIX-safe shell-argument quoter so
+  the codesign verification can no longer be tricked into evaluating `$` /
+  backtick on an adversarial app-bundle path.
+
+### Fixed (P0 / P1)
+
+- **`NoteStore.init` / `ClipHistory.init` / `SnippetStore.init`** were three
+  AccountView-class SIGTRAP-risk paths — each ran `boundedRead` (up to 16 MB)
+  + `JSONDecoder.decode` synchronously on the main thread inside the
+  `@StateObject` default expression. On a slow / cold disk this pushed past
+  the AttributeGraph 50 ms watchdog and could SIGTRAP. All three now seed
+  empty + load off-main + publish back on @MainActor.
+- **`AltTabView` `screenRecordingAllowed` `@State` default** ran
+  `CGPreflightScreenCaptureAccess()` synchronously on main during view init
+  (50–200 ms TCC read on a cold `tccd`). Seeded `false`; refreshes via
+  `.task` and `didBecomeActive` (both already wired).
+- **`OverviewView` Full-Disk-Access priming card** was shown eagerly on every
+  first launch — telling brand-new users they had a problem before they had
+  one. Now gated on actually-observed permission denials during Refresh
+  (probes `Downloads`/`Desktop`/`Documents` in the off-main hop).
+- **`WelcomeSheet` Escape** was bound to BOTH the "Start using Trove" CTA
+  AND the sheet's dismiss action — a user pressing Escape to back out
+  permanently committed `hasSeenWelcome = true`. Escape now ONLY dismisses
+  (welcome re-shows next launch); Return commits the CTA.
+- **History `watching` default** flipped from `false` → `true` on first
+  launch (key absent). Trove is a clipboard-first app; the empty pane on
+  fresh install made users think the feature was broken. Privacy markers
+  still filter the ingestion path.
+- **OCR `translationTarget` / `wantsTranslation` / `recognitionLanguage`**
+  persist across launches under `trove.ocr.*` keys. Users who returned to
+  OCR with the same source/target language combo had to re-pick every time.
+- **`auto_installer.swift:369,393` codesign verify shell escape** — the
+  previous `\"\(path)\"` only escaped `"`. `$` and backticks remained live.
+  Rewrote with POSIX single-quote (`'\''` close-reopen pattern) so arbitrary
+  path content is rendered literally. Local threat model only (the path
+  comes from `Bundle.main.bundleURL`), but the gap is closed.
+- **`history.swift` three `NSImage(contentsOf:)` call sites** now probe file
+  byte-size first (200 MB cap, matching the pasteboard ingestion ceiling).
+  A tampered `clipboard_history.json` path pointing at a 1 GB sparse file or
+  a FIFO would otherwise OOM the app.
+- **`image_tools.swift:471` IUO `var resultURL: URL!`** replaced with optional
+  + explicit `guard let`. The IUO path crashed if `doConvert` returned
+  without assigning AND without throwing (latent in a future refactor).
+- **Profile-sync `bundledDefaultsKeys` expanded from ~15 keys → 70+**, covering
+  every settings audit catalogued key (Stage, History, Keep Awake, Recorder,
+  Snip, Calc, QR, OCR, Image Tools, File Hash, Log, Rename, Snippets, GPU,
+  App Launcher, Updater, PDF recents, Color history). Migrating to a new Mac
+  via the profile bundle now preserves the user's settings instead of silently
+  resetting most of them.
+
+### Changed
+
+- **`UpdateChecker.fallbackVersion`** bumped to `1.1.0-beta.2`. The in-app
+  sidebar footer + Settings → About banner read this when
+  `CFBundleShortVersionString` is the placeholder `1.0` (dev / ad-hoc builds).
+- **`CutPaste.enabled`** documented in code as intentionally transient
+  (not a persistence bug). Each session re-engaging the CGEventTap that
+  intercepts ⌘X/⌘V is an explicit user opt-in — the security-by-default
+  contract Trove ships with.
+
+### Known gaps (carried to beta.3+)
+
+- ~140 Sendable-closure-capture warnings (Swift 6 strict-concurrency mode previews).
+- ~89 raw `.font(.headline)` calls that should be `.headerText()`.
+- `TroveEmptyState` built but unadopted across 6+ panes.
+- AI Bridge still entirely dead.
+
+---
+
+## [1.1.0-beta.1] — Unreleased
+
+The big polish + robustness pass. Every pane audited from a power-daily-user
+perspective and a security/correctness lens. Compile + lint + 218/218 tests pass.
+
+### Added
+
+- **Stage**: per-item Save…/Save to Downloads/Copy Path/Copy to Clipboard/drag-out
+  context menu actions (DEVELOP_RULES §9).
+- **Stage**: drag-reorder via `List.onMove` (persists with the rest of the items).
+- **Stage**: persistence to `stage.json` (atomic, debounced + synchronous flush on
+  `willTerminate`); items survive quits/relaunch.
+- **Stage**: `StagedItem` made a `final class` so `ForEach` identity is stable
+  across mutations — kills the O(n) thumbnail re-fetch on every change.
+- **Stage**: `Open files…` CTA in the empty state.
+- **Stage**: tolerant `Codable` decoder on `StagedItemRecord` so future schema
+  additions can't silently empty the Stage on upgrade.
+- **FloatingStage**: now reachable — View-menu command + toolbar `pip.enter`
+  button wired to `FloatingStageController.shared.toggle()`. Previously dead.
+- **AutoCompress**: wired live from `Stage.addFile/addImage/captureScreenshot`,
+  plus a user-tunable quality slider (default 0.78, range 0.50–0.98) in
+  Settings → Stage.
+- **AltTab**: real window thumbnails via ScreenCaptureKit (was a permanent
+  TODO before this release). Falls back to the app-icon overlay on permission
+  denial; inline Screen Recording permission card.
+- **Snap hotkeys**: now user-rebindable per-direction with conflict detection.
+- **OCR**: language hint picker; `recognitionLanguage` flows into `VNRecognizeTextRequest`.
+- **QR**: SVG vector export + custom foreground/background colors + persistent
+  correction level + export size picker.
+- **Mirror**: always-on-top floating panel + snapshot affordance
+  (copy/save/Send to Stage).
+- **Snip annotate**: redo stack parallel to undo; off-main render so committing
+  a 4K annotation no longer freezes the UI.
+- **Calculator**: `^` exponent operator; temperature / speed / area / energy
+  units (incl. a custom `UnitEnergy.wattHours = 3600 J`); per-line "Copy
+  expression + result" and "Send to Stage"; clear-confirm dialog.
+- **Text Tools**: pipeline persistence (`xform-pipeline.json`, atomic); ReDoS
+  guard catches `(a|a)+`-class patterns; off-main run with cancellation token;
+  searchable add-transform menu.
+- **Image Tools**: before/after preview before commit; per-source remove;
+  settings persist; output thumbnails.
+- **PDF**: image-watermark actually baked into the saved PDF (PDFKit's private
+  `STAMP_IMAGE` key is dropped on serialization — fixed by rendering into the
+  page's CGContext per page); freeform render DPI 72–600; live watermark
+  preview; `PDFOpsRecentEntry` tolerant decoder.
+- **File Hash**: SHA-512 (single-pass alongside MD5/SHA1/SHA256); opt-in
+  auto-copy preference.
+- **Rename**: off-main `apply()` with per-file rollback; settings persist;
+  ReDoS guard before NSRegularExpression construction; preview rows show
+  parent folder when the same filename appears in multiple dirs.
+- **Recorder**: real region picker (multi-screen crosshair NSWindow — previous
+  picker silently captured from `(0,0)` because it only read the PNG size); all
+  settings persist (mic / sys audio / codec / fps / output folder / send-to-Stage);
+  HEVC + 24/30/60 fps pickers; live capture preview while recording; bitrate
+  cap (`200 Mbps`) so 5K Retina no longer overflows to ~59 Gbps; `isRecording`
+  gate now taken synchronously before the first await so a double-tap during
+  the 300 ms SCK content fetch can't build two writers; SCStream frame
+  callback uses `[weak self]` (kills the per-frame `RecEngine` retain that
+  piled up during `finishWriting`).
+- **Big Scan**: proportional stacked-bar disk-usage breakdown; exclude list
+  (defaults include `node_modules`/`.git`); sort/filter controls; stale-cache
+  age infobar; trash off-main.
+- **Library**: QuickLook thumbnails for image/PDF/video rows; `saveOne` is
+  now atomic (tmp + `replaceItemAt`); `deleteAllLocalData` actually clears
+  UserDefaults + Keychain (not just the App Support folder, despite what the
+  confirmation alert promised).
+- **Outputs Library**: tolerant `OutputEntry` decoder so adding new fields
+  can't silently empty the recoverable cache on upgrade.
+- **Account**: Export/backup data; Delete all local data (with confirmation).
+- **Updater**: explicit Stable / Beta channel picker; in-app changelog renderer
+  for current release (GitHub release body as Markdown).
+- **Permissions**: refresh on pane reappear (debounced); generic description
+  instead of the literal TCC.db path; correct `Privacy` deep link for the
+  Network entry.
+- **Customize sidebar**: now includes the `App` section so the Library pane
+  can actually be hidden (`sectionOrder` was previously missing it).
+- **Color tokens**: `Color.troveFg` (primary text), `Color.troveSuccess`,
+  `Color.troveWarning`, `Color.troveError`.
+- **Shared UI**: reusable `TroveEmptyState<CTA>` and `TroveInlineError` views.
+- **Tolerant Codable decoders** added to `StagedItemRecord`, `OutputEntry`,
+  `PDFOpsRecentEntry`, `TroveCustomTheme`, `HotkeyBinding` — five separate
+  silent-on-upgrade data-loss vectors closed.
+
+### Fixed
+
+- **P0** `AltTab` window thumbnails were a permanent no-op (TODO since
+  `CGWindowListCreateImage` was removed) — implemented via SCK.
+- **P0** Recorder region picker captured `(0,0)`-relative every time —
+  rewritten with a real crosshair overlay window per display.
+- **P0** PDF image-watermark silently dropped from saved files (PDFKit
+  `STAMP_IMAGE` private key never serializes).
+- **P0** Clipboard history was fully ephemeral — now persists.
+- **P0** Multiple panes had main-thread blocking work: GPU/network/log sampling,
+  AX enumeration in WindowSnap, OCR `waitUntilExit`, big_scan walk, PDF document
+  open, rename apply, snip annotate render, addImage tiff/PNG encode. All moved
+  off-main with reentry guards.
+- **P0** Pasteboard `strict:false` path skipped the size guard — a 500 MB
+  clipboard image OOM-crashed the app on every explicit paste.
+- **P0** `cutpaste.swift` performPaste moved symlinks (incl. symlinks pointing
+  at `/dev/zero`) — now skipped.
+- **P0** Auto-installer continuation race on double-clicking "Install Now" —
+  protected with `os_unfair_lock`; UUID-namespaced staging dir.
+- **P0** Log Viewer "Save All" loaded the entire `log show` output into a
+  single Data — now streams line-by-line.
+- **P0** Stage no longer drops mutations within 300ms of quit (force-flush on
+  `troveWillTerminate`).
+- **P0** Stage `writeToDisk` no longer silently discards `replaceItemAt`
+  errors — falls back to `moveItem`.
+- **P0** Recorder bitrate `pxW × pxH × 4` overflowed on 5K Retina to ~59 Gbps;
+  capped to 200 Mbps.
+- **P0** Recorder `isRecording = true` was set AFTER 300 ms of awaits in
+  `start()` — a double-tap built two writers on the same path. Now set
+  synchronously via an `isStarting` flag.
+- **P0** Stage card title `.foregroundStyle(.white)` was invisible in the
+  light theme (cardSolid #F1F0EB ≈ white). Switched to `Color.troveFg`.
+- **P0** Toast appearance now fires `NSAccessibility.announcementRequested` —
+  VoiceOver users were getting zero feedback for any action.
+- **P1** Many destructive deletes were `removeItem` instead of `trashItem` —
+  swept across Library, big_scan, etc.
+- **P1** `Mirror` floating panel observer leaked one observer per open/close.
+- **P1** `AutoCompress` had no symlink/regular-file guard; non-atomic write
+  could leave a partial file and the `fileExists` guard then permanently
+  blocked future passes for that source.
+- **P1** Snip annotate `bounds.width == 0` produced `inf` scale on first
+  layout pass; guarded.
+- **P1** OCR `OCRTargetLanguage.smartDefault()` crashed if `all` were empty
+  (`all[0]`); now a safe English fallback.
+- **P1** Rename regex compiled with no ReDoS guard; now uses the same
+  `rejectCatastrophicRegex` heuristic as text-transforms.
+- **P1** Big Scan stale-result race: cancellable Task + generation counter
+  prevents an older scan from overwriting a newer one when the root changes.
+- **P1** Color picker history was in-memory only — now persists.
+- **P1** Snip and QR settings persist across launches.
+- **P1** `CustomizeView` had `App` missing from `sectionOrder` — Library could
+  not be hidden.
+- **P1** `deleteAllLocalData()` left UserDefaults and Keychain intact despite
+  the confirmation alert promising a full reset.
+- **P1** Numerous raw `Color.white.opacity(…)` / `.gray` / `.green` view tints
+  swapped for palette tokens so the light theme reads correctly.
+
+### Changed
+
+- Default theme remains Dark with Light/System/Linear/Cron/Custom alternatives.
+- `lint-trove` continues to ban `try!`, `as!`, `DispatchQueue.main.sync`, bare
+  `.waitUntilExit()`, `.first!`/`.last!`, `fatalError`. All rules clean.
+
+### Security
+
+- Per `auto_installer.swift` audit: shell escape in the codesign verification
+  path tracks `\` and `"` but not `$` / backtick. Local threat model only
+  (the path is `Bundle.main.bundleURL.path`), but the planned mitigation is
+  to drop `/bin/sh -c` entirely and call `/usr/bin/codesign` directly with
+  a second `Pipe()` for stderr. Tracked for 1.1.0-beta.2.
+
+### Known gaps (carried forward to beta.2+)
+
+- AI Bridge (CommandX-replacement) is still entirely dead. Separate feature
+  pass.
+- ~140 Sendable-closure-capture warnings (Swift 6 mode previews). Doesn't
+  ship a worse app today; Swift-6 strict-concurrency cleanup pass needed.
+- `NoteStore` / `ClipHistory` / `SnippetStore` `@StateObject` default
+  initializers do synchronous `boundedRead` + JSON decode on main —
+  AttributeGraph SIGTRAP risk on slow/cold disks. Pattern-fix pending.
+- ~89 raw `.font(.headline)` calls that should be `.headerText()` for
+  VoiceOver heading-rotor coverage.
+- The existing `TroveEmptyState` shared view is built but not yet adopted by
+  the 6+ panes that each still roll their own empty state.
+
+---
+
+## [1.0.7] — 2026-05-17
+
+Last public Stable release before the polish-and-robustness pass.
+See <https://github.com/ArnavGoel03/trove/releases/tag/v1.0.7>.

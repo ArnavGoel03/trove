@@ -27,6 +27,23 @@ struct HotkeyBinding: Equatable, Hashable, Codable {
     var modifiers: UInt32   // bitmask of cmdKey | optionKey | controlKey | shiftKey
     var keyCode: UInt32     // virtual keycode (kVK_*)
 
+    enum CodingKeys: String, CodingKey { case modifiers, keyCode }
+
+    init(modifiers: UInt32, keyCode: UInt32) {
+        self.modifiers = modifiers; self.keyCode = keyCode
+    }
+
+    /// P1 fix: tolerant decoder. Stored as JSON in UserDefaults under
+    /// `trove.windowSnap.bindings` (a `[String: HotkeyBinding]` map) and
+    /// `hotkey.fullScreenToStage.binding` (a single binding). Adding a future
+    /// field — e.g. `isEnabled` for per-direction disables — would otherwise
+    /// silently reset every per-direction snap binding to the hardcoded default.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.modifiers = (try? c.decodeIfPresent(UInt32.self, forKey: .modifiers)) ?? 0
+        self.keyCode   = (try? c.decodeIfPresent(UInt32.self, forKey: .keyCode))   ?? 0
+    }
+
     /// ⌘⌥⇧T — triple-modifier default avoids collisions with macOS Screenshot
     /// (⌘⇧2/3/4/5) and other common system shortcuts.
     static let cmdOptShiftT = HotkeyBinding(
@@ -230,7 +247,8 @@ final class TroveGlobalHotkeys: ObservableObject {
         }
         var conflicts: [SnapDirection] = []
         for dir in SnapDirection.allCases {
-            let binding = dir.defaultBinding
+            // Use per-direction custom binding if present, else the built-in default.
+            let binding = WindowSnapSettings.shared.binding(for: dir)
             let hkID = EventHotKeyID(signature: signature, id: dir.rawValue)
             var ref: EventHotKeyRef?
             let st = RegisterEventHotKey(
@@ -240,7 +258,7 @@ final class TroveGlobalHotkeys: ObservableObject {
             if st == noErr, let ref = ref {
                 snapHotkeys[dir] = ref
             } else if st == -9874 {
-                // Fix #8: eventHotKeyExistsErr — collect for UI surfacing.
+                // eventHotKeyExistsErr — collect for UI surfacing.
                 conflicts.append(dir)
             }
         }
@@ -309,6 +327,12 @@ final class TroveGlobalHotkeys: ObservableObject {
         )
         if status == noErr {
             installedHandler = handlerRef
+        } else {
+            // Surface InstallEventHandler failure — this is recoverable (e.g. the
+            // event target temporarily unavailable) so we use @Published rather
+            // than a crash. The settings card displays this as an orange banner.
+            lastRegisterError = "Carbon event handler failed to install (OS error \(status)). " +
+                                "Global hotkeys are inactive — try restarting Trove."
         }
     }
 
@@ -453,7 +477,8 @@ enum SnapDirection: UInt32, CaseIterable {
 final class WindowSnapSettings: ObservableObject {
     static let shared = WindowSnapSettings()
 
-    private static let enabledKey = "trove.windowSnap.enabled"
+    private static let enabledKey  = "trove.windowSnap.enabled"
+    private static let bindingsKey = "trove.windowSnap.bindings"  // JSON [String:HotkeyBinding]
 
     @Published var enabled: Bool {
         didSet {
@@ -462,14 +487,50 @@ final class WindowSnapSettings: ObservableObject {
         }
     }
 
+    /// Per-direction custom bindings. Falls back to `dir.defaultBinding` for any missing key.
+    @Published var customBindings: [SnapDirection: HotkeyBinding] = [:] {
+        didSet {
+            // Persist as JSON dict [rawValue: HotkeyBinding].
+            let raw: [String: HotkeyBinding] = Dictionary(uniqueKeysWithValues:
+                customBindings.map { (String($0.key.rawValue), $0.value) })
+            if let data = try? JSONEncoder().encode(raw) {
+                UserDefaults.standard.set(data, forKey: Self.bindingsKey)
+            }
+            TroveGlobalHotkeys.shared.rebind()
+        }
+    }
+
+    /// Resolved binding for a direction (custom override or default).
+    func binding(for dir: SnapDirection) -> HotkeyBinding {
+        customBindings[dir] ?? dir.defaultBinding
+    }
+
     private init() {
-        // Default OFF — don't claim global hotkeys without user opt-in.
         let ud = UserDefaults.standard
         if ud.object(forKey: Self.enabledKey) == nil {
             self.enabled = false
         } else {
             self.enabled = ud.bool(forKey: Self.enabledKey)
         }
+        // Restore persisted per-direction bindings.
+        if let data = ud.data(forKey: Self.bindingsKey),
+           let raw = try? JSONDecoder().decode([String: HotkeyBinding].self, from: data) {
+            var map: [SnapDirection: HotkeyBinding] = [:]
+            for (k, v) in raw {
+                if let rv = UInt32(k), let dir = SnapDirection(rawValue: rv),
+                   Self.isValidBinding(v) {
+                    map[dir] = v
+                }
+            }
+            self.customBindings = map
+        }
+    }
+
+    private static func isValidBinding(_ b: HotkeyBinding) -> Bool {
+        guard b.keyCode <= 0xFF else { return false }
+        let allowed = UInt32(cmdKey | optionKey | controlKey | shiftKey)
+        guard b.modifiers & ~allowed == 0, b.modifiers != 0 else { return false }
+        return true
     }
 }
 
@@ -490,7 +551,7 @@ struct HotkeySettingsCard: View {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 8) {
                     Image(systemName: "command").foregroundStyle(.tint)
-                    Text("Global hotkeys").font(.headline)
+                    Text("Global hotkeys").headerText()
                     Spacer()
                 }
 
@@ -642,18 +703,20 @@ private struct HotkeyRecorderHost: NSViewRepresentable {
 // MARK: - Window Snap settings card
 // ===========================================================================
 
-/// Settings card that lets users toggle Rectangle-style global snap hotkeys.
-/// Lives in the Customize / Settings pane alongside HotkeySettingsCard.
+/// Settings card that lets users toggle + rebind Rectangle-style global snap hotkeys.
+/// Per-row recorder lets each direction be individually rebound; conflicts are surfaced.
 struct WindowSnapSettingsCard: View {
     @ObservedObject private var settings = WindowSnapSettings.shared
     @ObservedObject private var hotkeys = TroveGlobalHotkeys.shared
+    /// Which direction is currently being recorded (nil = none).
+    @State private var recording: SnapDirection? = nil
 
     var body: some View {
         Card {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 8) {
                     Image(systemName: "rectangle.split.2x1").foregroundStyle(.tint)
-                    Text("Window Snap").font(.headline)
+                    Text("Window Snap").headerText()
                     Spacer()
                 }
                 VStack(alignment: .leading, spacing: 4) {
@@ -664,14 +727,14 @@ struct WindowSnapSettingsCard: View {
                         .font(.caption).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                // Fix #8: surface hotkey conflicts so users know why a snap doesn't fire.
+                // Surface hotkey conflicts so users know why a snap doesn't fire.
                 if !hotkeys.snapConflicts.isEmpty {
                     VStack(alignment: .leading, spacing: 4) {
                         ForEach(hotkeys.snapConflicts, id: \.rawValue) { dir in
                             HStack(spacing: 6) {
                                 Image(systemName: "exclamationmark.triangle.fill")
                                     .foregroundStyle(.orange)
-                                Text("\(dir.defaultBinding.displayString) is already used by another app (\(dir.label) snap inactive).")
+                                Text("\(settings.binding(for: dir).displayString) is already used by another app (\(dir.label) snap inactive).")
                             }
                             .font(.caption)
                             .foregroundStyle(.orange)
@@ -681,18 +744,12 @@ struct WindowSnapSettingsCard: View {
                     .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
                 }
                 if settings.enabled {
-                    LazyVGrid(
-                        columns: [GridItem(.flexible()), GridItem(.flexible())],
-                        spacing: 4
-                    ) {
+                    // Per-direction rows with individual rebind buttons.
+                    VStack(spacing: 2) {
                         ForEach(SnapDirection.allCases, id: \.rawValue) { dir in
-                            HStack(spacing: 4) {
-                                Text(dir.defaultBinding.displayString)
-                                    .font(.system(.caption, design: .monospaced))
-                                    .foregroundStyle(hotkeys.snapConflicts.contains(dir) ? .orange : .secondary)
-                                Text(dir.label)
-                                    .font(.caption)
-                                Spacer()
+                            snapBindingRow(dir)
+                            if dir != SnapDirection.allCases.last {
+                                Divider().padding(.leading, 4)
                             }
                         }
                     }
@@ -700,5 +757,91 @@ struct WindowSnapSettingsCard: View {
                 }
             }
         }
+        // Single HotkeyRecorderHost shared across all rows; active only when `recording != nil`.
+        .background(
+            HotkeyRecorderHost(
+                active: Binding(
+                    get: { recording != nil },
+                    set: { if !$0 { recording = nil } }
+                )
+            ) { event in
+                guard let dir = recording else { return }
+                let mods = carbonModifierMaskSnap(from: event.modifierFlags)
+                let nonShift = mods & ~UInt32(shiftKey)
+                guard nonShift != 0 else { return }
+                // Conflict detection: refuse if another direction already uses this combo.
+                let newBinding = HotkeyBinding(modifiers: mods, keyCode: UInt32(event.keyCode))
+                let conflict = SnapDirection.allCases.first { other in
+                    other != dir && settings.binding(for: other) == newBinding
+                }
+                if conflict != nil {
+                    // Binding already used — flash a warning but don't apply.
+                    Task { @MainActor in
+                        SharedStore.stage.flash(
+                            "\(newBinding.displayString) is already bound to \(conflict!.label) snap — pick a different key.",
+                            kind: .warning
+                        )
+                    }
+                } else {
+                    settings.customBindings[dir] = newBinding
+                }
+                recording = nil
+            }
+        )
+    }
+
+    @ViewBuilder
+    private func snapBindingRow(_ dir: SnapDirection) -> some View {
+        let isRecording = recording == dir
+        let binding = settings.binding(for: dir)
+        let conflict = hotkeys.snapConflicts.contains(dir)
+        let isCustom = settings.customBindings[dir] != nil
+        HStack(spacing: 8) {
+            Text(dir.label)
+                .font(.caption)
+                .frame(minWidth: 140, alignment: .leading)
+            Spacer()
+            // Rebind button
+            Button {
+                recording = isRecording ? nil : dir
+            } label: {
+                Text(isRecording ? "Press keys…" : binding.displayString)
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(minWidth: 72)
+                    .padding(.horizontal, 8).padding(.vertical, 3)
+                    // P2: use troveCardFill token.
+                    .background(
+                        RoundedRectangle(cornerRadius: 5)
+                            .fill(isRecording
+                                  ? Color.troveAccent.opacity(0.25)
+                                  : (conflict ? Color.troveWarning.opacity(0.15) : Color.troveCardFill))
+                    )
+                    .foregroundStyle(conflict ? Color.troveWarning : .primary)
+            }
+            .buttonStyle(.plain)
+            .help(conflict ? "Conflict — another app uses this chord" : "Click to rebind")
+            // Reset to default button (only shown when custom override exists)
+            if isCustom {
+                Button {
+                    settings.customBindings.removeValue(forKey: dir)
+                } label: {
+                    Image(systemName: "arrow.counterclockwise")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Reset to default: \(dir.defaultBinding.displayString)")
+            }
+        }
+        .padding(.vertical, 3)
+    }
+
+    private func carbonModifierMaskSnap(from flags: NSEvent.ModifierFlags) -> UInt32 {
+        var m: UInt32 = 0
+        if flags.contains(.command) { m |= UInt32(cmdKey) }
+        if flags.contains(.option)  { m |= UInt32(optionKey) }
+        if flags.contains(.control) { m |= UInt32(controlKey) }
+        if flags.contains(.shift)   { m |= UInt32(shiftKey) }
+        return m
     }
 }

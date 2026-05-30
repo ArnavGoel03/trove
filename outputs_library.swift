@@ -26,6 +26,8 @@ import AppKit
 import Combine
 import Foundation
 import UniformTypeIdentifiers
+import QuickLookUI
+import QuickLookThumbnailing
 
 // ===========================================================================
 // MARK: - Data model
@@ -45,6 +47,32 @@ struct OutputEntry: Identifiable, Codable, Hashable {
     let kind: String             // "pdf" | "image" | "text" | "video" | "other"
 
     var url: URL { URL(fileURLWithPath: urlPath) }
+
+    // P1 fix: tolerant Codable. Synthesized decoding fails the WHOLE-array load
+    // (outputs-library.json is `[OutputEntry]`) if any future version adds a
+    // required field — silently emptying the Library on upgrade. With
+    // `decodeIfPresent` + sensible fallbacks for every field besides id and
+    // urlPath (the structural minimum), future polish passes can append fields
+    // without dropping prior state.
+    enum CodingKeys: String, CodingKey { case id, urlPath, producer, sourceLabel, createdAt, bytes, kind }
+
+    init(id: UUID, urlPath: String, producer: String, sourceLabel: String,
+         createdAt: Date, bytes: Int64, kind: String) {
+        self.id = id; self.urlPath = urlPath; self.producer = producer
+        self.sourceLabel = sourceLabel; self.createdAt = createdAt
+        self.bytes = bytes; self.kind = kind
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id          = try c.decode(UUID.self, forKey: .id)
+        self.urlPath     = try c.decode(String.self, forKey: .urlPath)
+        self.producer    = (try? c.decodeIfPresent(String.self, forKey: .producer)) ?? "unknown"
+        self.sourceLabel = (try? c.decodeIfPresent(String.self, forKey: .sourceLabel)) ?? ""
+        self.createdAt   = (try? c.decodeIfPresent(Date.self,   forKey: .createdAt))   ?? Date()
+        self.bytes       = (try? c.decodeIfPresent(Int64.self,  forKey: .bytes))       ?? 0
+        self.kind        = (try? c.decodeIfPresent(String.self, forKey: .kind))        ?? "other"
+    }
 }
 
 // red-team-sec: Trusted producer directories. A hostile actor with write access
@@ -154,7 +182,11 @@ final class OutputsLibrary: ObservableObject {
     // Serial write queue so two debounced flushes can't interleave.
     private let writeQueue = DispatchQueue(label: "trove.outputs-library.write",
                                            qos: .utility)
+    // P2: saveWork is retained as a DispatchWorkItem for the synchronous
+    // flushSynchronously path; saveDebouncedTask carries the Swift-concurrency
+    // debounce Task so cancellation is reliable.
     private var saveWork: DispatchWorkItem?
+    private var saveDebouncedTask: Task<Void, Never>?
 
     // Terminate observer — flush before exit so the last `record(...)` makes it
     // to disk even if the user quits inside the 200ms debounce window.
@@ -358,24 +390,27 @@ final class OutputsLibrary: ObservableObject {
         scheduleSave()
     }
 
-    /// Remove from the manifest AND delete the file on disk. Caller is
+    /// Remove from the manifest AND move the file to Trash. Caller is
     /// expected to have confirmed with the user already.
-    /// On delete failure (permission denied, iCloud-not-downloaded) we keep
+    /// On trash failure (permission denied, iCloud-not-downloaded) we keep
     /// the entry in the list and flash an error so the user can retry.
+    /// Files trashed here are fully recoverable from ~/.Trash.
     func delete(_ id: UUID) {
         guard let i = entries.firstIndex(where: { $0.id == id }) else { return }
         let entry = entries[i]
         let url = entry.url
         do {
+            // P0 fix: use trashItem (recoverable) instead of removeItem (permanent).
             // Red-team #4: file may be missing, in iCloud, or permission-denied.
-            // Treat ".file already gone" as success.
+            // Treat "file already gone" as success.
             if FileManager.default.fileExists(atPath: url.path) {
-                try FileManager.default.removeItem(at: url)
+                var trashed: NSURL?
+                try FileManager.default.trashItem(at: url, resultingItemURL: &trashed)
             }
             entries.remove(at: i)
             scheduleSave()
         } catch {
-            SharedStore.stage.flash("Couldn't delete \(url.lastPathComponent): \(error.localizedDescription)")
+            SharedStore.stage.flash("Couldn't trash \(url.lastPathComponent): \(error.localizedDescription)")
         }
     }
 
@@ -426,15 +461,20 @@ final class OutputsLibrary: ObservableObject {
 
     /// Debounced save — coalesces a burst of record() calls (e.g. PDF split
     /// producing 30 part files) into a single disk write 200ms after the last
-    /// mutation.
+    /// mutation. P2 fix: replaced DispatchQueue.main.asyncAfter with a
+    /// Task.sleep so we stay on the Swift-concurrency executor path.
     private func scheduleSave() {
+        // Cancel any pending debounce Task.
+        saveDebouncedTask?.cancel()
+        saveDebouncedTask = nil
         saveWork?.cancel()
+        saveWork = nil
         let snapshot = entries
-        let work = DispatchWorkItem { [weak self] in
+        saveDebouncedTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(200))
+            guard !Task.isCancelled else { return }
             self?.performSave(snapshot)
         }
-        saveWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
     }
 
     /// Force-flush within the debounce window — invoked on willTerminate.
@@ -444,6 +484,8 @@ final class OutputsLibrary: ObservableObject {
     /// point of "flush before quit". Call the actual write body synchronously
     /// here so the on-disk file is current when the process dies.
     private func flushSynchronously() {
+        saveDebouncedTask?.cancel()
+        saveDebouncedTask = nil
         saveWork?.cancel()
         saveWork = nil
         let snapshot = entries
@@ -738,6 +780,9 @@ private struct OutputsRow: View {
     var isPrimary: Bool = false
     let onDelete: () -> Void
 
+    /// P1: QL thumbnail (loaded async; nil = not yet loaded or unavailable).
+    @State private var thumbnail: NSImage? = nil
+
     /// red-team: a row that's been evicted to iCloud should look different
     /// (and ops should refuse) — opening the .icloud placeholder pops a
     /// dataless-file dialog from the OS, which is confusing UX.
@@ -762,10 +807,21 @@ private struct OutputsRow: View {
 
     var body: some View {
         HStack(alignment: .center, spacing: 10) {
-            Image(systemName: iniCloud ? "icloud.and.arrow.down" : OutputsKindIcon.symbol(for: entry.kind))
-                .font(.system(size: 18))
-                .frame(width: 26, alignment: .center)
-                .foregroundStyle(iniCloud ? AnyShapeStyle(.secondary) : AnyShapeStyle(.tint))
+            // P1: show QL thumbnail when available; fall back to SF symbol.
+            Group {
+                if let thumb = thumbnail, !iniCloud {
+                    Image(nsImage: thumb)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 26, height: 26)
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                } else {
+                    Image(systemName: iniCloud ? "icloud.and.arrow.down" : OutputsKindIcon.symbol(for: entry.kind))
+                        .font(.system(size: 18))
+                        .foregroundStyle(iniCloud ? AnyShapeStyle(Color.troveFgMute) : AnyShapeStyle(Color.troveAccent))
+                }
+            }
+            .frame(width: 26, alignment: .center)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(entry.url.lastPathComponent)
@@ -881,6 +937,10 @@ private struct OutputsRow: View {
             return NSItemProvider(contentsOf: entry.url) ?? NSItemProvider()
         }
         .contextMenu {
+            Button("Quick Look") { TroveQuickLook.shared.show(entry.url) }
+                .keyboardShortcut(.space, modifiers: [])
+                .disabled(iniCloud)
+            Divider()
             Button("Open") { safeOpen() }
                 .disabled(iniCloud)
             Button("Save…") {
@@ -902,6 +962,21 @@ private struct OutputsRow: View {
                 let pb = NSPasteboard.general
                 pb.clearContents()
                 pb.setString(entry.url.path, forType: .string)
+            }
+            // P1 fix: add Re-edit… to contextMenu for parity with ellipsis menu
+            Divider()
+            reEditMenu
+        }
+        // P1: load QL thumbnail off-main; only for image/pdf/video kinds
+        // that are on-disk (not iCloud) to avoid stalling the list on evicted entries.
+        .task(id: entry.id) {
+            guard !iniCloud,
+                  ["image", "pdf", "video"].contains(entry.kind),
+                  FileManager.default.fileExists(atPath: entry.urlPath)
+            else { return }
+            let url = entry.url
+            if let img = await OutputsThumbnailLoader.thumbnail(for: url, size: CGSize(width: 52, height: 52)) {
+                thumbnail = img
             }
         }
     }
@@ -974,6 +1049,34 @@ private struct OutputsRow: View {
 }
 
 // ===========================================================================
+// MARK: - Thumbnail loader (QLThumbnailGenerator, P1)
+// ===========================================================================
+
+/// Generates a QL thumbnail for supported types (image/pdf/video) off-main.
+/// Returns nil on failure so callers fall back to the SF-symbol icon silently.
+private enum OutputsThumbnailLoader {
+    static func thumbnail(for url: URL, size: CGSize) async -> NSImage? {
+        return await withCheckedContinuation { cont in
+            let req = QLThumbnailGenerator.Request(
+                fileAt: url,
+                size: size,
+                scale: 2.0,
+                representationTypes: .thumbnail
+            )
+            QLThumbnailGenerator.shared.generateBestRepresentation(for: req) { rep, _ in
+                // Completion may fire on any thread; no main-actor requirement.
+                if let rep = rep {
+                    cont.resume(returning: NSImage(cgImage: rep.cgImage,
+                                                   size: size))
+                } else {
+                    cont.resume(returning: nil)
+                }
+            }
+        }
+    }
+}
+
+// ===========================================================================
 // MARK: - Save helpers (statics — no captured view state)
 // ===========================================================================
 
@@ -999,11 +1102,20 @@ private enum OutputsSaveHelpers {
         panel.begin { resp in
             guard resp == .OK, let dest = panel.url else { return }
             setLastSaveDir(dest.deletingLastPathComponent())
+            // P1 fix: atomic copy via tmp + replaceItemAt so a partial write
+            // never corrupts an existing file at the destination.
             do {
-                if FileManager.default.fileExists(atPath: dest.path) {
-                    try FileManager.default.removeItem(at: dest)
+                let fm = FileManager.default
+                let tmp = dest.deletingLastPathComponent()
+                    .appendingPathComponent(".\(dest.lastPathComponent).tmp-\(UUID().uuidString.prefix(6))")
+                try fm.copyItem(at: entry.url, to: tmp)
+                if fm.fileExists(atPath: dest.path) {
+                    _ = try fm.replaceItemAt(dest, withItemAt: tmp)
+                } else {
+                    try fm.moveItem(at: tmp, to: dest)
                 }
-                try FileManager.default.copyItem(at: entry.url, to: dest)
+                // Sweep any leftover tmp in case replaceItemAt left it.
+                if fm.fileExists(atPath: tmp.path) { try? fm.removeItem(at: tmp) }
                 NSWorkspace.shared.activateFileViewerSelecting([dest])
                 SharedStore.stage.flash("Saved \(dest.lastPathComponent) to \(dest.deletingLastPathComponent().lastPathComponent)")
             } catch {

@@ -82,12 +82,17 @@ final class SnipAnnotationModel: ObservableObject {
     @Published var currentFontSize: CGFloat = 18
     @Published var blurRadius: CGFloat = 10
 
+    // P1: commit progress flag — shown in the editor while background render runs.
+    @Published var isCommitting: Bool = false
+
     // Fix #2: shared CIContext to avoid creating one per blur render.
     private lazy var ciContext = CIContext(options: nil)
 
     // Undo stack: each entry is a snapshot of the annotations array.
     // Capped at 20 states.
     private var undoStack: [[SnipAnnotation]] = []
+    // P1: redo stack — parallel to undoStack.
+    private var redoStack: [[SnipAnnotation]] = []
     private let maxUndoDepth = 20
 
     init(image: NSImage) {
@@ -99,22 +104,52 @@ final class SnipAnnotationModel: ObservableObject {
         if undoStack.count > maxUndoDepth {
             undoStack.removeFirst(undoStack.count - maxUndoDepth)
         }
+        // P1: any new action clears the redo stack (standard undo model).
+        redoStack.removeAll()
     }
 
     func undo() {
         guard let prev = undoStack.popLast() else { return }
+        // P1: push current state onto redo before reverting.
+        redoStack.append(annotations)
         annotations = prev
     }
 
+    func redo() {
+        guard let next = redoStack.popLast() else { return }
+        undoStack.append(annotations)
+        annotations = next
+    }
+
     var canUndo: Bool { !undoStack.isEmpty }
+    var canRedo: Bool { !redoStack.isEmpty }
 
     func addAnnotation(_ ann: SnipAnnotation) {
         pushUndo()
         annotations.append(ann)
     }
 
-    /// Render image + annotations into a new NSImage at the original resolution.
-    func commit() -> NSImage {
+    /// P1: commit() runs the full-resolution lockFocus render on a background
+    /// thread to avoid blocking the main actor for large images. Calls
+    /// completion on MainActor when done.
+    func commitAsync(completion: @escaping @MainActor (NSImage) -> Void) {
+        isCommitting = true
+        let img = image
+        let anns = annotations
+        Task.detached(priority: .userInitiated) {
+            let result = Self.renderSync(image: img, annotations: anns)
+            await MainActor.run { [weak self] in
+                self?.isCommitting = false
+                completion(result)
+            }
+        }
+    }
+
+    /// Synchronous render — must be called off-main for large images.
+    /// `nonisolated` so it's reachable from Task.detached even though the
+    /// enclosing type is @MainActor; it only touches NSImage/CG which are
+    /// thread-safe for the read-only operations we perform here.
+    nonisolated private static func renderSync(image: NSImage, annotations: [SnipAnnotation]) -> NSImage {
         let size = image.size
         guard size.width > 0, size.height > 0 else { return image }
         let result = NSImage(size: size)
@@ -124,15 +159,30 @@ final class SnipAnnotationModel: ObservableObject {
         // Draw base image.
         image.draw(in: NSRect(origin: .zero, size: size))
 
-        // Draw each annotation.
+        // P1: snapshot the base CGImage *once* before drawing any annotations.
+        // drawBlurRegion previously called ctx.makeImage() per blur region,
+        // which re-snapped the entire bitmap each time — O(n) for n blurs.
+        // Snapping once and reusing cuts that to O(1).
         let ctx = NSGraphicsContext.current?.cgContext
+        let baseSnapshot = ctx?.makeImage()
+        let bounds = NSRect(origin: .zero, size: size)
+
         for ann in annotations {
-            drawAnnotation(ann, in: NSRect(origin: .zero, size: size), ctx: ctx)
+            drawAnnotation(ann, in: bounds, ctx: ctx, baseSnapshot: baseSnapshot)
         }
         return result
     }
 
-    private func drawAnnotation(_ ann: SnipAnnotation, in bounds: NSRect, ctx: CGContext?) {
+    // Keep the old synchronous commit() as a convenience wrapper for callers
+    // that don't need async (e.g. the test path). It runs on main and is only
+    // safe for small images.
+    func commit() -> NSImage {
+        Self.renderSync(image: image, annotations: annotations)
+    }
+
+    nonisolated private static func drawAnnotation(_ ann: SnipAnnotation, in bounds: NSRect,
+                                        ctx: CGContext?,
+                                        baseSnapshot: CGImage?) {
         switch ann {
         case .arrow(_, let start, let end, let color):
             drawArrow(from: start, to: end, color: color, lineWidth: 3)
@@ -144,11 +194,14 @@ final class SnipAnnotationModel: ObservableObject {
             path.stroke()
 
         case .highlight(_, let rect, let color):
+            // P1: use the stored color (was hardcoded to systemYellow in
+            // some callers; here we respect whatever was passed in).
             color.withAlphaComponent(0.3).setFill()
             NSBezierPath(rect: rect).fill()
 
         case .blur(_, let rect, let radius):
-            drawBlurRegion(rect: rect, radius: radius, in: bounds)
+            drawBlurRegion(rect: rect, radius: radius, in: bounds,
+                           ctx: ctx, baseSnapshot: baseSnapshot)
 
         case .text(_, let rect, let content, let color, let fontSize):
             let attrs: [NSAttributedString.Key: Any] = [
@@ -159,8 +212,8 @@ final class SnipAnnotationModel: ObservableObject {
         }
     }
 
-    private func drawArrow(from start: CGPoint, to end: CGPoint,
-                           color: NSColor, lineWidth: CGFloat) {
+    nonisolated private static func drawArrow(from start: CGPoint, to end: CGPoint,
+                                   color: NSColor, lineWidth: CGFloat) {
         guard start != end else { return }
         color.setStroke()
         color.setFill()
@@ -188,19 +241,25 @@ final class SnipAnnotationModel: ObservableObject {
         head.fill()
     }
 
-    private func drawBlurRegion(rect: CGRect, radius: CGFloat, in bounds: NSRect) {
+    nonisolated private static func drawBlurRegion(rect: CGRect, radius: CGFloat, in bounds: NSRect,
+                                        ctx: CGContext?, baseSnapshot: CGImage?) {
         guard rect.width > 0, rect.height > 0 else { return }
-        // Crop the current rendered content from the bitmap context, blur it
-        // via CIFilter, then draw back.
-        guard let ctx = NSGraphicsContext.current?.cgContext,
-              let snapped = ctx.makeImage() else {
+        // P1: use the pre-captured baseSnapshot instead of calling ctx.makeImage()
+        // here — avoids a full-resolution snapshot per blur region (was O(n)).
+        guard let ctx = ctx,
+              let snapped = baseSnapshot else {
             // Fallback: translucent gray.
             NSColor.gray.withAlphaComponent(0.5).setFill()
             NSBezierPath(rect: rect).fill()
             return
         }
 
-        let scale = snapped.width > 0 ? CGFloat(snapped.width) / bounds.width : 1
+        // P1 hardening: guard BOTH sides of the ratio. bounds.width can be 0 in
+        // the first SwiftUI layout pass before GeometryReader fires; CGFloat/0
+        // produces inf, which then poisons every downstream coordinate calculation.
+        let scale: CGFloat = (snapped.width > 0 && bounds.width > 0)
+            ? CGFloat(snapped.width) / bounds.width
+            : 1
         let cropRect = CGRect(x: rect.minX * scale,
                               y: rect.minY * scale,
                               width: rect.width * scale,
@@ -215,10 +274,11 @@ final class SnipAnnotationModel: ObservableObject {
         let filter = CIFilter.gaussianBlur()
         filter.inputImage = ciImage
         filter.radius = Float(radius)
+        // Use a thread-local CIContext rather than the MainActor lazy one
+        // because renderSync is called from a background Task.
+        let bgContext = CIContext(options: nil)
         guard let output = filter.outputImage,
-              let ciCtx = ciContext.createCGImage(
-                  output,
-                  from: ciImage.extent) else {
+              let ciCtx = bgContext.createCGImage(output, from: ciImage.extent) else {
             NSColor.gray.withAlphaComponent(0.5).setFill()
             NSBezierPath(rect: rect).fill()
             return
@@ -331,8 +391,9 @@ struct SnipAnnotationCanvas: View {
         case .highlight:
             let rect = toImgRect(start, end)
             guard rect.width > 2, rect.height > 2 else { return }
+            // P1: use model.currentColor instead of hardcoded systemYellow.
             model.addAnnotation(.highlight(rect: rect,
-                                           color: NSColor.systemYellow))
+                                           color: model.currentColor))
         case .blur:
             let rect = toImgRect(start, end)
             guard rect.width > 4, rect.height > 4 else { return }
@@ -350,7 +411,7 @@ struct SnipAnnotationCanvas: View {
     private var textPromptSheet: some View {
         VStack(spacing: 16) {
             Text("Enter annotation text")
-                .font(.headline)
+                .headerText()
             TextField("Text…", text: $textInput)
                 .textFieldStyle(.roundedBorder)
                 .frame(minWidth: 280)
@@ -421,7 +482,8 @@ struct SnipAnnotationCanvas: View {
             return .rectangle(rect: rect, color: model.currentColor,
                               strokeWidth: model.currentStrokeWidth)
         case .highlight:
-            return .highlight(rect: toImgRect(start, current), color: NSColor.systemYellow)
+            // P1: preview uses model.currentColor (was hardcoded systemYellow).
+            return .highlight(rect: toImgRect(start, current), color: model.currentColor)
         case .blur:
             // Preview blur as translucent gray (no live CI for perf).
             return .highlight(rect: toImgRect(start, current),
@@ -504,6 +566,8 @@ struct SnipAnnotationCanvas: View {
 
 struct AnnotationToolbar: View {
     @ObservedObject var model: SnipAnnotationModel
+    // P2: ReduceTransparency fallback for toolbar material.
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     private let colorPresets: [NSColor] = [
         .systemRed, .systemOrange, .systemYellow,
@@ -534,6 +598,8 @@ struct AnnotationToolbar: View {
                                       lineWidth: 1.2)
                 )
                 .help(tool.label)
+                // P2: accessibility label for tool buttons.
+                .accessibilityLabel(tool.label)
             }
 
             Divider().frame(height: 22)
@@ -555,6 +621,8 @@ struct AnnotationToolbar: View {
                 }
                 .buttonStyle(.plain)
                 .help(color.colorNameForDisplay)
+                // P2: accessibility label for color preset buttons.
+                .accessibilityLabel("\(color.colorNameForDisplay) color")
             }
 
             Divider().frame(height: 22)
@@ -569,10 +637,28 @@ struct AnnotationToolbar: View {
             .disabled(!model.canUndo)
             .help("Undo (⌘Z)")
             .keyboardShortcut("z", modifiers: [.command])
+            .accessibilityLabel("Undo")
+
+            // P1: redo button — mirrors undo, stack cleared on new action.
+            Button {
+                model.redo()
+            } label: {
+                Image(systemName: "arrow.uturn.forward")
+            }
+            .buttonStyle(.plain)
+            .disabled(!model.canRedo)
+            .help("Redo (⌘⇧Z)")
+            .keyboardShortcut("z", modifiers: [.command, .shift])
+            .accessibilityLabel("Redo")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background(.ultraThinMaterial)
+        // P2: solid background when Reduce Transparency is on.
+        .background(
+            reduceTransparency
+                ? AnyShapeStyle(Color.troveCardSolid)
+                : AnyShapeStyle(.ultraThinMaterial)
+        )
     }
 }
 
@@ -627,17 +713,31 @@ struct SnipAnnotationEditor: View {
             HStack {
                 Button("Cancel") { requestCancel() }
                     .keyboardShortcut(.escape, modifiers: [])
+                    .disabled(model.isCommitting)
                 Spacer()
-                Text(model.currentTool.label)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                if model.isCommitting {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Rendering…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text(model.currentTool.label)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
+                // P1: use async commit to avoid blocking the main thread on
+                // large full-resolution images.
                 Button("Done") {
-                    let annotated = model.commit()
-                    onCommit(annotated)
+                    model.commitAsync { annotated in
+                        onCommit(annotated)
+                    }
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.return, modifiers: [.command])
+                .disabled(model.isCommitting)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 10)

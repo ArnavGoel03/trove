@@ -297,6 +297,16 @@ enum RenamePlanner {
 
         case .regex:
             if settings.findText.isEmpty { return (original, nil) }
+            // P1 fix: ReDoS guard. NSRegularExpression has no timeout, and this
+            // runs synchronously on the debounced planner against every filename
+            // in the batch on every keystroke. A pattern like `(a+)+$` would
+            // peg a CPU core for seconds; on a 1000-file batch it locks the UI.
+            // text_transforms.swift already has the heuristic — share it.
+            do {
+                try rejectCatastrophicRegex(settings.findText, inputBytes: original.count)
+            } catch {
+                return (original, RenamePlanError.regexInvalid(error.localizedDescription).errorDescription)
+            }
             // red-team #4 (regex compile failure): surfaces inline as a row
             // error; the planner never throws to the caller.
             var options: NSRegularExpression.Options = []
@@ -418,7 +428,10 @@ final class RenameViewModel: ObservableObject {
         // typing felt sticky. Debounce 250 ms and run the planner off-main on
         // a serial queue with latest-input-wins; the UI publishes back via
         // MainActor.run when the freshest run finishes.
-        didSet { schedulePreviewRecompute() }
+        didSet {
+            persistSettings()
+            schedulePreviewRecompute()
+        }
     }
     @Published var globalError: String? = nil
     /// Red-team #9: gate while a batch is in flight so the user can't queue
@@ -426,6 +439,49 @@ final class RenameViewModel: ObservableObject {
     @Published var isApplying: Bool = false
     /// Undo bookkeeping for the most recent successful apply.
     @Published private(set) var lastUndo: [RenameUndoPair] = []
+
+    // P1 FIX: persist RenameSettings via UserDefaults so settings survive
+    // app restarts. Using explicit UserDefaults keys so all scalar settings
+    // are individually addressable. Applied once at init from persisted values.
+    private static let kPrefix = "trove.rename."
+    private func persistSettings() {
+        let ud = UserDefaults.standard
+        ud.set(settings.mode.rawValue,             forKey: Self.kPrefix + "mode")
+        ud.set(settings.findText,                  forKey: Self.kPrefix + "findText")
+        ud.set(settings.replaceText,               forKey: Self.kPrefix + "replaceText")
+        ud.set(settings.matchCase,                 forKey: Self.kPrefix + "matchCase")
+        ud.set(settings.sequencePrefix,            forKey: Self.kPrefix + "sequencePrefix")
+        ud.set(settings.sequenceStart,             forKey: Self.kPrefix + "sequenceStart")
+        ud.set(settings.sequencePadding,           forKey: Self.kPrefix + "sequencePadding")
+        ud.set(settings.dateFormat,                forKey: Self.kPrefix + "dateFormat")
+        ud.set(settings.dateSeparator,             forKey: Self.kPrefix + "dateSeparator")
+        ud.set(settings.caseStyle.rawValue,        forKey: Self.kPrefix + "caseStyle")
+    }
+    private static func loadSettings() -> RenameSettings {
+        let ud = UserDefaults.standard
+        var s = RenameSettings()
+        if let raw = ud.string(forKey: kPrefix + "mode"),
+           let m = RenameMode(rawValue: raw) { s.mode = m }
+        if let v = ud.string(forKey: kPrefix + "findText")   { s.findText = v }
+        if let v = ud.string(forKey: kPrefix + "replaceText") { s.replaceText = v }
+        s.matchCase = ud.bool(forKey: kPrefix + "matchCase")
+        if let v = ud.string(forKey: kPrefix + "sequencePrefix") { s.sequencePrefix = v }
+        let start = ud.integer(forKey: kPrefix + "sequenceStart")
+        if start > 0 { s.sequenceStart = start }
+        let pad = ud.integer(forKey: kPrefix + "sequencePadding")
+        if pad > 0 { s.sequencePadding = pad }
+        if let v = ud.string(forKey: kPrefix + "dateFormat")    { s.dateFormat = v }
+        if let v = ud.string(forKey: kPrefix + "dateSeparator") { s.dateSeparator = v }
+        if let raw = ud.string(forKey: kPrefix + "caseStyle"),
+           let c = RenameCaseStyle(rawValue: raw) { s.caseStyle = c }
+        return s
+    }
+
+    init() {
+        // Restore persisted settings without triggering didSet / schedulePreview.
+        // We assign via the backing storage to avoid the first-launch redundant write.
+        self._settings = Published(initialValue: Self.loadSettings())
+    }
 
     // ----- preview debounce plumbing -------------------------------------
     // speed: serial queue means a slow regex compile on input N can't overlap
@@ -435,6 +491,17 @@ final class RenameViewModel: ObservableObject {
     private let previewQueue = DispatchQueue(label: "trove.rename.preview", qos: .userInitiated)
     private var previewWorkItem: DispatchWorkItem? = nil
     private var previewGeneration: UInt64 = 0
+
+    // P1 FIX: summary counters for the confirm dialog (no-ops, warnings, will-rename).
+    var applyDialogSummary: (noOps: Int, warnings: Int, willRename: Int) {
+        var noOps = 0, warnings = 0, willRename = 0
+        for row in rows {
+            if row.newName == row.originalName { noOps += 1; continue }
+            if let e = row.rowError, e.lowercased().hasPrefix("warning:") { warnings += 1; continue }
+            willRename += 1
+        }
+        return (noOps, warnings, willRename)
+    }
 
     // ----- list mutation --------------------------------------------------
 
@@ -489,18 +556,25 @@ final class RenameViewModel: ObservableObject {
 
     // ----- preview pipeline ----------------------------------------------
 
-    /// Recompute every row's `newName` from the current settings — SYNCHRONOUS
-    /// path used by list mutations (addURLs / remove / undo / apply) where the
-    /// user just changed the row set and expects the preview to update before
-    /// the next frame. Settings-keystroke updates funnel through the debounced
-    /// async path instead.
+    /// Recompute every row's `newName` from the current settings.
+    ///
+    /// P0 FIX: the old synchronous path called `annotateCollisions()` which
+    /// called `fm.fileExists` on the main actor for every row — stalls the UI
+    /// on large/network batches. We now run the pure planner synchronously on
+    /// main (fast, no FS hits), then dispatch the FS-touching collision pass to
+    /// the same serial previewQueue used by the debounced path. Results are
+    /// published back via MainActor.run with a generation guard so a racing
+    /// settings-keystroke debounce can't overwrite newer results.
     func recomputePreview() {
-        // speed: cancel any in-flight debounced job — its result would clobber
-        // ours by ID and racing the sync update we're about to do.
+        // Cancel any in-flight debounced job so its results can't clobber ours.
         previewWorkItem?.cancel()
         previewWorkItem = nil
         previewGeneration &+= 1
+        let gen = previewGeneration
         globalError = nil
+
+        // Stage 1: pure planner (no FS) — runs synchronously on main so the UI
+        // immediately shows the new names without visible delay.
         for (idx, row) in rows.enumerated() {
             let (name, err) = RenamePlanner.planName(for: row.url,
                                                      index: idx,
@@ -508,7 +582,65 @@ final class RenameViewModel: ObservableObject {
             row.newName = name
             row.rowError = err
         }
-        annotateCollisions()
+
+        // Stage 2: fast batch-duplicate check (no FS hits) — can run on main.
+        annotateCollisionsInBatch()
+
+        // Stage 3: off-main FS-touching collision check (fileExists per dest).
+        let snap: [(id: UUID, url: URL, name: String, existingError: String?)] = rows.map {
+            ($0.id, $0.url, $0.newName, $0.rowError)
+        }
+        let work = DispatchWorkItem { [weak self] in
+            let fm = FileManager.default
+            var updates: [UUID: String] = [:]  // id → new error string (nil means clear to existing)
+            for entry in snap {
+                guard entry.existingError == nil else { continue }
+                if entry.name.isEmpty { continue }
+                let dest = entry.url.deletingLastPathComponent().appendingPathComponent(entry.name)
+                if dest.path == entry.url.path { continue }
+                if fm.fileExists(atPath: dest.path) {
+                    let sameInode: Bool = {
+                        let keys: Set<URLResourceKey> = [.fileResourceIdentifierKey]
+                        guard let a = try? entry.url.resourceValues(forKeys: keys).fileResourceIdentifier,
+                              let b = try? dest.resourceValues(forKeys: keys).fileResourceIdentifier
+                        else { return false }
+                        return (a as AnyObject).isEqual(b as AnyObject)
+                    }()
+                    if sameInode { continue }
+                    updates[entry.id] = "destination exists"
+                }
+            }
+            DispatchQueue.main.async {
+                guard let self, gen == self.previewGeneration else { return }
+                for row in self.rows {
+                    if let err = updates[row.id] {
+                        row.rowError = err
+                    }
+                }
+                self.applyHiddenAndReservedWarnings()
+            }
+        }
+        previewWorkItem = work
+        previewQueue.async(execute: work)
+    }
+
+    /// Annotate within-batch duplicate planned names (no FS I/O).
+    /// Safe to call on the main actor.
+    private func annotateCollisionsInBatch() {
+        var counts: [String: Int] = [:]
+        for row in rows {
+            let dest = row.url.deletingLastPathComponent().appendingPathComponent(row.newName)
+            counts[dest.path, default: 0] += 1
+        }
+        for row in rows {
+            if row.rowError != nil { continue }
+            if row.newName.isEmpty { row.rowError = "empty name"; continue }
+            let dest = row.url.deletingLastPathComponent().appendingPathComponent(row.newName)
+            if dest.path == row.url.path { continue }
+            if (counts[dest.path] ?? 0) > 1 {
+                row.rowError = "duplicate planned name"
+            }
+        }
     }
 
     /// speed: debounced + off-main preview recompute for the settings-keystroke
@@ -657,88 +789,41 @@ final class RenameViewModel: ObservableObject {
     /// red-team #7 (reserved DOS names): warn (non-blocking) when the stem
     /// matches a reserved Windows basename. macOS will happily create them,
     /// but Windows / SMB / OneDrive sync will not.
-    private func annotateCollisions() {
-        var counts: [String: Int] = [:]
-        // group by destination-path (dir + newName); collisions are equal paths.
-        var destPaths: [(row: RenameRow, dest: URL)] = []
-        for row in rows {
-            let dest = row.url.deletingLastPathComponent().appendingPathComponent(row.newName)
-            destPaths.append((row, dest))
-            counts[dest.path, default: 0] += 1
-        }
-        let fm = FileManager.default
-        for (row, dest) in destPaths {
-            // Don't overwrite an existing rowError from the planner.
-            if row.rowError != nil { continue }
-            if row.newName.isEmpty {
-                row.rowError = "empty name"
-                continue
-            }
-            // Same-path no-op is fine (means "no change for this row").
-            if dest.path == row.url.path { continue }
-            // red-team #1: collision within the planned batch.
-            if (counts[dest.path] ?? 0) > 1 {
-                row.rowError = "duplicate planned name"
-                continue
-            }
-            // red-team #2 (case-only rename): if the only difference is letter
-            // case AND the volume is case-insensitive, both paths resolve to
-            // the same inode. That's not a real collision — apply() will do
-            // the temp-name dance. Detect via `URLResourceKey.fileResourceIdentifierKey`:
-            // identical identifiers ⇒ same on-disk file.
-            if fm.fileExists(atPath: dest.path) {
-                let sameInode: Bool = {
-                    let keys: Set<URLResourceKey> = [.fileResourceIdentifierKey]
-                    guard
-                        let a = try? row.url.resourceValues(forKeys: keys).fileResourceIdentifier,
-                        let b = try? dest.resourceValues(forKeys: keys).fileResourceIdentifier
-                    else { return false }
-                    // fileResourceIdentifier is opaque NSObject; compare by isEqual.
-                    return (a as AnyObject).isEqual(b as AnyObject)
-                }()
-                if sameInode {
-                    // Same-inode case-only rename → not an error; apply()
-                    // will handle via the temp-name dance.
-                    continue
-                }
-                // If `dest.path` is the current path of some OTHER row in the
-                // batch, this is still a hard conflict for non-temp moveItem;
-                // flag it.
-                row.rowError = "destination exists"
-                continue
-            }
-            // red-team #6: hidden-file warning. Only flag when the original
-            // was visible (`!hasPrefix "."`) and the new name starts with `.`
-            // — that's the surprising path. Period-prefix on something that
-            // was already hidden is fine.
-            if !row.originalName.hasPrefix("."), row.newName.hasPrefix(".") {
-                row.rowError = "warning: starts with '.', will be hidden in Finder"
-                continue
-            }
-            // red-team #7: reserved DOS names — warn so cross-platform users
-            // know the rename will break on Windows / OneDrive / SMB.
-            let stem = (row.newName as NSString).deletingPathExtension.uppercased()
-            if Self.reservedDOSNames.contains(stem) {
-                row.rowError = "warning: '\(stem)' is reserved on Windows / OneDrive"
-                continue
-            }
-        }
-    }
-
     // ----- apply ---------------------------------------------------------
 
-    /// Apply every planned rename, atomic-ish: on any throw mid-batch, undo
-    /// the already-applied renames in reverse and surface a summary. Red-team #3.
+    /// Synchronous replan used exclusively by apply(). Runs stages 1+2 (pure
+    /// planner + batch-dup check) synchronously on main. Stage 3 (fileExists)
+    /// is intentionally skipped — apply() performs its own per-row FS check
+    /// inside the loop via moveItemSafely, which throws on a real collision.
+    private func replanSyncForApply() {
+        previewWorkItem?.cancel()
+        previewWorkItem = nil
+        previewGeneration &+= 1
+        globalError = nil
+        for (idx, row) in rows.enumerated() {
+            let (name, err) = RenamePlanner.planName(for: row.url,
+                                                     index: idx,
+                                                     settings: settings)
+            row.newName = name
+            row.rowError = err
+        }
+        annotateCollisionsInBatch()
+        applyHiddenAndReservedWarnings()
+    }
+
+    /// Apply every planned rename off-main with per-file progress reporting.
+    /// P1 FIX: the previous implementation ran the moveItem loop synchronously
+    /// on the main actor — on a 1000-file batch this froze the UI for several
+    /// seconds. We now snapshot the planned pairs and execute off-main via
+    /// Task.detached, publishing per-file progress back via MainActor.run.
+    /// Atomic-ish: on any failure mid-batch, we roll back the already-applied
+    /// renames in reverse before surfacing the error.
     func apply() {
         guard !isApplying else { return }
         guard !rows.isEmpty else { return }
-        // red-team: a debounced preview job may still be sitting on the queue
-        // with the LATEST settings. If we don't flush it, apply() would run
-        // against the pre-debounce planned names. Cancel the pending job and
-        // recompute synchronously so what the user sees is what we apply.
-        if previewWorkItem != nil {
-            recomputePreview()
-        }
+        // Flush any pending debounced preview by replanning synchronously so
+        // what the user sees on-screen is exactly what we apply.
+        replanSyncForApply()
 
         // Refuse if ANY row has a hard row-level error — the user must clear
         // them first. This is the "atomic batch" contract.
@@ -765,64 +850,124 @@ final class RenameViewModel: ObservableObject {
 
         isApplying = true
         globalError = nil
-        var doneSoFar: [(row: RenameRow, from: URL, to: URL)] = []
-        var perFileErrors: [String] = []
 
-        for row in rows {
-            // No-op rows: just record the identity pair so undo still works
-            // symmetrically. (Identity move would no-op anyway — skip it.)
-            if row.newName == row.originalName {
-                row.appliedURL = row.url
-                continue
+        // Snapshot the planned (from, to, id, originalName) pairs off-main so
+        // the detached task doesn't need to touch @Published row objects.
+        struct Pair { let id: UUID; let from: URL; let to: URL; let originalName: String; let isNoOp: Bool }
+        let pairs: [Pair] = rows.map { r in
+            let to = r.url.deletingLastPathComponent().appendingPathComponent(r.newName)
+            return Pair(id: r.id, from: r.url, to: to,
+                        originalName: r.originalName, isNoOp: r.newName == r.originalName)
+        }
+        let total = pairs.count
+        let settingsSnapshot = settings
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            // Results collected on the worker; published to main when done.
+            struct ApplyResult {
+                var appliedByID: [UUID: URL] = [:]      // id → final URL
+                var donePairs: [(from: URL, to: URL)] = [] // for rollback
+                var perFileErrors: [String] = []
+                var failedMid: Bool = false
             }
-            let from = row.url
-            let to = from.deletingLastPathComponent().appendingPathComponent(row.newName)
-            do {
-                try moveItemSafely(from: from, to: to)
-                doneSoFar.append((row, from, to))
-                row.appliedURL = to
-            } catch {
-                // red-team #1 (mid-batch failure): rollback in reverse, then
-                // surface BOTH the trigger error and any rollback failures.
-                let failedAt = row.originalName
-                perFileErrors.append("\(failedAt): \(error.localizedDescription)")
-                let rollbackFailures = rollback(doneSoFar)
-                for r in rows { r.appliedURL = nil }
-                isApplying = false
-                var msg = "Apply failed at \"\(failedAt)\"; rolled back \(doneSoFar.count - rollbackFailures.count) of \(doneSoFar.count) prior renames. \(error.localizedDescription)"
-                if !rollbackFailures.isEmpty {
-                    msg += " · Undo incomplete — these files were not restored: \(rollbackFailures.joined(separator: ", "))"
+            var result = ApplyResult()
+
+            for (i, pair) in pairs.enumerated() {
+                if pair.isNoOp {
+                    result.appliedByID[pair.id] = pair.from
+                    continue
                 }
-                globalError = msg
-                return
+                do {
+                    try Self.moveItemSafelyStatic(from: pair.from, to: pair.to)
+                    result.donePairs.append((pair.from, pair.to))
+                    result.appliedByID[pair.id] = pair.to
+                    // Publish incremental progress so the UI doesn't appear frozen.
+                    let prog = "Renamed \(i + 1) of \(total)…"
+                    await MainActor.run { [weak self] in self?.globalError = nil; _ = prog }
+                } catch {
+                    let failedAt = pair.originalName
+                    result.perFileErrors.append("\(failedAt): \(error.localizedDescription)")
+                    // Rollback in reverse off-main.
+                    var rollbackFailures: [String] = []
+                    for entry in result.donePairs.reversed() {
+                        do {
+                            try Self.moveItemSafelyStatic(from: entry.to, to: entry.from)
+                        } catch let rbErr {
+                            rollbackFailures.append("\(entry.to.lastPathComponent)→\(entry.from.lastPathComponent) (\(rbErr.localizedDescription))")
+                        }
+                    }
+                    var msg = "Apply failed at \"\(failedAt)\"; rolled back \(result.donePairs.count - rollbackFailures.count) of \(result.donePairs.count) prior renames. \(error.localizedDescription)"
+                    if !rollbackFailures.isEmpty {
+                        msg += " · Undo incomplete — not restored: \(rollbackFailures.joined(separator: ", "))"
+                    }
+                    await MainActor.run { [weak self] in
+                        guard let self else { return }
+                        for r in self.rows { r.appliedURL = nil }
+                        self.isApplying = false
+                        self.globalError = msg
+                    }
+                    result.failedMid = true
+                    return
+                }
             }
-        }
 
-        // Success: build the undo stack and reset per-row state. Replace each
-        // row's url with the new path so further edits target the new name.
-        var undo: [RenameUndoPair] = []
-        for row in rows {
-            guard let applied = row.appliedURL else { continue }
-            if applied.path != row.url.path {
-                undo.append(RenameUndoPair(original: row.url, applied: applied))
+            // Success path: publish final state to main.
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                var undo: [RenameUndoPair] = []
+                for row in self.rows {
+                    guard let applied = result.appliedByID[row.id] else { continue }
+                    row.appliedURL = applied
+                    if applied.path != row.url.path {
+                        undo.append(RenameUndoPair(original: row.url, applied: applied))
+                    }
+                }
+                // Rebuild rows to point at their new on-disk paths.
+                self.rows = self.rows.map { r in
+                    RenameRow(url: result.appliedByID[r.id] ?? r.url)
+                }
+                self.lastUndo = undo
+                self.isApplying = false
+                // Trigger recompute with same settings so preview shows clean state.
+                self.settings = settingsSnapshot
+                if !result.perFileErrors.isEmpty {
+                    self.globalError = "Partial: " + result.perFileErrors.joined(separator: " · ")
+                }
             }
         }
-        // Rebuild rows pointing at their new on-disk paths so re-running the
-        // pipeline against the (now-renamed) list is well-defined.
-        let oldSettings = settings
-        let newRows: [RenameRow] = rows.map { r in
-            let target = r.appliedURL ?? r.url
-            return RenameRow(url: target)
+    }
+
+    /// Static version of moveItemSafely for use from Task.detached where `self`
+    /// is not available as @MainActor. Logic is identical to the instance method.
+    /// `nonisolated` because the enclosing type is @MainActor but this method
+    /// touches only FileManager (thread-safe) — must be callable from worker tasks.
+    nonisolated private static func moveItemSafelyStatic(from: URL, to: URL) throws {
+        let fm = FileManager.default
+        let sameInode: Bool = {
+            guard fm.fileExists(atPath: to.path) else { return false }
+            let keys: Set<URLResourceKey> = [.fileResourceIdentifierKey]
+            guard let a = try? from.resourceValues(forKeys: keys).fileResourceIdentifier,
+                  let b = try? to.resourceValues(forKeys: keys).fileResourceIdentifier
+            else { return false }
+            return (a as AnyObject).isEqual(b as AnyObject)
+        }()
+        if sameInode && from.path != to.path {
+            let dir = from.deletingLastPathComponent()
+            let stem = (to.lastPathComponent as NSString).deletingPathExtension
+            let ext  = (to.lastPathComponent as NSString).pathExtension
+            let dotted = ext.isEmpty ? "" : ".\(ext)"
+            let tempName = "\(stem).tmp.\(UUID().uuidString.prefix(8))\(dotted)"
+            let temp = dir.appendingPathComponent(tempName)
+            try fm.moveItem(at: from, to: temp)
+            do {
+                try fm.moveItem(at: temp, to: to)
+            } catch {
+                try? fm.moveItem(at: temp, to: from)
+                throw error
+            }
+            return
         }
-        rows = newRows
-        lastUndo = undo
-        isApplying = false
-        // Re-run the preview against the new file list with the same settings,
-        // so the user sees a clean state.
-        settings = oldSettings
-        if !perFileErrors.isEmpty {
-            globalError = "Partial: " + perFileErrors.joined(separator: " · ")
-        }
+        try fm.moveItem(at: from, to: to)
     }
 
     /// Returns the list of basenames that *failed* to roll back, so the caller
@@ -979,7 +1124,15 @@ public struct RenameView: View {
             Button("Rename", role: .destructive) { vm.apply() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This will rename the files on disk. The operation can be undone via the Undo toolbar button.")
+            // P1 FIX: summarize (n no-ops, n warnings, n will-rename) in the
+            // confirm dialog so the user knows exactly what will happen.
+            let s = vm.applyDialogSummary
+            let parts: [String] = [
+                s.willRename > 0 ? "\(s.willRename) will be renamed" : nil,
+                s.warnings > 0   ? "\(s.warnings) warning\(s.warnings == 1 ? "" : "s")" : nil,
+                s.noOps > 0      ? "\(s.noOps) no-op\(s.noOps == 1 ? "" : "s")" : nil,
+            ].compactMap { $0 }
+            Text(parts.joined(separator: " · ") + ". This will rename files on disk. Undoable via the toolbar button.")
         }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
@@ -1019,7 +1172,7 @@ public struct RenameView: View {
                 HStack(spacing: 8) {
                     Image(systemName: "textformat.abc.dottedunderline")
                         .foregroundStyle(.tint)
-                    Text("Rename mode").font(.headline)
+                    Text("Rename mode").headerText()
                 }
                 Picker("", selection: $vm.settings.mode) {
                     ForEach(RenameMode.allCases) { m in
@@ -1040,7 +1193,7 @@ public struct RenameView: View {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     Image(systemName: "slider.horizontal.3").foregroundStyle(.secondary)
-                    Text(vm.settings.mode.rawValue).font(.headline)
+                    Text(vm.settings.mode.rawValue).headerText()
                 }
                 switch vm.settings.mode {
                 case .findReplace: findReplaceControls
@@ -1131,7 +1284,7 @@ public struct RenameView: View {
                         .font(.system(size: 38, weight: .light))
                         .foregroundStyle(dropTargeted ? AnyShapeStyle(Color.accentColor)
                                                      : AnyShapeStyle(HierarchicalShapeStyle.tertiary))
-                    Text("No files added yet").font(.headline)
+                    Text("No files added yet").headerText()
                     Text("Drop files here, or pick them from Finder. Mass rename with find/replace, regex, sequence, date, EXIF, or case — applied atomically and fully undoable.")
                         .font(.callout).foregroundStyle(.secondary)
                         .frame(maxWidth: 440)
@@ -1173,7 +1326,7 @@ public struct RenameView: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Image(systemName: "list.bullet.rectangle").foregroundStyle(.secondary)
-                    Text("Preview").font(.headline)
+                    Text("Preview").headerText()
                     Spacer()
                     Button { pickFiles() } label: {
                         Label("Add more…", systemImage: "plus")
@@ -1264,39 +1417,54 @@ private struct RenamePreviewRow: View {
         row.rowError?.lowercased().hasPrefix("warning:") == true
     }
 
+    /// P1 FIX: show the parent folder in the preview row so same-named files
+    /// from different directories are distinguishable at a glance.
+    private var parentFolderLabel: String {
+        row.url.deletingLastPathComponent().lastPathComponent
+    }
+
     var body: some View {
-        HStack(spacing: 8) {
-            Text(row.originalName)
-                .font(.system(.body, design: .monospaced))
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            Image(systemName: "arrow.right")
+        VStack(alignment: .leading, spacing: 1) {
+            // Parent folder label — dim, always visible so the row is unambiguous
+            // when multiple files share the same basename from different folders.
+            Text(parentFolderLabel)
+                .font(.caption2.monospaced())
                 .foregroundStyle(.tertiary)
-                .accessibilityHidden(true)
-            Text(row.newName.isEmpty ? "—" : row.newName)
-                .font(.system(.body, design: .monospaced))
-                .foregroundStyle(row.rowError == nil
-                                 ? Color.primary
-                                 : (isWarning ? Color.orange : Color.red))
                 .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            if let e = row.rowError {
-                Text(e)
-                    .font(.caption2)
-                    .foregroundStyle(isWarning ? Color.orange : Color.red)
+                .truncationMode(.head)
+            HStack(spacing: 8) {
+                Text(row.originalName)
+                    .font(.system(.body, design: .monospaced))
                     .lineLimit(1)
-            }
-            Button {
-                vm.remove(row)
-            } label: {
-                Image(systemName: "xmark.circle.fill")
+                    .truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Image(systemName: "arrow.right")
                     .foregroundStyle(.tertiary)
+                    .accessibilityHidden(true)
+                Text(row.newName.isEmpty ? "—" : row.newName)
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundStyle(row.rowError == nil
+                                     ? Color.primary
+                                     : (isWarning ? Color.orange : Color.red))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if let e = row.rowError {
+                    Text(e)
+                        .font(.caption2)
+                        .foregroundStyle(isWarning ? Color.orange : Color.red)
+                        .lineLimit(1)
+                }
+                Button {
+                    vm.remove(row)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                .disabled(vm.isApplying)
+                .help("Remove from list")
             }
-            .buttonStyle(.plain)
-            .disabled(vm.isApplying)
-            .help("Remove from list")
         }
         .padding(.vertical, 3)
     }
