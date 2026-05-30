@@ -1215,7 +1215,9 @@ public struct DiskSpeedView: View {
                                                  : "bolt.horizontal.circle.fill")
                         .foregroundStyle(vm.running ? AnyShapeStyle(.tint)
                                                     : AnyShapeStyle(.secondary))
-                    Text(vm.running ? "Running" : "Ready").headerText()
+                    // P1 a11y fix: live status label, not a section heading —
+                    // revert the sweep so the heading rotor isn't polluted.
+                    Text(vm.running ? "Running" : "Ready").font(.headline)
                     Spacer()
                     Text(vm.liveMessage)
                         .font(.caption).foregroundStyle(.secondary)

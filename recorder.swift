@@ -2107,7 +2107,11 @@ struct RecHUD: View {
                         }
                         .accessibilityLabel(engine.isPaused ? "Recording paused" : "Recording in progress")
                     Text(engine.isPaused ? "Paused" : "Recording")
-                        .headerText()
+                        // P1 a11y fix: sweep regression — this is a live
+                        // status string that mutates during recording, not
+                        // a structural section heading. .isHeader trait
+                        // pollutes the VoiceOver heading rotor.
+                        .font(.headline)
                         .monospacedDigit()
                     Spacer()
                     Text(timecode(engine.elapsed))

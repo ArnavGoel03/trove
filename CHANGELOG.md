@@ -14,6 +14,95 @@ will surface whatever's newest on the chosen channel.
 
 ---
 
+## [1.1.0-beta.8] — Unreleased
+
+### Added
+
+- **Pro-level customization surface — four new Settings cards** in
+  `customization_settings.swift`:
+  - **Accessibility** — single-click toggles for Reduce Motion, Reduce
+    Transparency, Increase Contrast respect; VoiceOver state-change
+    announcement opt-in; focus-ring style picker (Default / Bold accent
+    / Subtle border); inline catalogue of the 15 most useful chords with
+    keyboard navigation hints.
+  - **Density & layout** — Compact / Default / Comfortable picker driving
+    row spacing, card radius, padding via a single `TroveUIDensity` token;
+    sidebar-width slider (180–320 pt); toast-lifetime slider (1.5–12 s);
+    hover-reveal delay slider (0–600 ms); Compact list rows + double-click-
+    activation toggles.
+  - **Keyboard shortcuts** — comprehensive read-only catalogue grouped by
+    surface (App / File / Edit / View / Per-pane), 50+ chords surfaced —
+    no more "is there a shortcut for X" tab-hunting. Total-chord count
+    badge in the header.
+  - **Defaults** — per-pane default save folder picker for PDF / Image
+    Tools / Recorder / Snip / OCR / QR / Color, plus a default Snippets
+    sort + Calculator angle unit. Empty value falls back to per-session
+    last-used (existing behaviour) — these defaults are upstream of the
+    pane's own last-used persistence.
+
+### Fixed
+
+- **P0 PDF previews — duplicate `.task(id: url)` on
+  `PDFOpsCompressPreview`.** Two separate `.task(id: url)` modifiers raced;
+  the second's `scheduleProbe()` always read `renderer == nil` and silently
+  no-opped because the first hadn't yet committed `renderer = r`. Merged
+  into a single ordered task that builds the renderer → publishes
+  pageCount → schedules the first probe.
+- **P1 Compress preview cross-file contamination.** `scheduleProbe()`
+  previously captured `pageCount` BEFORE the 180 ms debounce sleep, so a
+  source-switch during the debounce multiplied per-page bytes by the OLD
+  doc's page count. Now captures the renderer ref before the sleep and
+  re-reads pageCount AFTER the await on MainActor.
+- **P0 QuickLook — responder-chain bypass.** `TroveQuickLook` hard-wired
+  `panel.dataSource = self` / `panel.delegate = self` directly and never
+  cleared `urls` — the singleton retained whatever URL was last previewed
+  across the entire app session, particularly bad for Stage temp PNGs.
+  Hooks `NSWindow.willCloseNotification` on the QL panel and releases
+  URLs + nils data source/delegate on close. Also drops the synchronous
+  `fileExists` pre-filter (QL renders a clean "file not found" placeholder
+  for missing URLs — the previous silent guard-return was a UX bug).
+- **P0 PDF "Continue with…" — three latent corruption paths.**
+  `ingestPDFReopenPayload` now (a) validates the op key explicitly and
+  surfaces a `kind: .error` toast on unknown keys instead of silently
+  falling back to `.merge`; (b) calls `m.cancel()` if a job is in flight
+  before `m.clear()`, preventing a mid-pipeline source-wipe-under-worker;
+  (c) flashes a heads-up when there are unsaved outputs (still findable in
+  Library + recents) instead of silently dropping them; (d) checks
+  `fileExists` on the URL before clearing prior state, so a swept temp
+  file doesn't wipe state for nothing.
+- **P1 PDF "Continue with…" — missing `Unlock` entry.** The submenu had
+  11 op routes but `unlock` was absent — a user who just Protected a PDF
+  had no one-click path to reverse it. Added.
+- **P0 Menu bar — `⌘⇧N` registered twice.** Both Edit > Capture
+  Screenshot and Tools > Capture > Screenshot to Stage bound `⌘⇧N`,
+  making the responder chain pick non-deterministically. Dropped the
+  Tools shortcut; Edit owns the chord.
+- **P0 Menu bar — `⌘.` triple-collision.** "Release Assertion" in Keep
+  Awake clashed with the Recorder's stop-recording shortcut AND the
+  universal macOS Cancel chord; releasing the assertion mid-recording was
+  an unrecoverable surprise. Removed the menu shortcut; the action stays
+  one click away in the pane.
+- **P0 A11y sweep regression — Welcome CTA marked as a heading.** The
+  `.headerText()` coherence sweep accidentally branded "Start using Trove"
+  with `.isHeader`, polluting VoiceOver's heading rotor with a button label.
+  Reverted to literal `.font(.headline)`.
+- **P1 A11y sweep regression — live status strings marked as headings.**
+  Recorder "Paused / Recording" and Disk Speed "Running / Ready" are
+  mutating runtime state, not section landmarks. The heading rotor jumped
+  to them and announced different values seconds later, which is
+  disorienting. Both reverted to `.font(.headline)`.
+- **P2 A11y sweep miss — `theming.swift:319` had the manual inline
+  `.font(.headline).accessibilityAddTraits(.isHeader)` pattern** that the
+  regex didn't catch (trailing trait broke the modifier-chain match).
+  Collapsed to `.headerText()` for consistency.
+
+### Verified
+
+`lint-trove`: clean. `swiftc -DTROVE_TESTING -parse-as-library`: clean.
+`test-trove`: 233/233 PASS.
+
+---
+
 ## [1.1.0-beta.7] — Unreleased
 
 ### Added

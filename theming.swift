@@ -316,7 +316,11 @@ struct ThemeSettingsCard: View {
     @ObservedObject private var store = TroveThemeStore.shared
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Theme").font(.headline).accessibilityAddTraits(.isHeader)
+            // Sweep miss: had .font(.headline).accessibilityAddTraits(.isHeader)
+            // inline — the regex didn't match because of the trailing trait.
+            // Collapsed to .headerText() for consistency with the rest of the
+            // codebase's section titles.
+            Text("Theme").headerText()
             Text("Trove keeps its own theme so the app looks the same regardless of macOS Light / Dark mode. Pick one — or build your own.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             ThemePickerGrid(compact: false)

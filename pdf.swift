@@ -2253,7 +2253,38 @@ public struct PDFToolsView: View {
         guard let info,
               let url = info["url"] as? URL else { return }
         let opStr = info["op"] as? String
-        let op = PDFOpKind(rawValue: opStr ?? "") ?? .merge
+        // P0 fix: previously unknown op keys silently fell back to .merge.
+        // Now we validate explicitly + surface an error toast so a refactor
+        // typo in the key string is visible instead of mysteriously merging.
+        guard let op = PDFOpKind(rawValue: opStr ?? "") else {
+            SharedStore.stage.flash("Unknown PDF op \"\(opStr ?? "?")\" — open ignored",
+                                    kind: .error)
+            return
+        }
+        // P0 fix: if a job is in flight, cancel cleanly before swapping
+        // sources. Previously `m.clear()` wiped sources out from under the
+        // already-running detached worker — `m.working` stayed `true` and
+        // the user was locked out until the worker finished writing outputs
+        // referring to deleted sources.
+        if m.working {
+            m.cancel()
+        }
+        // P1 fix: if there are unsaved outputs from the prior op, surface
+        // them via the stage flash so the user knows they're about to lose
+        // the in-memory list. Outputs themselves still exist on disk (under
+        // the per-op temp dir) and are findable via Library + PDFOpsRecents.
+        if !m.outputs.isEmpty {
+            let n = m.outputs.count
+            SharedStore.stage.flash("Continuing with \(url.lastPathComponent) — prior \(n) output\(n == 1 ? "" : "s") still in Library",
+                                    kind: .info)
+        }
+        // P2 fix: check the URL exists before clearing state — a swept temp
+        // file would otherwise wipe the current sources for nothing.
+        if !FileManager.default.fileExists(atPath: url.path) {
+            SharedStore.stage.flash("Output file no longer exists — it may have been moved or deleted",
+                                    kind: .error)
+            return
+        }
         m.clear()
         m.addPDFFiles([url])
         currentOp = op
@@ -3049,6 +3080,7 @@ struct PDFOpsDetailView: View {
                     pdfContinueButton(url: o.url, label: "Watermark",               op: "watermark",   icon: "drop.halffull")
                     pdfContinueButton(url: o.url, label: "Crop",                    op: "crop",        icon: "crop")
                     pdfContinueButton(url: o.url, label: "Password-protect",        op: "protect",     icon: "lock")
+                    pdfContinueButton(url: o.url, label: "Remove password",         op: "unlock",      icon: "lock.open")
                     pdfContinueButton(url: o.url, label: "OCR text layer",          op: "ocr",         icon: "doc.text.viewfinder")
                     pdfContinueButton(url: o.url, label: "Re-save via PDFKit",      op: "repair",      icon: "bandage")
                 } label: {
@@ -3781,13 +3813,22 @@ fileprivate struct PDFOpsCompressPreview: View {
             }
         }
         .task(id: url) {
+            // P0 fix: previously two separate `.task(id: url)` modifiers raced
+            // — the second probe always read `renderer = nil` and silently
+            // no-opped because the first hadn't yet awaited `r.count()`.
+            // Merged into one ordered sequence: build renderer → set state →
+            // await count → publish page count → schedule the first probe.
             let r = PDFOpsThumbRenderer(url: url)
             renderer = r
             let n = await r.count()
-            await MainActor.run { pageCount = n }
+            await MainActor.run {
+                pageCount = n
+                projectedBytes = 0
+                pageImage = nil
+            }
+            scheduleProbe()
         }
         .onChange(of: quality) { _ in scheduleProbe() }
-        .task(id: url) { scheduleProbe() }
     }
 
     /// Debounce the JPEG re-encode so the slider isn't I/O-bound. Cancels the
@@ -3795,21 +3836,29 @@ fileprivate struct PDFOpsCompressPreview: View {
     private func scheduleProbe() {
         probeTask?.cancel()
         let q = self.quality
-        let pageURL = self.url
-        let pageNum = self.pageCount
+        // P1 fix: previously captured `pageCount` BEFORE the 180ms sleep, so
+        // a URL switch during the debounce window multiplied per-page bytes
+        // by the OLD doc's page count. Now we capture the renderer ref
+        // (which uniquely belongs to the current url-task) before the sleep
+        // and re-read pageCount AFTER the await on MainActor so the estimate
+        // is always for the live document, not the previous one.
+        let probeRenderer = self.renderer
         probeTask = Task {
             try? await Task.sleep(nanoseconds: 180_000_000) // 180ms debounce
             if Task.isCancelled { return }
-            // Render page 1 at the target raster scale (matches the compress op).
-            guard let r = renderer else { return }
+            guard let r = probeRenderer else { return }
             guard let img = await r.thumbnail(at: 0, target: 320) else { return }
-            // Re-encode to JPEG at quality and measure.
             let bytes = Self.encodedJPEGBytes(img: img, quality: q)
             await MainActor.run {
+                if Task.isCancelled { return }
                 self.pageImage = img
                 let per = Int64(bytes)
-                self.projectedBytes = per * Int64(max(pageNum, 1))
-                _ = pageURL  // silence unused warning
+                // P1 fix: scale the per-page projection by the live pageCount
+                // (a thumbnail-encoded byte count is a rough lower-bound for
+                // the actual 150-DPI compress output, but the slope of the
+                // quality slider is what users tune by — they see the
+                // relative direction even if the absolute number is rough).
+                self.projectedBytes = per * Int64(max(self.pageCount, 1))
             }
         }
     }

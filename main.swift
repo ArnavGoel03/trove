@@ -232,8 +232,11 @@ struct TroveApp: App {
                     Button("Clear Stage")         { confirmClearStageViaAlert(SharedStore.stage) }
                 }
                 Menu("Capture") {
+                    // P0 fix: ⌘⇧N is already bound in Edit (Stage cluster);
+                    // duplicating it here made the SwiftUI responder chain
+                    // pick non-deterministically. Keep the visible menu item
+                    // but drop the shortcut binding so only Edit owns ⌘⇧N.
                     Button("Screenshot to Stage") { SharedStore.stage.captureScreenshot() }
-                        .keyboardShortcut("n", modifiers: [.command, .shift])
                     Button("Region to OCR…") {
                         switchToPane(.ocr)
                         NotificationCenter.default.post(name: .troveCaptureRegionToOCR, object: nil)
@@ -300,10 +303,16 @@ struct TroveApp: App {
                         KeepAwakeCoordinator.shared.quickCaffeinate(nil)
                     }
                     Divider()
+                    // P0 fix: ⌘. clashed with three different things — the
+                    // Recorder's stop-recording shortcut, the universal
+                    // macOS Cancel chord, and a per-pane cancel binding.
+                    // Releasing the Keep Awake assertion mid-recording would
+                    // have been an unrecoverable surprise. Removed the
+                    // shortcut entirely; this is a rarely-pressed safety
+                    // valve that lives one click away in the pane itself.
                     Button("Release Assertion") {
                         KeepAwakeCoordinator.shared.toggleMaster(false)
                     }
-                    .keyboardShortcut(".", modifiers: .command)
                     Button("Open Keep Awake Pane") { switchToPane(.keepAwake) }
                 }
                 Divider()
@@ -2033,6 +2042,19 @@ struct CustomizeView: View {
                 // Custom. App keeps its theme regardless of macOS Light/Dark.
                 ThemeSettingsCard()
 
+                // v1.1.0-beta.8 — pro-level customization surface. Four
+                // new cards covering accessibility posture, UI density,
+                // a comprehensive shortcut catalogue, and per-pane default
+                // save folders. Each is self-contained in
+                // customization_settings.swift.
+                UIDensitySettingsCard()
+
+                AccessibilitySettingsCard()
+
+                KeyboardShortcutsSettingsCard()
+
+                DefaultsSettingsCard()
+
                 // Stage compression card — auto-shrink oversized PNG/JPEG drops to
                 // WebP/HEIC silently with an undo toast. Cuts Clop ($14).
                 // P1 fix: wrapped in Card{} — was raw white.opacity which looked off.
@@ -3200,7 +3222,11 @@ struct WelcomeSheet: View {
                 dismiss()
             } label: {
                 Text("Start using Trove")
-                    .headerText()
+                    // P0 a11y fix: the headerText() coherence sweep
+                    // accidentally marked this CTA as `.isHeader`, polluting
+                    // VoiceOver's heading rotor with a button label. Revert
+                    // to the literal .font(.headline) for the visual weight.
+                    .font(.headline)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 10)
             }
@@ -3451,29 +3477,65 @@ final class TroveQuickLook: NSObject, QLPreviewPanelDataSource, QLPreviewPanelDe
     static let shared = TroveQuickLook()
     private var urls: [URL] = []
     private var selected: Int = 0
+    // P0 fix: observer token for the panel's close notification. Without this
+    // there's no signal to clear `urls`, so the singleton retained whatever
+    // URL was last previewed across the whole app session — particularly bad
+    // for Stage temp PNGs whose paths shouldn't outlive the panel.
+    private var closeObserver: NSObjectProtocol?
 
-    /// Show a single URL. Most call sites use this — the menu entry is
-    /// "Quick Look" on a single staged/library/history item.
+    /// Show a single URL.
     func show(_ url: URL) {
         show([url], start: 0)
     }
 
-    /// Show multiple URLs (arrow-key navigation between them, the standard
-    /// macOS QuickLook spacebar-strip flow). Reserved for future multi-select
-    /// adoption in Stage / Library.
+    /// Show multiple URLs. Reserved for future multi-select.
     func show(_ urls: [URL], start: Int = 0) {
-        // Filter to existent paths so the panel never opens onto a dead URL.
-        let fm = FileManager.default
-        let live = urls.filter { fm.fileExists(atPath: $0.path) }
-        guard !live.isEmpty else { return }
-        self.urls = live
-        self.selected = max(0, min(start, live.count - 1))
+        // For single-URL invocations (the common case) we don't pre-filter on
+        // fileExists — QLPreviewPanel handles "file not found" with a clean
+        // built-in placeholder, and the silent guard-return that filtering
+        // produced was the audit's "silent no-op on dead URL" UX bug.
+        // For genuinely empty input arrays we still bail.
+        guard !urls.isEmpty else { return }
+        self.urls = urls
+        self.selected = max(0, min(start, urls.count - 1))
         guard let panel = QLPreviewPanel.shared() else { return }
+        // If the panel is already visible, replace data in place rather than
+        // re-presenting. Stops a fast double-invocation from racing the
+        // present animation against a reloadData call.
+        if !panel.isVisible {
+            panel.makeKeyAndOrderFront(nil)
+        }
         panel.dataSource = self
         panel.delegate = self
-        panel.makeKeyAndOrderFront(nil)
         panel.reloadData()
         panel.currentPreviewItemIndex = self.selected
+        // P0 fix: hook willClose so we can drop URL references when the user
+        // dismisses the panel. Notification name on macOS is the standard
+        // `NSWindow.willCloseNotification`; QLPreviewPanel is an NSWindow.
+        if closeObserver == nil {
+            closeObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification,
+                object: panel,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in self?.handlePanelClose() }
+            }
+        }
+    }
+
+    /// Called when the panel closes. Releases URLs + unwires the panel so the
+    /// singleton holds no references between sessions.
+    private func handlePanelClose() {
+        urls.removeAll()
+        selected = 0
+        if let panel = QLPreviewPanel.shared() {
+            if panel.dataSource === self { panel.dataSource = nil }
+            if panel.delegate === self   { panel.delegate   = nil }
+        }
+    }
+
+    deinit {
+        if let obs = closeObserver { NotificationCenter.default.removeObserver(obs) }
     }
 
     // MARK: QLPreviewPanelDataSource
@@ -3481,7 +3543,8 @@ final class TroveQuickLook: NSObject, QLPreviewPanelDataSource, QLPreviewPanelDe
     func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int { urls.count }
 
     func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
-        urls[index] as NSURL
+        guard index >= 0, index < urls.count else { return URL(fileURLWithPath: "/") as NSURL }
+        return urls[index] as NSURL
     }
 }
 
