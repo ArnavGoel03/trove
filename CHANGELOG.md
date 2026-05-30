@@ -14,6 +14,58 @@ will surface whatever's newest on the chosen channel.
 
 ---
 
+## [1.1.0-beta.12] — Unreleased
+
+### Added
+
+- **Snippet + Clipboard History entity intents** — 8 more AppIntents on
+  top of beta.11's foundation, all entity-based so the Shortcuts editor
+  renders rich pickers with name + body preview on snippets and preview
+  + kind + date on clipboard entries:
+  - **Snippet entity surface** (`SnippetEntity`, `SnippetEntityQuery`
+    with `EntityStringQuery` for live filter; `SnippetIndex` is the
+    read-only JSON snapshot loader so AppIntents — which run out-of-
+    process in Shortcuts' extension host — can query without touching
+    the per-view `@StateObject` `SnippetStore`).
+  - `GetSnippetIntent` — picker-driven, returns body.
+  - `GetSnippetByNameIntent` — string lookup, falls through
+    exact-match → prefix-match → substring-match before throwing
+    `TroveIntentError.snippetNotFound(name)`.
+  - `ListSnippetsIntent` — returns `[String]` of snippet names so a
+    Shortcut can pipe them into a Choose-from-Menu step.
+  - `CountSnippetsIntent` — returns `Int`.
+  - **Clipboard history entity surface**
+    (`ClipboardEntryEntity` + `ClipboardEntryEntityQuery`;
+    `ClipboardIndex.Entry` mirrors the on-disk shape since
+    `ClipEntryCodable` is `fileprivate` in `history.swift`).
+  - `GetClipboardHistoryAtIntent` — index-based access; throws if the
+    entry isn't text.
+  - `GetRecentClipboardTextIntent` — N-th most recent TEXT entry,
+    silently skips image/file captures.
+  - `CountClipboardHistoryIntent` — returns total entry count.
+  - `PickClipboardEntryIntent` — full picker, returns text body.
+- `TroveIntentError` extended with friendly
+  `CustomLocalizedStringResourceConvertible` messages so Shortcuts
+  surfaces real diagnostics ("No Trove snippet named 'X' — try the
+  picker variant of this intent") instead of generic boilerplate.
+
+### Notes
+
+- Total intent count now stands at **19** (11 base + 8 entity), with 5
+  default voice / Spotlight phrases. The Snippets and Clipboard entity
+  pickers are the surface power users will reach for in their custom
+  Shortcuts.
+- The two index types (`SnippetIndex`, `ClipboardIndex`) are
+  intentionally read-only — they're cheap, atomic JSON loads that work
+  even when Trove isn't running. Mutation intents would need a separate
+  XPC channel or URL-scheme dispatch (see strategic backlog).
+
+### Verified
+
+`lint-trove`: clean. `test-trove`: 233/233 PASS.
+
+---
+
 ## [1.1.0-beta.11] — Unreleased
 
 ### Added
