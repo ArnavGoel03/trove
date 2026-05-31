@@ -1568,6 +1568,8 @@ final class ProfileSync: ObservableObject {
         "keepAwake.ruleScheduleOn",
         "keepAwake.ruleScheduleStart",
         "keepAwake.ruleScheduleEnd",
+        // Mirror (menu-bar opt-in)
+        "mirror.showInMenuBar",
         // Recorder
         "rec.systemAudioOn",
         "rec.microphoneOn",

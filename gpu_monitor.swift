@@ -705,18 +705,23 @@ final class GPUMonitorModel: ObservableObject {
     private let bufferCap = 60
     private var timer: Timer?
     private var thermalObserver: NSObjectProtocol?
+    // appResignObserver / appActiveObserver removed: auto-pausing on app-switch
+    // defeats stress-testing workflows. Users can pause manually via the toolbar.
     private var statusItem: NSStatusItem?
     private let powerQueue = DispatchQueue(label: "trove.gpu.power")
+    // Dedicated background queue for IORegistry / SMC sampling so tick() never
+    // stalls the main thread (IORegistry traversal + SMC calls: 10–30 ms each).
+    private let probeQueue = DispatchQueue(label: "trove.gpu.probe", qos: .utility)
     // Fix 16: pmsetTick removed — IOPSCopyPowerSourcesInfo is cheap enough to call every tick.
 
     init() {
-        // red-team: read the persisted toggle BEFORE the property is observed,
-        // otherwise the `didSet` would fire during init and try to start HID
-        // before the rest of the model is ready. Direct UD read sidesteps that.
-        self.experimentalSensors = UserDefaults.standard.bool(forKey: Self.kExperimentalKey)
-        // Same pattern for the unit toggle — its didSet only writes back to UD,
-        // which is idempotent, but the spurious write at init is still noise.
-        self.temperatureFahrenheit = UserDefaults.standard.bool(forKey: Self.kFahrenheitKey)
+        // Read persisted toggles with a single read BEFORE assignment so the
+        // `didSet` observers don't fire during init (they'd try to start/stop
+        // HID before the model is fully initialised).
+        let savedSensors = UserDefaults.standard.bool(forKey: Self.kExperimentalKey)
+        let savedFahr    = UserDefaults.standard.bool(forKey: Self.kFahrenheitKey)
+        self.experimentalSensors   = savedSensors
+        self.temperatureFahrenheit = savedFahr
         thermalObserver = NotificationCenter.default.addObserver(
             forName: ProcessInfo.thermalStateDidChangeNotification,
             object: nil, queue: .main) { [weak self] _ in
@@ -861,45 +866,69 @@ final class GPUMonitorModel: ObservableObject {
     }
 
     func tick() {
-        // GPU probe + thermal are cheap. Fix 16: IOPSCopyPowerSourcesInfo is
-        // pure IPC (no fork), so power can be read every tick without throttling.
-        let probed = GPUProbe.snapshot()
-        let rpms: [Int]? = GPUSMC.fanRPMs()
-        // Power read is cheap now — call directly on background queue.
-        powerQueue.async { [weak self] in
-            let r = GPUPower.read()
-            Task { @MainActor [weak self] in self?.power = r }
-        }
+        // Reentry guard: if the previous tick's detached probe is still running
+        // (possible at 1 s interval on a slow IORegistry), skip this tick
+        // rather than piling up concurrent IOKit calls.
+        guard !probing else { return }
+        probing = true
 
-        self.gpus = probed
-        self.fanRPMs = rpms
-        self.thermal = ProcessInfo.processInfo.thermalState
+        // Snapshot main-actor state we need on the probe queue.
+        let wantSensors = experimentalSensors
+        // Capture `hid` as a local so the probeQueue closure doesn't cross
+        // the @MainActor isolation boundary when calling sampleAsync.
+        let hidRef = hid
 
-        // Experimental HID sensors — fire-and-forget; result lands on main.
-        if experimentalSensors {
-            hid.sampleAsync { [weak self] readings in
+        // Move IORegistry + SMC off the main thread. GPUProbe.snapshot() and
+        // GPUSMC.fanRPMs() each take 10–30 ms; running them on the main actor
+        // causes visible UI hitches every second.
+        probeQueue.async { [weak self] in
+            guard let self = self else { return }
+            let probed = GPUProbe.snapshot()
+            let rpms: [Int]? = GPUSMC.fanRPMs()
+            let power = GPUPower.read()
+            let thermal = ProcessInfo.processInfo.thermalState
+
+            Task { @MainActor [weak self] in
                 guard let self = self else { return }
-                self.sensorLatest = readings
-                self.appendHistoryTick(readings)
+                self.probing = false
+                self.gpus = probed
+                self.fanRPMs = rpms
+                self.power = power
+                self.thermal = thermal
+                self.refreshAlertIcon()
+
+                var perGPU: [UInt64: (activity: Double, mem: Int64)] = [:]
+                for g in probed {
+                    perGPU[g.id] = (g.gpuActivity ?? 0, g.inUseSystemMemory ?? 0)
+                }
+                let sample = GPUSample(
+                    t: Date(),
+                    perGPU: perGPU,
+                    thermal: thermal,
+                    fanRPMs: rpms,
+                    acWatts: power.acWatts,
+                    batteryPercent: power.batteryPercent,
+                    onAC: power.onAC
+                )
+                self.samples.append(sample)
+                if self.samples.count > self.bufferCap {
+                    self.samples.removeFirst(self.samples.count - self.bufferCap)
+                }
+            }
+
+            // Experimental HID sensors — fire-and-forget; result lands on main.
+            if wantSensors {
+                hidRef.sampleAsync { [weak self] readings in
+                    guard let self = self else { return }
+                    self.sensorLatest = readings
+                    self.appendHistoryTick(readings)
+                }
             }
         }
-
-        var perGPU: [UInt64: (activity: Double, mem: Int64)] = [:]
-        for g in probed {
-            perGPU[g.id] = (g.gpuActivity ?? 0, g.inUseSystemMemory ?? 0)
-        }
-        let sample = GPUSample(
-            t: Date(),
-            perGPU: perGPU,
-            thermal: thermal,
-            fanRPMs: rpms,
-            acWatts: power.acWatts,
-            batteryPercent: power.batteryPercent,
-            onAC: power.onAC
-        )
-        samples.append(sample)
-        if samples.count > bufferCap { samples.removeFirst(samples.count - bufferCap) }
     }
+
+    // Prevents concurrent IORegistry/SMC calls from the tick loop.
+    private var probing: Bool = false
 
     // ---- pin window ---------------------------------------------------------
 
@@ -1202,6 +1231,18 @@ struct GPUDeviceCard: View {
         guard let used = gpu.inUseSystemMemory, gpu.totalVRAM > 0 else { return nil }
         return Double(used) / Double(gpu.totalVRAM) * 100.0
     }
+    /// True when Device / Renderer / Activity report the same value (or
+    /// some are nil and the present ones agree). Apple Silicon falls into
+    /// this case constantly because all three IOKit keys point at the same
+    /// unified GPU-busy counter. We then render one row instead of three
+    /// identical ones.
+    var rowsAgree: Bool {
+        let vals = [gpu.deviceUtilization, gpu.rendererUtilization, gpu.gpuActivity]
+            .compactMap { $0 }
+        guard let first = vals.first else { return true }   // all-nil → one row's enough
+        // Treat values within 0.1 percentage points as "the same".
+        return vals.allSatisfy { abs($0 - first) < 0.1 }
+    }
 
     var body: some View {
         Card {
@@ -1228,18 +1269,33 @@ struct GPUDeviceCard: View {
                                      tint: .blue)
                     }
                 } else {
-                    GPUMetricRow(label: "Device Utilization",
-                                 value: gpu.deviceUtilization.map { String(format: "%.1f%%", $0) } ?? "—",
-                                 series: history.compactMap { $0.perGPU[gpu.id]?.activity },
-                                 tint: .accentColor, maxValue: 100)
-                    GPUMetricRow(label: "Renderer Utilization",
-                                 value: gpu.rendererUtilization.map { String(format: "%.1f%%", $0) } ?? "—",
-                                 series: activitySeries,
-                                 tint: .purple, maxValue: 100)
-                    GPUMetricRow(label: "GPU Activity",
-                                 value: gpu.gpuActivity.map { String(format: "%.1f%%", $0) } ?? "—",
-                                 series: activitySeries,
-                                 tint: .pink, maxValue: 100)
+                    // On Apple Silicon, IOKit exposes a single unified
+                    // GPU-busy counter that all three legacy keys (Device
+                    // Utilization, Renderer Utilization, GPU Activity) fall
+                    // back to — printing the same number three times made
+                    // the panel look broken. We now collapse to one row
+                    // when they agree, and expand to per-counter rows only
+                    // when there's a genuine difference (discrete AMD/Intel
+                    // GPUs do expose all three separately).
+                    if rowsAgree {
+                        GPUMetricRow(label: "GPU Activity",
+                                     value: gpu.gpuActivity.map { String(format: "%.1f%%", $0) } ?? "—",
+                                     series: activitySeries,
+                                     tint: .pink, maxValue: 100)
+                    } else {
+                        GPUMetricRow(label: "Device Utilization",
+                                     value: gpu.deviceUtilization.map { String(format: "%.1f%%", $0) } ?? "—",
+                                     series: activitySeries,
+                                     tint: .accentColor, maxValue: 100)
+                        GPUMetricRow(label: "Renderer Utilization",
+                                     value: gpu.rendererUtilization.map { String(format: "%.1f%%", $0) } ?? "—",
+                                     series: activitySeries,
+                                     tint: .purple, maxValue: 100)
+                        GPUMetricRow(label: "GPU Activity",
+                                     value: gpu.gpuActivity.map { String(format: "%.1f%%", $0) } ?? "—",
+                                     series: activitySeries,
+                                     tint: .pink, maxValue: 100)
+                    }
                     Divider()
                     GPUMetricRow(label: "VRAM In Use",
                                  value: vramText(),
@@ -1369,17 +1425,38 @@ struct GPUSystemCard: View {
 
     // red-team: tri-state renderer for the fan-RPM cell so a failed SMC read
     // doesn't render as a misleading "0".
+    //
+    // Apple Silicon Air / Mini line is fanless — SMC has no fan service for
+    // it at all, which used to render as "—" (looks broken). When we know
+    // we're on Apple Silicon and SMC returned nothing, we now show "Passive"
+    // so users on a M-series Air don't think the monitor is failing.
     private func fanText(_ rpms: [Int]?) -> String {
-        guard let rpms = rpms else { return "—" }
-        if rpms.isEmpty { return "None" }
-        return rpms.map { "\($0)" }.joined(separator: "  /  ")
+        if let rpms = rpms {
+            if rpms.isEmpty { return "Passive" }
+            return rpms.map { "\($0)" }.joined(separator: "  /  ")
+        }
+        return Self.isAppleSilicon ? "Passive" : "—"
     }
     private func fanTooltip(_ rpms: [Int]?) -> String {
         guard let rpms = rpms else {
-            return "Fan RPM not exposed by SMC (common on Apple Silicon without root)."
+            return Self.isAppleSilicon
+                ? "No fan exposed — this Mac is fanless (passive cooling)."
+                : "Fan RPM not exposed by SMC (some Intel Macs only expose this to root processes)."
         }
         if rpms.isEmpty { return "This Mac reports zero fans (passive cooling)." }
         return "Per-fan RPM from SMC."
+    }
+
+    /// Compile-time flag. arm64 builds always run on Apple Silicon Macs,
+    /// where the fanless Air / Mini variants legitimately have no fan to
+    /// report. Resolved at compile time so the SystemCard doesn't need to
+    /// reach into IOKit to render this one cell.
+    private static var isAppleSilicon: Bool {
+        #if arch(arm64)
+        return true
+        #else
+        return false
+        #endif
     }
 }
 
@@ -1394,6 +1471,17 @@ struct GPUSystemCard: View {
 /// answers the actual question ("is the GPU hot?") in one glance.
 struct GPUTempCard: View {
     @ObservedObject var model: GPUMonitorModel
+
+    /// True when every present sensor reading is below 0.5 °C — Apple
+    /// Silicon under macOS 13+ blocks the IOHIDEventSystemClient values
+    /// (services match, but every tick returns exactly 0.0). Treat that
+    /// as "data isn't available" rather than rendering an honest-looking
+    /// "Battery 0.0 °C" row that suggests the laptop is at freezing.
+    private var allZero: Bool {
+        let vals = model.tempChartRows.compactMap { $0.currentC }
+        guard !vals.isEmpty else { return false }
+        return vals.allSatisfy { abs($0) < 0.5 }
+    }
 
     var body: some View {
         Card {
@@ -1419,6 +1507,20 @@ struct GPUTempCard: View {
                     // Briefly visible during the first tick after toggling on.
                     Text("Waiting for first sensor tick…")
                         .font(.caption).foregroundStyle(.secondary)
+                } else if allZero {
+                    // macOS 13+ on Apple Silicon: the IOHIDEventSystemClient
+                    // services match but their values are blocked by SEP —
+                    // every reading lands at exactly 0.0 °C. Showing that
+                    // ("Battery 0.0 °C, SoC 0.0 °C, …") makes the pane look
+                    // broken. Tell the truth instead.
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Sensors matched but every reading is 0.0 °C.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                        Text("Apple Silicon (M1+) blocks user-mode access to die temperatures in macOS 13+. Reliable numbers require `powermetrics` with sudo, or a kernel extension — both intentionally out of scope for Trove. Stats and iStat Menus paper over this with private entitlements; Trove won't.")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
                 } else {
                     ForEach(model.tempChartRows) { row in
                         GPUTempRow(row: row, model: model)
@@ -1542,6 +1644,8 @@ struct GPUMonitorToolbar: View {
             .help("Flash a red menubar icon when thermal state ≥ Serious.")
 
             Toggle(isOn: $model.experimentalSensors) {
+                // Beta label stays until we can guarantee non-zero readings
+                // on Apple Silicon (which we can't without private entitlements).
                 Label("Sensors β", systemImage: "thermometer.medium")
             }
             .toggleStyle(.button)
@@ -1628,7 +1732,7 @@ public struct GPUMonitorView: View {
         .overlay(alignment: .bottom) { toastView }
         .navigationTitle("GPU & Thermals")
         .onAppear { model.start(); if model.experimentalSensors { model.startHID() } }
-        .onDisappear { model.stop(); if model.experimentalSensors { model.stopHID() } }
+        .onDisappear { model.stop(); model.stopHID() }  // stopHID is idempotent
     }
 
     @ViewBuilder

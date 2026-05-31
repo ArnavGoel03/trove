@@ -122,6 +122,21 @@ final class MirrorViewModel: ObservableObject {
     // Fix #5: re-activation observer — re-checks permission after user visits System Settings.
     private var activationObserver: NSObjectProtocol?
 
+    // ---- Menu-bar surface (opt-in via Mirror pane toolbar) -----------------
+    //
+    // Same pattern as KeepAwakeCoordinator: opt-in NSStatusItem + popover
+    // hosting a live preview. Persisted across launches.
+
+    static let kShowInMenuBar = "mirror.showInMenuBar"
+    @Published var showInMenuBar: Bool = false {
+        didSet {
+            UserDefaults.standard.set(showInMenuBar, forKey: Self.kShowInMenuBar)
+            syncMenuBar()
+        }
+    }
+    private var statusItem: NSStatusItem?
+    private var popover: NSPopover?
+
     init() {
         // Fix #7: observe AVCaptureSession runtime errors (e.g. USB unplug).
         runtimeErrorObserver = NotificationCenter.default.addObserver(
@@ -147,11 +162,67 @@ final class MirrorViewModel: ObservableObject {
                 }
             }
         }
+
+        // Restore menu-bar pref and instantiate the status item if needed.
+        // Done last so the syncMenuBar() call sees a fully-initialized
+        // observer set above.
+        self.showInMenuBar = UserDefaults.standard.bool(forKey: Self.kShowInMenuBar)
+        syncMenuBar()
     }
 
     deinit {
         if let o = runtimeErrorObserver { NotificationCenter.default.removeObserver(o) }
         if let o = activationObserver   { NotificationCenter.default.removeObserver(o) }
+        if let s = statusItem           { NSStatusBar.system.removeStatusItem(s) }
+    }
+
+    // MARK: - Menu bar plumbing -------------------------------------------
+
+    private func syncMenuBar() {
+        if showInMenuBar {
+            if statusItem == nil {
+                let s = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+                if let btn = s.button {
+                    btn.image = NSImage(systemSymbolName: "video.fill",
+                                         accessibilityDescription: "Mirror")
+                    btn.toolTip = "Trove Mirror — click to preview camera"
+                    btn.target = self
+                    btn.action = #selector(menuBarClicked(_:))
+                }
+                statusItem = s
+            }
+        } else {
+            if let s = statusItem {
+                NSStatusBar.system.removeStatusItem(s)
+                statusItem = nil
+            }
+            popover?.performClose(nil)
+            popover = nil
+        }
+    }
+
+    @objc private func menuBarClicked(_ sender: Any?) {
+        // NSStatusBarButton can fire off-main in rare edge cases.
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in self?.menuBarClicked(sender) }
+            return
+        }
+        guard let btn = statusItem?.button else { return }
+        if popover == nil {
+            let p = NSPopover()
+            p.contentSize = NSSize(width: 360, height: 260)
+            p.behavior = .transient
+            p.contentViewController = NSHostingController(rootView: MirrorMenuBarPopover(vm: self))
+            self.popover = p
+        }
+        if popover?.isShown == true {
+            popover?.performClose(nil)
+        } else {
+            // Ensure session is running when the popover opens — otherwise
+            // the preview shows a black square. start() is idempotent.
+            if !isActive { start() }
+            popover?.show(relativeTo: btn.bounds, of: btn, preferredEdge: .minY)
+        }
     }
 
     func start() {
@@ -340,6 +411,77 @@ struct MirrorPreviewView: NSViewRepresentable {
     }
 }
 
+/// Menu-bar popover content — shows the live preview (reusing the same
+/// AVCaptureSession that the pane uses, no second camera open), plus the
+/// same Float / Snapshot actions the pane toolbar exposes, plus a small
+/// "remove from menu bar" affordance so the user doesn't have to reopen
+/// the Mirror pane just to turn it off.
+private struct MirrorMenuBarPopover: View {
+    @ObservedObject var vm: MirrorViewModel
+    var body: some View {
+        VStack(spacing: 8) {
+            if vm.permissionDenied {
+                VStack(spacing: 6) {
+                    Image(systemName: "video.slash.fill")
+                        .font(.system(size: 28))
+                        .foregroundStyle(.tint)
+                    Text("Camera access denied")
+                        .font(.callout.weight(.medium))
+                    Text("Open System Settings → Privacy & Security → Camera")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                    Button("Open System Settings") {
+                        _ = TCCDeepLink.camera.open()
+                    }
+                    .controlSize(.small)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(20)
+            } else {
+                MirrorPreviewView(vm: vm)
+                    .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                    .frame(maxWidth: 340, maxHeight: 200)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.troveLine))
+                HStack(spacing: 8) {
+                    Button {
+                        NotificationCenter.default.post(name: .troveMirrorOpenFloating, object: nil)
+                    } label: {
+                        Label("Float", systemImage: "pip.enter")
+                    }
+                    .help("Open the always-on-top floating mirror")
+
+                    Button {
+                        // Route to the main Mirror pane — keeps the toolbar
+                        // affordances (snapshot, camera picker) available
+                        // without duplicating them here.
+                        if let url = URL(string: "trove://pane/open?pane=Mirror") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    } label: {
+                        Label("Open Pane", systemImage: "arrow.up.right.square")
+                    }
+                    .help("Bring the Trove window forward at the Mirror pane")
+
+                    Spacer()
+                    Button {
+                        vm.showInMenuBar = false
+                    } label: {
+                        Image(systemName: "minus.circle")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Remove Mirror from the menu bar")
+                }
+                .padding(.horizontal, 4)
+            }
+        }
+        .padding(10)
+        .frame(width: 360)
+    }
+}
+
 final class MirrorPreviewNSView: NSView {
     let previewLayer = AVCaptureVideoPreviewLayer()
     override init(frame frameRect: NSRect) {
@@ -414,6 +556,20 @@ struct MirrorView: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
+            // Show-in-menu-bar toggle — surfaces a tiny camera status item
+            // with a live-preview popover, same opt-in pattern as Keep Awake.
+            Button {
+                vm.showInMenuBar.toggle()
+            } label: {
+                Label(vm.showInMenuBar ? "Hide from Menu Bar" : "Show in Menu Bar",
+                      systemImage: vm.showInMenuBar
+                          ? "menubar.dock.rectangle"
+                          : "menubar.rectangle")
+            }
+            .help(vm.showInMenuBar
+                  ? "Remove the Mirror status item from the menu bar"
+                  : "Add a Mirror status item to the menu bar — click it to preview the camera anywhere")
+
             // P1: always-on-top floating panel toggle.
             Button {
                 floatingCtrl.toggle(vm: vm)
