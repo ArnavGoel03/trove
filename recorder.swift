@@ -1663,6 +1663,10 @@ final class RecViewModel: ObservableObject {
     @AppStorage("rec.menuBarWhileRecording") var menuBarWhileRecording: Bool = false {
         didSet { RecMenuBarController.shared.prefDidChange() }
     }
+    // Power-user item #5 — click ripple overlay during recording.
+    @AppStorage("rec.clickRipple")          var clickRipple: Bool = false
+    // Power-user item #4 — keystroke overlay during recording.
+    @AppStorage("rec.keystrokeOverlay")     var keystrokeOverlay: Bool = false
 
     @AppStorage("rec.codec")             private var _codec: String = RecCodec.hevc.rawValue
     var codec: RecCodec {
@@ -1983,6 +1987,18 @@ struct RecView: View {
                             set: { vm.menuBarWhileRecording = $0 }
                         ))
                         .help("Display a pulsing record dot in the menu bar while recording — click to stop.")
+                        // Power-user item #5 — click ripple overlay.
+                        Toggle("Show click ripples", isOn: Binding(
+                            get: { vm.clickRipple },
+                            set: { vm.clickRipple = $0 }
+                        ))
+                        .help("Render a fading ring at every mouse click — essential for tutorial recordings. Needs Accessibility permission.")
+                        // Power-user item #4 — keystroke overlay.
+                        Toggle("Show keystrokes", isOn: Binding(
+                            get: { vm.keystrokeOverlay },
+                            set: { vm.keystrokeOverlay = $0 }
+                        ))
+                        .help("Display a HUD with the last chord pressed (⌘⇧K etc.) bottom-center of the screen. Secure input fields are filtered out automatically.")
                     }
                 }
 
@@ -2097,6 +2113,18 @@ struct RecView: View {
             }
             RecFloatingStopController.shared.attach(engine: vm.engine, stop: stop)
             RecMenuBarController.shared.attach(engine: vm.engine, stop: stop)
+            // Power-user items #4 + #5 — overlay tap. Active only when
+            // a recording is running AND the relevant pref is on.
+            // Combine sink on the engine's isRecording publisher keeps
+            // the dispatcher state in sync without polling.
+            for await rec in vm.engine.$isRecording.values {
+                let cr = rec && vm.clickRipple
+                let ks = rec && vm.keystrokeOverlay
+                RecOverlayDispatcher.shared.clickRippleOn = cr
+                RecOverlayDispatcher.shared.keystrokeOn   = ks
+                RecOverlayTap.shared.setClickRipple(cr)
+                RecOverlayTap.shared.setKeystrokeOverlay(ks)
+            }
         }
         // Listen for menu-bar Record submenu triggers. userInfo carries
         // mix-and-match audio config: keys "mic" and "sys", both Bool.
