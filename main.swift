@@ -834,6 +834,8 @@ extension Notification.Name {
     /// Posted by the menu-bar "Record Screen + Audio" item. Recorder pane
     /// listens and auto-starts a recording with system audio + microphone.
     static let troveStartRecordingNow = Notification.Name("TroveStartRecordingNow")
+    /// Power-user item #8 — global stop-recording hotkey fires this.
+    static let troveStopRecordingNow  = Notification.Name("TroveStopRecordingNow")
     // Stage / History post this when they write to NSPasteboard.general; the
     // *other* store listens and bumps its `lastChangeCount` so the next
     // watcher tick doesn't echo-ingest our own write.

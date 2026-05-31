@@ -2491,6 +2491,22 @@ struct RecView: View {
                 RecOverlayTap.shared.setKeystrokeOverlay(ks)
             }
         }
+        // Power-user item #8 — global stop hotkey routes through here.
+        .onReceive(NotificationCenter.default.publisher(for: .troveStopRecordingNow)) { _ in
+            guard vm.engine.isRecording else { return }
+            Task {
+                await vm.engine.stop()
+                if vm.sendToStageOnStop, let url = vm.engine.lastOutputURL {
+                    stage.addFile(url)
+                    stage.flash("Recording added to Stage")
+                }
+                if vm.previewSheetOnStop, let url = vm.engine.lastOutputURL {
+                    vm.pendingPreviewDuration = vm.engine.elapsed
+                    vm.pendingPreviewSentToStage = vm.sendToStageOnStop
+                    vm.pendingPreviewURL = url
+                }
+            }
+        }
         // Listen for menu-bar Record submenu triggers. userInfo carries
         // mix-and-match audio config: keys "mic" and "sys", both Bool.
         // Falls back to system+mic if userInfo is missing (legacy callers).
