@@ -138,6 +138,52 @@ enum RecPaths {
         return "Trove-\(f.string(from: date)).mp4"
     }
 
+    /// Power-user item #13 — filename templating. Expands tokens against
+    /// `{date}`, `{time}`, `{datetime}`, `{counter}`, `{codec}`, `{fps}`,
+    /// `{source}` and the raw strftime tokens `{yyyy}`, `{MM}`, `{dd}`,
+    /// `{HH}`, `{mm}`, `{ss}`. Falls back to the plain timestamped name
+    /// when the template is empty or produces an unsafe filename (path
+    /// separators, leading dot). Always appends `.mp4`.
+    ///
+    /// red-team-sec: refuses absolute paths and `..` to keep the writer
+    /// pinned to `outputFolder`. A user who types `/etc/passwd` as
+    /// template gets the safe fallback instead of a hijacked write.
+    static func name(template: String,
+                     date: Date = Date(),
+                     counter: Int = 1,
+                     codec: String = "",
+                     fps: Int = 0,
+                     source: String = "") -> String {
+        let trimmed = template.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return timestampedName(date: date) }
+
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        var s = trimmed
+        for (tok, fmt) in [
+            ("{yyyy}", "yyyy"), ("{MM}", "MM"), ("{dd}", "dd"),
+            ("{HH}", "HH"),     ("{mm}", "mm"), ("{ss}", "ss"),
+        ] {
+            f.dateFormat = fmt
+            s = s.replacingOccurrences(of: tok, with: f.string(from: date))
+        }
+        f.dateFormat = "yyyy-MM-dd";   s = s.replacingOccurrences(of: "{date}", with: f.string(from: date))
+        f.dateFormat = "HHmmss";       s = s.replacingOccurrences(of: "{time}", with: f.string(from: date))
+        f.dateFormat = "yyyyMMdd-HHmmss"; s = s.replacingOccurrences(of: "{datetime}", with: f.string(from: date))
+        s = s.replacingOccurrences(of: "{counter}", with: String(format: "%03d", counter))
+        s = s.replacingOccurrences(of: "{codec}",  with: codec)
+        s = s.replacingOccurrences(of: "{fps}",    with: fps > 0 ? "\(fps)fps" : "")
+        s = s.replacingOccurrences(of: "{source}", with: source)
+        s = s.trimmingCharacters(in: .whitespaces)
+        // Refuse path separators / `..` / hidden-file leaders.
+        if s.contains("/") || s.contains("..") || s.hasPrefix(".") || s.isEmpty {
+            return timestampedName(date: date)
+        }
+        // Strip any user-supplied extension; we always end in `.mp4`.
+        let stem = (s as NSString).deletingPathExtension
+        return "\(stem).mp4"
+    }
+
     /// red-team: orphaned `.tmp.mp4` cleanup on next launch. A SIGKILL /
     /// power loss during a recording leaves a `.tmp.mp4` with a missing
     /// moov atom. We don't delete them (they're recoverable with ffmpeg)
@@ -164,6 +210,43 @@ enum RecPaths {
             if (try? fm.moveItem(at: url, to: dest)) != nil { n += 1 }
         }
         return n
+    }
+}
+
+// =============================================================================
+// MARK: - Quality preset (#10 — pro bitrate control)
+// =============================================================================
+//
+// Currently the recorder picks a bitrate from `pxW * pxH * 4` capped at
+// 200 Mbps. That's "visually lossless" but generates huge files at 4K +
+// 60 fps. Pro users want explicit control over the quality/size trade.
+
+enum RecQuality: String, CaseIterable, Identifiable, Codable {
+    case smallest   // 0.4× default — fine for talking-head screencasts
+    case balanced   // 1.0× default — current behavior
+    case best       // 2.0× default — for archival / further editing
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .smallest: return "Smallest"
+        case .balanced: return "Balanced"
+        case .best:     return "Best"
+        }
+    }
+    var bitrateMultiplier: Double {
+        switch self {
+        case .smallest: return 0.4
+        case .balanced: return 1.0
+        case .best:     return 2.0
+        }
+    }
+    var tooltip: String {
+        switch self {
+        case .smallest: return "Smallest — lower bitrate (~40% of default). Tutorial-grade quality at half the file size; good for short clips that need to share quickly."
+        case .balanced: return "Balanced — default bitrate. Visually lossless at typical viewing distances; the safe pick."
+        case .best:     return "Best — double the bitrate. Use when the recording is going to be re-edited (color graded, cut, compressed again) and you don't want to compound losses."
+        }
     }
 }
 
@@ -566,6 +649,15 @@ final class RecEngine: NSObject, ObservableObject {
     var maxDurationSeconds: TimeInterval = 0
     private var maxDurationTimer: Timer?
 
+    /// Power-user item #10 — bitrate multiplier set by the VM's quality
+    /// preset before calling start(). 1.0 = balanced (current default
+    /// behavior); 0.4 = smallest; 2.0 = best (archival).
+    var qualityMultiplier: Double = 1.0
+
+    /// Power-user item #13 — filename template used by the writer to
+    /// pick output filenames. Empty = `Trove-yyyyMMdd-HHmmss.mp4`.
+    var filenameTemplate: String = ""
+
     /// Update SCStream configuration to reflect the live cursor toggle.
     /// Falls back silently when the stream isn't running (e.g. during
     /// initial countdown) — the start() path picks up `showsCursor` from
@@ -879,7 +971,15 @@ final class RecEngine: NSObject, ObservableObject {
         // clash. Bump with -N until both the final and the .tmp.mp4 paths
         // are free. We do NOT clobber a stale .tmp.mp4 (it might be from a
         // recoverable crashed prior session — see RecPaths.sweepStaleTmp).
-        let baseName  = RecPaths.timestampedName()
+        // Power-user item #13 — expand the user's filename template
+        // (codec / fps / date / source / counter tokens). Empty template
+        // falls back to the classic `Trove-yyyyMMdd-HHmmss.mp4`.
+        let baseName  = RecPaths.name(
+            template: filenameTemplate,
+            counter: 1,
+            codec: codec.rawValue.replacingOccurrences(of: " ", with: "_"),
+            fps: fps.rawValue,
+            source: "")
         var finalURL  = outputFolder.appendingPathComponent(baseName)
         var tempURL   = outputFolder.appendingPathComponent(baseName + ".tmp.mp4")
         var bump = 1
@@ -910,8 +1010,13 @@ final class RecEngine: NSObject, ObservableObject {
         // HEVC/H.264 need for visually-lossless screen content at any resolution
         // we'll realistically encode; floor of 8 Mbps preserves quality at lower
         // resolutions.
+        // Power-user item #10 — quality preset scales the base bitrate.
+        // `qualityMultiplier` is set on the engine by start() callers; if
+        // never set it falls back to 1.0 (balanced — current behavior).
         let bitrateCap = 200_000_000
-        let bitrate = min(bitrateCap, max(8_000_000, pxWidth * pxHeight * 4))
+        let baseBitrate = max(8_000_000, pxWidth * pxHeight * 4)
+        let scaled = Double(baseBitrate) * (qualityMultiplier > 0 ? qualityMultiplier : 1.0)
+        let bitrate = min(bitrateCap, Int(scaled))
         var compressionProps: [String: Any] = [
             AVVideoAverageBitRateKey: bitrate,
             AVVideoMaxKeyFrameIntervalKey: fps.rawValue * 2,  // 2-sec key frame
@@ -1534,6 +1639,31 @@ final class RecViewModel: ObservableObject {
     // P1: misc prefs — persisted
     @AppStorage("rec.highlightCursor")    var highlightCursor:    Bool   = true
     @AppStorage("rec.sendToStageOnStop")  var sendToStageOnStop: Bool   = false
+    // Power-user item #10 — quality preset.
+    @AppStorage("rec.quality")           private var _quality: String = RecQuality.balanced.rawValue
+    var quality: RecQuality {
+        get { RecQuality(rawValue: _quality) ?? .balanced }
+        set { _quality = newValue.rawValue }
+    }
+    // Power-user item #13 — filename template (empty = default timestamped name).
+    @AppStorage("rec.filenameTemplate")  var filenameTemplate: String = ""
+    // Power-user item #15 — countdown seconds before recording starts (0 = off).
+    @AppStorage("rec.countdownSeconds")  var countdownSeconds: Int = 0
+    @Published var pendingCountdown: Int? = nil
+    // Power-user item #7 — floating Stop panel pref.
+    @AppStorage("rec.floatingStop")      private var _floatingStop: String = RecFloatingStopPref.whileRecording.rawValue
+    var floatingStopPref: RecFloatingStopPref {
+        get { RecFloatingStopPref(rawValue: _floatingStop) ?? .whileRecording }
+        set {
+            _floatingStop = newValue.rawValue
+            RecFloatingStopController.shared.prefDidChange()
+        }
+    }
+    // Power-user item #16 — menu bar status item while recording.
+    @AppStorage("rec.menuBarWhileRecording") var menuBarWhileRecording: Bool = false {
+        didSet { RecMenuBarController.shared.prefDidChange() }
+    }
+
     @AppStorage("rec.codec")             private var _codec: String = RecCodec.hevc.rawValue
     var codec: RecCodec {
         get { RecCodec(rawValue: _codec) ?? .hevc }
@@ -1779,6 +1909,55 @@ struct RecView: View {
                         }
                         .pickerStyle(.segmented)
 
+                        // Power-user item #10 — quality preset.
+                        Picker("Quality", selection: Binding(
+                            get: { vm.quality },
+                            set: { vm.quality = $0 }
+                        )) {
+                            ForEach(RecQuality.allCases) { q in
+                                Text(q.label).tag(q)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .help(vm.quality.tooltip)
+
+                        // Power-user item #15 — countdown timer before record.
+                        Picker("Countdown", selection: Binding(
+                            get: { vm.countdownSeconds },
+                            set: { vm.countdownSeconds = $0 }
+                        )) {
+                            Text("Off").tag(0)
+                            Text("3s").tag(3)
+                            Text("5s").tag(5)
+                            Text("10s").tag(10)
+                        }
+                        .pickerStyle(.segmented)
+                        .help("Show a 3-2-1 countdown before recording starts. Esc cancels.")
+
+                        // Power-user item #13 — filename template.
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text("Filename")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Text(filenamePreview())
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.tertiary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            TextField("Trove-{datetime}",
+                                      text: Binding(
+                                          get: { vm.filenameTemplate },
+                                          set: { vm.filenameTemplate = $0 }))
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(.body, design: .monospaced))
+                            Text("Tokens: {date} {time} {datetime} {yyyy} {MM} {dd} {HH} {mm} {ss} {codec} {fps} {counter}")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+
                         Toggle("Show cursor", isOn: Binding(
                             get: { vm.highlightCursor },
                             set: { vm.highlightCursor = $0 }
@@ -1787,11 +1966,53 @@ struct RecView: View {
                             get: { vm.sendToStageOnStop },
                             set: { vm.sendToStageOnStop = $0 }
                         ))
+                        // Power-user item #7 — floating Stop panel.
+                        Picker("Floating Stop", selection: Binding(
+                            get: { vm.floatingStopPref },
+                            set: { vm.floatingStopPref = $0 }
+                        )) {
+                            ForEach(RecFloatingStopPref.allCases) { p in
+                                Text(p.label).tag(p)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .help("Show a draggable always-on-top Stop button so you can stop a fullscreen recording without finding the Trove window.")
+                        // Power-user item #16 — menu bar status item while recording.
+                        Toggle("Show menu bar Record dot", isOn: Binding(
+                            get: { vm.menuBarWhileRecording },
+                            set: { vm.menuBarWhileRecording = $0 }
+                        ))
+                        .help("Display a pulsing record dot in the menu bar while recording — click to stop.")
                     }
                 }
 
-                // Recording HUD or Record button --------------------------
-                if vm.engine.isRecording {
+                // Recording HUD, countdown overlay, or Record button -----
+                if let n = vm.pendingCountdown {
+                    Card {
+                        VStack(spacing: 14) {
+                            Text("\(n)")
+                                .font(.system(size: 96, weight: .bold, design: .rounded))
+                                .monospacedDigit()
+                                .foregroundStyle(Color.red)
+                                .frame(maxWidth: .infinity)
+                                .accessibilityLabel("Recording starts in \(n) seconds")
+                            Text(n == 1 ? "Recording in 1 second…"
+                                        : "Recording in \(n) seconds…")
+                                .font(.headline)
+                                .foregroundStyle(.secondary)
+                            Button(role: .destructive) {
+                                vm.pendingCountdown = nil
+                            } label: {
+                                Label("Cancel countdown", systemImage: "xmark.circle")
+                            }
+                            .controlSize(.large)
+                            .keyboardShortcut(.escape, modifiers: [])
+                            .help("Cancel before recording starts (Esc)")
+                        }
+                        .padding(20)
+                        .frame(maxWidth: .infinity)
+                    }
+                } else if vm.engine.isRecording {
                     RecHUD(engine: vm.engine, vm: vm) { url in
                         if vm.sendToStageOnStop, let url = url {
                             stage.addFile(url)
@@ -1862,6 +2083,20 @@ struct RecView: View {
             await Task.detached(priority: .background) {
                 _ = RecPaths.sweepStaleTmp(folder)
             }.value
+            // Power-user items #7 + #16 — attach controllers once on
+            // appear. They observe engine.isRecording themselves so the
+            // attach call is idempotent + cheap.
+            let stop: () -> Void = {
+                Task { @MainActor in
+                    await vm.engine.stop()
+                    if vm.sendToStageOnStop, let url = vm.engine.lastOutputURL {
+                        stage.addFile(url)
+                        stage.flash("Recording added to Stage")
+                    }
+                }
+            }
+            RecFloatingStopController.shared.attach(engine: vm.engine, stop: stop)
+            RecMenuBarController.shared.attach(engine: vm.engine, stop: stop)
         }
         // Listen for menu-bar Record submenu triggers. userInfo carries
         // mix-and-match audio config: keys "mic" and "sys", both Bool.
@@ -1888,6 +2123,26 @@ struct RecView: View {
     private func startRecording() {
         Task {
             do {
+                // Power-user item #15 — countdown timer. Run BEFORE asking
+                // mic permission so the user can cancel during the countdown
+                // without dismissing the OS dialog (worse UX). Esc cancels
+                // by setting pendingCountdown = nil; the loop bails out on
+                // the next tick.
+                if vm.countdownSeconds > 0 {
+                    var n = vm.countdownSeconds
+                    vm.pendingCountdown = n
+                    while n > 0 {
+                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        guard vm.pendingCountdown != nil else {
+                            // User cancelled via Esc / button — abort cleanly.
+                            return
+                        }
+                        n -= 1
+                        vm.pendingCountdown = n
+                    }
+                    vm.pendingCountdown = nil
+                }
+
                 // Fix #1: Request mic permission BEFORE starting the engine
                 // so the OS dialog appears before recording begins and we can
                 // gate the mic track accurately rather than starting it and
@@ -1904,6 +2159,11 @@ struct RecView: View {
                         return
                     }
                 }
+                // Apply pro-user knobs that aren't passed via start()'s
+                // parameter list — kept as engine properties so the rest
+                // of the signature stays stable.
+                vm.engine.qualityMultiplier = vm.quality.bitrateMultiplier
+                vm.engine.filenameTemplate  = vm.filenameTemplate
                 try await vm.engine.start(
                     source: vm.buildSource(),
                     outputFolder: vm.outputFolder,
@@ -1919,6 +2179,18 @@ struct RecView: View {
                 // Engine already set lastError; nothing else to do.
             }
         }
+    }
+
+    /// Live preview of the expanded filename template. Shown to the
+    /// right of the "Filename" label so the user knows what the next
+    /// recording will be named without having to start one to find out.
+    private func filenamePreview() -> String {
+        RecPaths.name(
+            template: vm.filenameTemplate,
+            counter: 1,
+            codec: vm.codec.rawValue.replacingOccurrences(of: " ", with: "_"),
+            fps: vm.fps.rawValue,
+            source: "")
     }
 
     private func chooseFolder() {
