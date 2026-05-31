@@ -2032,7 +2032,16 @@ struct RecView: View {
                     RecHUD(engine: vm.engine, vm: vm) { url in
                         if vm.sendToStageOnStop, let url = url {
                             stage.addFile(url)
-                            stage.flash("Recording added to Stage")
+                            // Power-user item #3 — rich auto-route message
+                            // with duration + sources + codec + fps so the
+                            // user sees what just landed instead of a
+                            // generic "added to Stage" toast.
+                            let dur = RecMeta.duration(vm.engine.elapsed)
+                            let audio = RecMeta.audioSummary(sys: vm.systemAudioOn,
+                                                              mic: vm.microphoneOn)
+                            let codec = vm.codec.rawValue
+                            let fps = vm.fps.rawValue
+                            stage.flash("\(dur) · \(audio) · \(codec) \(fps)fps → Stage")
                         }
                     }
                 } else {
@@ -2281,6 +2290,30 @@ struct RecLastRecordingRow: View {
                 Button { RecSaver.openInQuickTime(url) } label: {
                     Label("Show in QuickTime Player", systemImage: "play.rectangle")
                 }
+                // Power-user item #2 — cross-pane Continue editing.
+                Divider()
+                Section("Continue editing") {
+                    Button {
+                        RecSaver.extractFirstFrameAndSendToOCR(url)
+                    } label: {
+                        Label("Extract a frame → OCR", systemImage: "doc.viewfinder")
+                    }
+                    .help("Pull the first frame of the recording and route it into the OCR pane for text extraction.")
+                    Button {
+                        RecSaver.extractFirstFrameAndSendToStage(url)
+                    } label: {
+                        Label("First frame → Stage", systemImage: "photo")
+                    }
+                    .help("Pull the first frame as a PNG and route it to Stage so you can chain it into any image pane.")
+                    Button {
+                        if let openURL = URL(string: "trove://pane/open?pane=Snip") {
+                            NSWorkspace.shared.open(openURL)
+                        }
+                    } label: {
+                        Label("Annotate a frame in Snip", systemImage: "scribble.variable")
+                    }
+                    .help("Open the Snip pane — drop a frame from this recording in to annotate / arrow / blur.")
+                }
                 Divider()
                 Button { RecSaver.copyPath(url) } label: {
                     Label("Copy Path", systemImage: "doc.on.doc")
@@ -2315,6 +2348,26 @@ struct RecLastRecordingRow: View {
     private static func fileSizeString(_ url: URL) -> String {
         let bytes = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         return ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    }
+}
+
+/// Power-user item #3 — short readable strings for the "added to Stage"
+/// flash toast (and anywhere else we surface recording metadata).
+enum RecMeta {
+    static func duration(_ s: TimeInterval) -> String {
+        let total = Int(s)
+        let h = total / 3600, m = (total % 3600) / 60, ss = total % 60
+        return h > 0
+            ? String(format: "%d:%02d:%02d", h, m, ss)
+            : String(format: "%d:%02d", m, ss)
+    }
+    static func audioSummary(sys: Bool, mic: Bool) -> String {
+        switch (sys, mic) {
+        case (true,  true):  return "system + mic"
+        case (true,  false): return "system audio"
+        case (false, true):  return "mic only"
+        case (false, false): return "silent"
+        }
     }
 }
 
@@ -2370,6 +2423,73 @@ enum RecSaver {
         pb.clearContents()
         pb.setString(url.path, forType: .string)
         SharedStore.stage.flash("Copied path")
+    }
+
+    /// Power-user item #2 — cross-pane Continue editing. Pull the first
+    /// frame from the recording and send it into another Trove pane.
+    /// We extract once and reuse the PNG for both routes so we never
+    /// pay the AVAssetImageGenerator cost twice.
+    static func extractFirstFrameAndSendToOCR(_ url: URL) {
+        Task.detached(priority: .userInitiated) {
+            guard let png = await firstFramePNG(url: url) else {
+                await MainActor.run { SharedStore.stage.flash("Couldn't extract a frame", kind: .warning) }
+                return
+            }
+            await MainActor.run {
+                // Send the PNG to Stage with a hint label so the user can
+                // see what arrived, then deeplink to OCR which picks up
+                // the new image item on appear.
+                SharedStore.stage.addFile(png)
+                if let openURL = URL(string: "trove://pane/open?pane=OCR") {
+                    NSWorkspace.shared.open(openURL)
+                }
+                SharedStore.stage.flash("First frame → Stage; opening OCR")
+            }
+        }
+    }
+
+    static func extractFirstFrameAndSendToStage(_ url: URL) {
+        Task.detached(priority: .userInitiated) {
+            guard let png = await firstFramePNG(url: url) else {
+                await MainActor.run { SharedStore.stage.flash("Couldn't extract a frame", kind: .warning) }
+                return
+            }
+            await MainActor.run {
+                SharedStore.stage.addFile(png)
+                SharedStore.stage.flash("First frame → Stage")
+            }
+        }
+    }
+
+    /// Render the first frame of a video file to a PNG in `~/Documents/Trove/frames/`.
+    /// Off-main. Returns nil on decode failure or if the file isn't a
+    /// video Trove can read.
+    nonisolated private static func firstFramePNG(url: URL) async -> URL? {
+        let asset = AVURLAsset(url: url)
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
+        gen.requestedTimeToleranceBefore = .zero
+        gen.requestedTimeToleranceAfter = .positiveInfinity
+        // Use the modern async API where available (macOS 13+).
+        do {
+            let result = try await gen.image(at: .zero)
+            let cg = result.image
+            let bitmap = NSBitmapImageRep(cgImage: cg)
+            guard let data = bitmap.representation(using: .png, properties: [:]) else { return nil }
+            // Sit alongside the recording so the user finds it without
+            // having to dig — but in a `.frames/` subdir to keep the
+            // recording folder uncluttered.
+            let dir = url.deletingLastPathComponent().appendingPathComponent("frames",
+                                                                            isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir,
+                                                     withIntermediateDirectories: true)
+            let stem = (url.lastPathComponent as NSString).deletingPathExtension
+            let dest = dir.appendingPathComponent("\(stem)-frame1.png")
+            try data.write(to: dest, options: [.atomic])
+            return dest
+        } catch {
+            return nil
+        }
     }
 
     /// Explicitly open in QuickTime Player rather than relying on default
