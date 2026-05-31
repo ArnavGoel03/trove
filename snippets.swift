@@ -17,6 +17,7 @@
 import SwiftUI
 import AppKit
 import Foundation
+import UniformTypeIdentifiers
 
 // ===========================================================================
 // MARK: - Model
@@ -31,6 +32,7 @@ struct Snippet: Identifiable, Codable, Hashable {
     var useCount: Int
     var lastUsedAt: Date?
     var pinned: Bool
+    var updatedAt: Date? = nil
 
     init(id: UUID = UUID(),
          name: String,
@@ -39,7 +41,8 @@ struct Snippet: Identifiable, Codable, Hashable {
          createdAt: Date = Date(),
          useCount: Int = 0,
          lastUsedAt: Date? = nil,
-         pinned: Bool = false) {
+         pinned: Bool = false,
+         updatedAt: Date? = nil) {
         self.id = id
         self.name = name
         self.body = body
@@ -48,26 +51,35 @@ struct Snippet: Identifiable, Codable, Hashable {
         self.useCount = useCount
         self.lastUsedAt = lastUsedAt
         self.pinned = pinned
+        self.updatedAt = updatedAt
     }
 
     // Custom decoding so future-added fields and previously-missing fields don't
     // explode on existing files. Every field except `id` has a sane default.
     enum CodingKeys: String, CodingKey {
-        case id, name, body, tags, createdAt, useCount, lastUsedAt, pinned
+        case id, name, body, tags, createdAt, useCount, lastUsedAt, pinned, updatedAt
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         // id: tolerate missing by minting a fresh one — corrupt rows still load.
-        self.id         = (try? c.decode(UUID.self, forKey: .id)) ?? UUID()
-        self.name       = (try? c.decode(String.self, forKey: .name)) ?? "Untitled"
-        self.body       = (try? c.decode(String.self, forKey: .body)) ?? ""
-        self.tags       = (try? c.decode([String].self, forKey: .tags)) ?? []
-        self.createdAt  = (try? c.decode(Date.self, forKey: .createdAt)) ?? Date()
-        self.useCount   = (try? c.decode(Int.self, forKey: .useCount)) ?? 0
+        self.id        = (try? c.decode(UUID.self, forKey: .id)) ?? UUID()
+        self.name      = (try? c.decode(String.self, forKey: .name)) ?? "Untitled"
+        self.body      = (try? c.decode(String.self, forKey: .body)) ?? ""
+        self.tags      = (try? c.decode([String].self, forKey: .tags)) ?? []
+        self.createdAt = (try? c.decode(Date.self, forKey: .createdAt)) ?? Date()
+        self.useCount  = (try? c.decode(Int.self, forKey: .useCount)) ?? 0
         self.lastUsedAt = try? c.decodeIfPresent(Date.self, forKey: .lastUsedAt)
-        self.pinned     = (try? c.decode(Bool.self, forKey: .pinned)) ?? false
+        self.pinned    = (try? c.decode(Bool.self, forKey: .pinned)) ?? false
+        self.updatedAt = try? c.decodeIfPresent(Date.self, forKey: .updatedAt)
     }
+}
+
+enum SortMode: String, CaseIterable {
+    case smart          = "Smart"
+    case alphabetical   = "A–Z"
+    case recentlyUsed   = "Recently Used"
+    case recentlyCreated = "Recently Created"
 }
 
 enum SnippetError: LocalizedError {
@@ -90,30 +102,72 @@ final class SnippetStore: ObservableObject {
     // Fix 13: `visible` is now @Published, populated on snippets/search changes.
     var snippets: [Snippet] = [] {
         willSet { objectWillChange.send() }
-        didSet  { recomputeVisible() }
+        didSet  { scheduleRecomputeVisible() }
     }
     var search: String = "" {
         willSet { objectWillChange.send() }
-        didSet  { recomputeVisible() }
+        didSet  { scheduleRecomputeVisible() }
     }
     /// Surface load errors visually without blocking startup.
     @Published var lastErrorMessage: String? = nil
     @Published private(set) var visible: [Snippet] = []
+    var sortMode: SortMode = {
+        let raw = UserDefaults.standard.string(forKey: "trove.snippets.sortMode") ?? ""
+        return SortMode(rawValue: raw) ?? .smart
+    }() {
+        willSet { objectWillChange.send() }
+        didSet {
+            UserDefaults.standard.set(sortMode.rawValue, forKey: "trove.snippets.sortMode")
+            scheduleRecomputeVisible()
+        }
+    }
+
+    // Fix 14: 50 ms debounce so rapid keystrokes don't filter on every character.
+    private var recomputeTask: Task<Void, Never>?
+
+    private func scheduleRecomputeVisible() {
+        recomputeTask?.cancel()
+        recomputeTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(50))
+            guard !Task.isCancelled else { return }
+            recomputeVisible()
+        }
+    }
 
     private func recomputeVisible() {
-        let q = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let filtered: [Snippet] = q.isEmpty
-            ? snippets
-            : snippets.filter { s in
-                if s.name.lowercased().contains(q) { return true }
-                if s.body.lowercased().contains(q) { return true }
-                if s.tags.contains(where: { $0.lowercased().contains(q) }) { return true }
+        let q = search.trimmingCharacters(in: .whitespacesAndNewlines)
+        let filtered: [Snippet]
+        if q.isEmpty {
+            filtered = snippets
+        } else if q.lowercased().hasPrefix("tag:") {
+            let tagQuery = String(q.dropFirst(4)).trimmingCharacters(in: .whitespacesAndNewlines)
+            filtered = snippets.filter { s in
+                s.tags.contains(where: { $0.localizedCaseInsensitiveContains(tagQuery) })
+            }
+        } else {
+            filtered = snippets.filter { s in
+                if s.name.localizedCaseInsensitiveContains(q) { return true }
+                if s.body.localizedCaseInsensitiveContains(q) { return true }
+                if s.tags.contains(where: { $0.localizedCaseInsensitiveContains(q) }) { return true }
                 return false
             }
+        }
         visible = filtered.sorted { a, b in
-            if a.pinned != b.pinned { return a.pinned && !b.pinned }
-            if a.useCount != b.useCount { return a.useCount > b.useCount }
-            return a.createdAt > b.createdAt
+            switch sortMode {
+            case .smart:
+                if a.pinned != b.pinned { return a.pinned && !b.pinned }
+                if a.useCount != b.useCount { return a.useCount > b.useCount }
+                return a.createdAt > b.createdAt
+            case .alphabetical:
+                return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+            case .recentlyUsed:
+                // P1: sort by recency (lastUsedAt), not frequency (useCount).
+                let aDate = a.lastUsedAt ?? a.createdAt
+                let bDate = b.lastUsedAt ?? b.createdAt
+                return aDate > bDate
+            case .recentlyCreated:
+                return a.createdAt > b.createdAt
+            }
         }
     }
 
@@ -126,20 +180,58 @@ final class SnippetStore: ObservableObject {
     private let ioQueue = DispatchQueue(label: "trove.snippets.io", qos: .utility)
     /// Debounce token; cancelled and replaced on each save() call within 200 ms.
     private var pendingSave: DispatchWorkItem?
+    private var terminateObserver: NSObjectProtocol?
 
     init(fileURL: URL? = nil) {
         if let u = fileURL {
             self.fileURL = u
         } else {
-            let appSupport = FileManager.default.urls(for: .applicationSupportDirectory,
-                                                      in: .userDomainMask).first
-                ?? URL(fileURLWithPath: NSHomeDirectory())
-                    .appendingPathComponent("Library/Application Support")
-            self.fileURL = appSupport
-                .appendingPathComponent("Trove", isDirectory: true)
+            // Power-user item #8: route through TrovePaths so snippets
+            // follow the user's XDG opt-in.
+            self.fileURL = TrovePaths.appSupportDir
                 .appendingPathComponent("snippets.json")
         }
-        load()
+        // P1 fix (DEVELOP_RULES §1): previously `load()` ran synchronously here —
+        // boundedRead (16 MB cap) + JSONDecoder.decode of the snippet library
+        // pushed @StateObject init past the AttributeGraph 50 ms watchdog on
+        // slow / cold storage. Library briefly renders empty, then populates.
+        // The nonisolated worker returns the parsed payload; the @Published
+        // mutation is dispatched back to MainActor.
+        let loadURL = self.fileURL
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let outcome = Self.loadFromDiskOffMain(url: loadURL)
+            await MainActor.run {
+                guard let self else { return }
+                switch outcome {
+                case .ok(let list):
+                    self.snippets = list
+                case .empty:
+                    self.snippets = []
+                case .corrupt(let msg):
+                    self.snippets = []
+                    self.lastErrorMessage = msg
+                case .noFile:
+                    self.snippets = []
+                }
+                self.pendingSave?.cancel()
+            }
+        }
+        // Fix 5: force-flush on quit within the 200ms debounce window.
+        let url = self.fileURL
+        let queue = self.ioQueue
+        terminateObserver = NotificationCenter.default.addObserver(
+            forName: .troveWillTerminate, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            self.pendingSave?.cancel()
+            self.pendingSave = nil
+            let snapshot = self.snippets
+            queue.sync { _ = Self.writeSnapshot(snapshot, to: url) }
+        }
+    }
+
+    deinit {
+        if let o = terminateObserver { NotificationCenter.default.removeObserver(o) }
     }
 
     // MARK: filtered + sorted view
@@ -160,7 +252,9 @@ final class SnippetStore: ObservableObject {
     func update(_ s: Snippet) -> SnippetError? {
         if let e = validate(s) { return e }
         guard let i = snippets.firstIndex(where: { $0.id == s.id }) else { return nil }
-        snippets[i] = s
+        var stamped = s
+        stamped.updatedAt = Date()
+        snippets[i] = stamped
         save()
         return nil
     }
@@ -173,6 +267,7 @@ final class SnippetStore: ObservableObject {
     func togglePin(_ id: UUID) {
         guard let i = snippets.firstIndex(where: { $0.id == id }) else { return }
         snippets[i].pinned.toggle()
+        snippets[i].updatedAt = Date()
         save()
     }
 
@@ -180,6 +275,7 @@ final class SnippetStore: ObservableObject {
         guard let i = snippets.firstIndex(where: { $0.id == id }) else { return }
         snippets[i].useCount &+= 1
         snippets[i].lastUsedAt = Date()
+        snippets[i].updatedAt = Date()
         save()
     }
 
@@ -227,6 +323,42 @@ final class SnippetStore: ObservableObject {
     }
 
     // MARK: persistence
+
+    /// Result of the off-main load attempt. The caller patches `snippets`
+    /// (and optionally `lastErrorMessage`) on MainActor based on which case
+    /// is returned.
+    enum SnippetLoadOutcome {
+        case ok([Snippet])
+        case empty
+        case corrupt(String)   // user-facing error message
+        case noFile
+    }
+
+    /// Off-main loader, used by `init()` to keep the @StateObject default
+    /// expression cheap. Same read/decode logic as `load()`; differs only in
+    /// that it returns the outcome instead of mutating @Published state, and
+    /// performs the corrupt-file rename inline so the next save doesn't append
+    /// to garbage.
+    nonisolated static func loadFromDiskOffMain(url: URL) -> SnippetLoadOutcome {
+        do {
+            guard let data = boundedRead(url) else { return .noFile }
+            guard !data.isEmpty else { return .empty }
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let decoded = try decoder.decode([Snippet].self, from: data)
+            return .ok(decoded)
+        } catch let e as NSError where e.domain == NSCocoaErrorDomain
+                                  && e.code == NSFileReadNoSuchFileError {
+            return .noFile
+        } catch {
+            // Best-effort: rename the bad file out of the way so the next save
+            // doesn't accidentally append to garbage.
+            let bak = url.deletingPathExtension()
+                .appendingPathExtension("corrupt-\(Int(Date().timeIntervalSince1970)).json")
+            try? FileManager.default.moveItem(at: url, to: bak)
+            return .corrupt("Couldn't read snippets.json — starting empty.")
+        }
+    }
 
     func load() {
         let url = self.fileURL
@@ -305,7 +437,12 @@ final class SnippetStore: ObservableObject {
             try data.write(to: tmp, options: [.atomic])
 
             if fm.fileExists(atPath: url.path) {
-                _ = try fm.replaceItemAt(url, withItemAt: tmp)
+                do {
+                    _ = try fm.replaceItemAt(url, withItemAt: tmp)
+                } catch {
+                    try? fm.removeItem(at: tmp)
+                    throw error
+                }
             } else {
                 try fm.moveItem(at: tmp, to: url)
             }
@@ -327,6 +464,13 @@ struct SnippetsView: View {
 
     @State private var editorTarget: SnippetEditorTarget? = nil
     @State private var deleteCandidate: Snippet? = nil
+    @State private var pendingSnippetBody: String? = nil
+    // P1: multi-select + batch ops
+    @State private var selection: Set<UUID> = []
+    // P1: delete undo tombstone
+    @State private var undoStack: [(Snippet, Int)] = []  // (deleted snippet, original index)
+    // P1: JSON import
+    @State private var isImporting = false
 
     var body: some View {
         Group {
@@ -340,8 +484,62 @@ struct SnippetsView: View {
         .searchable(text: $store.search, prompt: "Search snippets")
         .navigationTitle("Snippets")
         .navigationSubtitle(subtitle)
+        // P0 fix: wire menu-bar routes (File > New Snippet ⌘N, File > Import,
+        // File > Export). Previously the menu posted these notifications
+        // into the void — the pane switch happened but nothing else fired.
+        .onReceive(NotificationCenter.default.publisher(for: .troveSnippetsNewItem)) { _ in
+            editorTarget = .new
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .troveSnippetsImport)) { _ in
+            isImporting = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .troveSnippetsExport)) { _ in
+            triggerExport()
+        }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                // P1: batch send to Stage when items are selected.
+                if !selection.isEmpty {
+                    Button {
+                        batchSendToStage()
+                    } label: {
+                        Label("Send \(selection.count) to Stage", systemImage: "tray.and.arrow.down")
+                    }
+                    .help("Send all selected snippets to Stage")
+
+                    Button(role: .destructive) {
+                        batchDelete()
+                    } label: {
+                        Label("Delete \(selection.count)", systemImage: "trash")
+                    }
+                    .help("Delete selected snippets")
+                }
+
+                // P1: undo last delete
+                if !undoStack.isEmpty {
+                    Button {
+                        undoLastDelete()
+                    } label: {
+                        Label("Undo Delete", systemImage: "arrow.uturn.backward")
+                    }
+                    .help("Undo last deletion")
+                }
+
+                Menu {
+                    Button("Import from JSON…") { isImporting = true }
+                    Button("Export Library to JSON…") { triggerExport() }
+                } label: {
+                    Label("More", systemImage: "ellipsis.circle")
+                }
+                .help("Import/Export snippet library")
+
+                Picker("Sort", selection: $store.sortMode) {
+                    ForEach(SortMode.allCases, id: \.self) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .pickerStyle(.menu)
+                .help("Sort order")
                 Button { editorTarget = .new } label: {
                     Label("New", systemImage: "plus")
                 }
@@ -353,7 +551,8 @@ struct SnippetsView: View {
             SnippetEditorSheet(
                 store: store,
                 target: target,
-                onClose: { editorTarget = nil }
+                onClose: { editorTarget = nil; pendingSnippetBody = nil },
+                prefillBody: pendingSnippetBody
             )
             .frame(minWidth: 520, idealWidth: 600, minHeight: 420, idealHeight: 480)
         }
@@ -367,20 +566,39 @@ struct SnippetsView: View {
             presenting: deleteCandidate
         ) { snip in
             Button("Delete", role: .destructive) {
-                store.delete(snip.id)
-                stage.flash("Deleted \(snip.name)")
+                deleteWithUndo(snip)
                 deleteCandidate = nil
             }
             Button("Cancel", role: .cancel) { deleteCandidate = nil }
         } message: { snip in
             Text("\"\(snip.name)\" will be removed from your snippet library.")
         }
+        // P1: JSON import via file importer.
+        .fileImporter(
+            isPresented: $isImporting,
+            allowedContentTypes: [.json],
+            allowsMultipleSelection: false
+        ) { result in
+            guard let url = (try? result.get())?.first else { return }
+            importJSON(from: url)
+        }
         .onAppear {
             if let msg = store.lastErrorMessage {
                 stage.flash(msg)
                 store.lastErrorMessage = nil
             }
+            ingestSmartSnippetsPayload(StageSmartActionQueue.shared.drain(.troveSmartOpenInSnippets))
         }
+        .onReceive(NotificationCenter.default.publisher(for: .troveSmartOpenInSnippets)) { n in
+            ingestSmartSnippetsPayload(n.userInfo)
+        }
+    }
+
+    private func ingestSmartSnippetsPayload(_ info: [AnyHashable: Any]?) {
+        guard let info,
+              let text = info[StageSmartKey.text] as? String, !text.isEmpty else { return }
+        pendingSnippetBody = text
+        editorTarget = .new
     }
 
     private var subtitle: String {
@@ -419,8 +637,11 @@ struct SnippetsView: View {
                     ForEach(rows) { snip in
                         SnippetRow(
                             snippet: snip,
+                            isSelected: selection.contains(snip.id),
                             onCopy: { copy(snip) },
-                            onTogglePin: { store.togglePin(snip.id) }
+                            onTogglePin: { store.togglePin(snip.id) },
+                            onToggleSelect: { toggleSelect(snip.id) },
+                            onTagFilter: { store.search = "tag:\($0)" }
                         )
                         .contextMenu {
                             Button("Copy") { copy(snip) }
@@ -441,12 +662,67 @@ struct SnippetsView: View {
                             Button("Delete…", role: .destructive) {
                                 deleteCandidate = snip
                             }
+                            if AIBridge.shared.hasInstalledTarget() {
+                                Divider()
+                                Menu("Send to AI") {
+                                    Button("Rewrite clearer")      { AIBridge.shared.send(snip.body, kind: .rephrase) }
+                                    Button("Translate to English") { AIBridge.shared.send(snip.body, kind: .translate) }
+                                    Button("Summarize")            { AIBridge.shared.send(snip.body, kind: .summarize) }
+                                    Divider()
+                                    Button("Send raw")             { AIBridge.shared.send(snip.body, kind: .paste) }
+                                }
+                            }
+                        }
+                        // P1: drag-out via NSItemProvider.
+                        .onDrag {
+                            NSItemProvider(object: snip.body as NSString)
                         }
                     }
                 }
                 .padding(18)
             }
         }
+    }
+
+    private func toggleSelect(_ id: UUID) {
+        if selection.contains(id) { selection.remove(id) } else { selection.insert(id) }
+    }
+
+    private func batchSendToStage() {
+        let targets = store.snippets.filter { selection.contains($0.id) }
+        for snip in targets {
+            stage.addText(snip.body)
+            store.recordUse(snip.id)
+        }
+        stage.flash("Sent \(targets.count) snippet\(targets.count == 1 ? "" : "s") to Stage")
+        selection.removeAll()
+    }
+
+    private func batchDelete() {
+        let ids = selection
+        let targets = store.snippets.enumerated().filter { ids.contains($0.element.id) }
+        // Store tombstones for undo (keep at most 10).
+        let tombstones = targets.map { ($0.element, $0.offset) }
+        undoStack = Array((tombstones + undoStack).prefix(10))
+        for t in targets {
+            store.delete(t.element.id)
+        }
+        stage.flash("Deleted \(targets.count) snippet\(targets.count == 1 ? "" : "s")")
+        selection.removeAll()
+    }
+
+    private func deleteWithUndo(_ snip: Snippet) {
+        let idx = store.snippets.firstIndex(where: { $0.id == snip.id }) ?? 0
+        undoStack = Array([(snip, idx)] + undoStack.prefix(9))
+        store.delete(snip.id)
+        stage.flash("Deleted \(snip.name)")
+    }
+
+    private func undoLastDelete() {
+        guard let (snip, _) = undoStack.first else { return }
+        undoStack.removeFirst()
+        store.add(snip)
+        stage.flash("Restored \(snip.name)")
     }
 
     private func copy(_ snip: Snippet) {
@@ -461,6 +737,54 @@ struct SnippetsView: View {
         store.recordUse(snip.id)
         stage.flash("Copied \(snip.name)")
     }
+
+    // P1: JSON export — encode all snippets and save via NSSavePanel.
+    private func triggerExport() {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        enc.dateEncodingStrategy = .iso8601
+        guard let data = try? enc.encode(store.snippets) else {
+            stage.flash("Export encoding failed")
+            return
+        }
+        let panel = NSSavePanel()
+        panel.title = "Export Snippets"
+        panel.nameFieldStringValue = "trove-snippets.json"
+        panel.allowedContentTypes = [.json]
+        panel.begin { resp in
+            guard resp == .OK, let url = panel.url else { return }
+            do {
+                try data.write(to: url, options: .atomic)
+                stage.flash("Snippets exported to \(url.lastPathComponent)")
+            } catch {
+                stage.flash("Export failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    // P1: JSON import — merge incoming snippets by name dedup.
+    private func importJSON(from url: URL) {
+        guard let data = boundedRead(url), !data.isEmpty else {
+            stage.flash("Import: couldn't read file")
+            return
+        }
+        let dec = JSONDecoder()
+        dec.dateDecodingStrategy = .iso8601
+        guard let incoming = try? dec.decode([Snippet].self, from: data) else {
+            stage.flash("Import: file is not a valid Trove snippets JSON")
+            return
+        }
+        var added = 0
+        let existingNames = Set(store.snippets.map { $0.name.lowercased() })
+        for snip in incoming {
+            if existingNames.contains(snip.name.lowercased()) { continue }
+            let fresh = Snippet(name: snip.name, body: snip.body, tags: snip.tags,
+                                pinned: snip.pinned)
+            store.add(fresh)
+            added += 1
+        }
+        stage.flash("Imported \(added) snippet\(added == 1 ? "" : "s") (\(incoming.count - added) skipped as duplicates)")
+    }
 }
 
 // ===========================================================================
@@ -469,19 +793,32 @@ struct SnippetsView: View {
 
 private struct SnippetRow: View {
     let snippet: Snippet
+    let isSelected: Bool          // P1: multi-select state passed in
     let onCopy: () -> Void
     let onTogglePin: () -> Void
+    let onToggleSelect: () -> Void // P1: selection toggle callback
+    let onTagFilter: (String) -> Void
     @State private var hover = false
 
     private var preview: String {
-        let firstLine = snippet.body.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
-        let trimmed = firstLine.trimmingCharacters(in: .whitespaces)
-        return trimmed.isEmpty ? "(empty)" : trimmed
+        let firstNonEmpty = snippet.body.split(separator: "\n")
+            .first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
+            .map(String.init) ?? ""
+        return firstNonEmpty.isEmpty ? "(empty)" : firstNonEmpty
     }
 
     var body: some View {
         Card {
             HStack(alignment: .top, spacing: 12) {
+                // P1: multi-select checkbox.
+                Button(action: onToggleSelect) {
+                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 14))
+                        .foregroundStyle(isSelected ? Color.troveAccent : Color.troveFgMute)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(isSelected ? "Deselect snippet" : "Select snippet")
+
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 8) {
                         Text(snippet.name)
@@ -498,15 +835,19 @@ private struct SnippetRow: View {
                         if !snippet.tags.isEmpty {
                             HStack(spacing: 4) {
                                 ForEach(snippet.tags.prefix(4), id: \.self) { tag in
-                                    Text(tag)
-                                        .font(.caption2)
-                                        .padding(.horizontal, 6).padding(.vertical, 2)
-                                        .background(.secondary.opacity(0.15), in: Capsule())
-                                        .foregroundStyle(.secondary)
+                                    Button { onTagFilter(tag) } label: {
+                                        Text(tag)
+                                            .font(.caption2)
+                                            .padding(.horizontal, 6).padding(.vertical, 2)
+                                            .background(.secondary.opacity(0.15), in: Capsule())
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .buttonStyle(.plain)
                                 }
                                 if snippet.tags.count > 4 {
                                     Text("+\(snippet.tags.count - 4)")
                                         .font(.caption2).foregroundStyle(.tertiary)
+                                        .help(snippet.tags.joined(separator: ", "))
                                 }
                             }
                         }
@@ -518,17 +859,23 @@ private struct SnippetRow: View {
                         .truncationMode(.tail)
                 }
                 Spacer(minLength: 8)
+                // P1: accessibilityLabel on pin button.
                 Button(action: onTogglePin) {
                     Image(systemName: snippet.pinned ? "pin.fill" : "pin")
                         .foregroundStyle(snippet.pinned ? Color.accentColor : .secondary)
                 }
                 .buttonStyle(.borderless)
                 .help(snippet.pinned ? "Unpin" : "Pin to top")
+                .accessibilityLabel(snippet.pinned ? "Unpin \(snippet.name)" : "Pin \(snippet.name) to top")
             }
         }
         .overlay(
             RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(hover ? Color.accentColor.opacity(0.45) : .clear, lineWidth: 1)
+                .strokeBorder(
+                    isSelected ? Color.troveAccent.opacity(0.6) :
+                    (hover ? Color.accentColor.opacity(0.45) : .clear),
+                    lineWidth: isSelected ? 1.5 : 1
+                )
         )
         .contentShape(Rectangle())
         .onHover { hover = $0 }
@@ -547,7 +894,9 @@ private struct SnippetsEmpty: View {
             Image(systemName: "doc.text.below.ecg")
                 .font(.system(size: 60, weight: .light))
                 .foregroundStyle(.tertiary)
-            Text("No snippets yet").font(.title2.weight(.medium))
+            // A11y sweep revert: empty-state title — not a structural
+            // heading, shouldn't appear in the VoiceOver heading rotor.
+            Text("No snippets yet").font(.headline)
             Text("Save email signatures, prompt scaffolds, and boilerplate once. Click any saved snippet to copy it instantly, or send it to Stage.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -588,6 +937,7 @@ private struct SnippetEditorSheet: View {
     @ObservedObject var store: SnippetStore
     let target: SnippetEditorTarget
     let onClose: () -> Void
+    var prefillBody: String? = nil
 
     @EnvironmentObject var stage: Stage
 
@@ -713,7 +1063,7 @@ private struct SnippetEditorSheet: View {
         loaded = true
         switch target {
         case .new:
-            name = ""; draftBody = ""; tagsText = ""
+            name = ""; draftBody = prefillBody ?? ""; tagsText = ""
         case .edit(let id):
             // Red-team #7: snippet may have been deleted between sheet presentation
             // and load. Mark the sheet as orphaned and let the user save a copy.
@@ -796,3 +1146,5 @@ private struct SnippetEditorSheet: View {
         onClose()
     }
 }
+
+

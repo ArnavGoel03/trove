@@ -91,6 +91,21 @@ enum AccountKeychain {
         ]
         return SecItemDelete(q as CFDictionary)
     }
+
+    /// P1 fix: wipe ALL Trove-namespaced Keychain entries (any account).
+    /// Used by `AccountDataManager.deleteAllLocalData()` so a full reset
+    /// actually clears the SIWA identity token even if the user is still
+    /// signed in. Returns `errSecSuccess` if entries were removed, or
+    /// `errSecItemNotFound` if there was nothing to remove (also a success
+    /// outcome from the caller's perspective).
+    @discardableResult
+    static func deleteAll() -> OSStatus {
+        let q: [String: Any] = [
+            kSecClass as String:       kSecClassGenericPassword,
+            kSecAttrService as String: service,
+        ]
+        return SecItemDelete(q as CFDictionary)
+    }
 }
 
 // ===========================================================================
@@ -110,20 +125,20 @@ final class AccountStore: ObservableObject {
     /// only weak-refs its delegate. Stash it here while a request is in flight.
     fileprivate var pendingCoordinator: AccountSIWACoordinator?
 
-    private init() { load() }
+    private init() {
+        // Seed published defaults immediately; load() can block on slow disks.
+        // Defer to a detached task and patch back on MainActor, matching the
+        // pattern used by ProfileSync.init().
+        Task.detached(priority: .utility) { [weak self] in
+            await MainActor.run { self?.load() }
+        }
+    }
 
     // ---- file path -------------------------------------------------------
 
     var fileURL: URL {
-        let fm = FileManager.default
-        let base = (try? fm.url(for: .applicationSupportDirectory,
-                                in: .userDomainMask,
-                                appropriateFor: nil,
-                                create: true))
-            ?? URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support")
-        let dir = base.appendingPathComponent("Trove", isDirectory: true)
-        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("account.json")
+        // Power-user item #8: account.json follows the active TrovePaths dir.
+        TrovePaths.appSupportDir.appendingPathComponent("account.json")
     }
 
     // ---- load / save -----------------------------------------------------
@@ -421,6 +436,11 @@ public struct AccountView: View {
     // that never grows with the ticker.
     @State private var bootMoment: Date = Date()
 
+    // P1: Data Management state
+    @State private var isExporting = false
+    @State private var confirmDeleteAllData = false
+    @State private var exportError: String? = nil
+
     public init() {}
 
     public var body: some View {
@@ -430,6 +450,7 @@ public struct AccountView: View {
                 signInCard
                 identityCard
                 prefsCard
+                dataManagementCard   // P1: new section
                 Spacer(minLength: 8)
             }
             .padding(18)
@@ -438,6 +459,11 @@ public struct AccountView: View {
         .frame(maxWidth: .infinity, alignment: .topLeading)
         .navigationTitle("Account")
         .navigationSubtitle(subtitle)
+        // P0 fix: wire File > Export My Trove Data menu item — was a dead
+        // route. The pane switched but exportData() never ran.
+        .onReceive(NotificationCenter.default.publisher(for: .troveExportAllData)) { _ in
+            exportData()
+        }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
@@ -518,7 +544,7 @@ public struct AccountView: View {
         Card {
             VStack(alignment: .leading, spacing: 12) {
                 Label("Sign in with Apple", systemImage: "applelogo")
-                    .font(.headline)
+                    .headerText()
 
                 if let id = store.identity {
                     HStack(spacing: 10) {
@@ -591,7 +617,7 @@ public struct AccountView: View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
                 Label("System identity", systemImage: "person.crop.rectangle")
-                    .font(.headline)
+                    .headerText()
 
                 let _ = uptimeTicker  // re-eval when ticker fires
                 AccountInfoGrid(rows: [
@@ -615,13 +641,90 @@ public struct AccountView: View {
     // displayed uptime was 2×snapshot-uptime that never advanced. Replaced by
     // `bootMoment` @State above.
 
+    // ---- Data Management (P1) ------------------------------------------
+
+    private var dataManagementCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 10) {
+                Label("Data Management", systemImage: "externaldrive")
+                    .headerText()
+
+                Text("Your Trove data lives in Application Support/Trove on this Mac. Export creates a zip archive you can back up or inspect. Delete removes all local data after confirmation — this cannot be undone.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let err = exportError {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle").foregroundStyle(Color.troveError)
+                        Text(err).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+
+                HStack(spacing: 12) {
+                    // Export my data
+                    Button {
+                        exportData()
+                    } label: {
+                        if isExporting {
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.small)
+                                Text("Exporting…")
+                            }
+                        } else {
+                            Label("Export my data…", systemImage: "square.and.arrow.up")
+                        }
+                    }
+                    .disabled(isExporting)
+
+                    Spacer()
+
+                    // Delete all local data
+                    Button(role: .destructive) {
+                        confirmDeleteAllData = true
+                    } label: {
+                        Label("Delete all local data…", systemImage: "trash")
+                    }
+                    .foregroundStyle(Color.troveError)
+                }
+            }
+        }
+        .alert("Delete all local Trove data?",
+               isPresented: $confirmDeleteAllData) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete Everything", role: .destructive) {
+                AccountDataManager.deleteAllLocalData()
+            }
+        } message: {
+            Text("This permanently removes your Trove Application Support folder (outputs library, account data, scan caches, and settings). Your actual output files in Movies/Trove, Downloads, etc. are NOT deleted. This cannot be undone.")
+        }
+    }
+
+    private func exportData() {
+        isExporting = true
+        exportError = nil
+        Task.detached(priority: .userInitiated) {
+            let result = AccountDataManager.exportData()
+            await MainActor.run {
+                isExporting = false
+                switch result {
+                case .success(let url):
+                    NSWorkspace.shared.activateFileViewerSelecting([url])
+                    SharedStore.stage.flash("Exported Trove data to \(url.lastPathComponent)")
+                case .failure(let err):
+                    exportError = "Export failed: \(err.localizedDescription)"
+                }
+            }
+        }
+    }
+
     // ---- Preferences ---------------------------------------------------
 
     private var prefsCard: some View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
                 Label("Preferences", systemImage: "slider.horizontal.3")
-                    .font(.headline)
+                    .headerText()
 
                 Toggle(isOn: Binding(
                     get: { store.prefs.showFlash },
@@ -695,15 +798,102 @@ private struct AccountAvatarView: View {
                         ))
                     Text(AccountAvatar.initials(name))
                         .font(.system(size: size * 0.38, weight: .semibold, design: .rounded))
-                        .foregroundStyle(.white)
+                        // P2: raw .white → token for initials text
+                        .foregroundStyle(Color.troveBg)
                 }
                 .frame(width: size, height: size)
             }
         }
         .overlay(
-            Circle().strokeBorder(.separator.opacity(0.4), lineWidth: 0.5)
+            Circle().strokeBorder(Color.troveLine.opacity(0.4), lineWidth: 0.5)
         )
-        .shadow(color: .black.opacity(0.08), radius: 4, y: 1)
+        // P2: raw color → token for shadow
+        .shadow(color: Color.troveBg.opacity(0.18), radius: 4, y: 1)
+    }
+}
+
+// ===========================================================================
+// MARK: - P1: AccountDataManager (export + delete local data)
+// ===========================================================================
+
+private enum AccountDataManager {
+
+    /// The Trove data directory — the historical
+    /// `~/Library/Application Support/Trove` unless the user has opted
+    /// into an XDG location via TrovePaths.
+    private static var appSupportDir: URL { TrovePaths.appSupportDir }
+
+    /// Zips ~/Library/Application Support/Trove to a timestamped file in the
+    /// user's Downloads folder. Returns the destination URL on success.
+    /// Runs off-main (caller must dispatch).
+    static func exportData() -> Result<URL, Error> {
+        let src = appSupportDir
+        guard FileManager.default.fileExists(atPath: src.path) else {
+            return .failure(NSError(domain: "AccountDataManager", code: 1,
+                                    userInfo: [NSLocalizedDescriptionKey: "No Trove data found at \(src.path)"]))
+        }
+
+        let fm = FileManager.default
+        let downloads = fm.urls(for: .downloadsDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory() + "/Downloads")
+
+        let ts = DateFormatter.localizedString(from: Date(), dateStyle: .short, timeStyle: .short)
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+            .replacingOccurrences(of: " ", with: "_")
+        let destName = "TroveData-\(ts).zip"
+        let dest = downloads.appendingPathComponent(destName)
+
+        // Use ditto -ck (create zip from folder) — handles macOS extended attrs.
+        let (_, code) = runShell(
+            "/usr/bin/ditto",
+            ["-ck", "--keepParent", src.path, dest.path],
+            timeout: 120
+        )
+        if code == 0 {
+            return .success(dest)
+        } else {
+            return .failure(NSError(domain: "AccountDataManager", code: Int(code),
+                                    userInfo: [NSLocalizedDescriptionKey: "ditto exited with code \(code)"]))
+        }
+    }
+
+    /// Move ~/Library/Application Support/Trove to Trash (recoverable) AND wipe
+    /// the UserDefaults domain AND clear the Keychain identity token. Previously
+    /// this only trashed App Support, leaving ~70 preference keys (keepAwake,
+    /// recorder codec, snip mode, alttab config, hotkeys, theme, …) silently
+    /// persisting through what the confirmation alert calls a full reset.
+    /// Caller must have shown a confirmation dialog.
+    /// Must be called on @MainActor (button action or .task).
+    @MainActor
+    static func deleteAllLocalData() {
+        let dir = appSupportDir
+        var summary: [String] = []
+        // 1) App Support → Trash (recoverable).
+        if FileManager.default.fileExists(atPath: dir.path) {
+            do {
+                var trashed: NSURL?
+                try FileManager.default.trashItem(at: dir, resultingItemURL: &trashed)
+                summary.append("data moved to Trash")
+            } catch {
+                SharedStore.stage.flash("Delete failed: \(error.localizedDescription)",
+                                        kind: .error)
+                return
+            }
+        }
+        // 2) Wipe the entire UserDefaults bundle domain. Wipes accent, theme,
+        //    hotkeys, every per-pane @AppStorage and direct UserDefaults key —
+        //    all the things the confirmation alert says will be removed.
+        if let bid = Bundle.main.bundleIdentifier {
+            UserDefaults.standard.removePersistentDomain(forName: bid)
+            UserDefaults.standard.synchronize()
+            summary.append("preferences cleared")
+        }
+        // 3) Clear the Keychain identity token (SIWA). signOut() would do this
+        //    too but only if the user is signed in; here we do it unconditionally.
+        AccountKeychain.deleteAll()
+        summary.append("identity token cleared")
+        SharedStore.stage.flash("Trove " + summary.joined(separator: ", "))
     }
 }
 

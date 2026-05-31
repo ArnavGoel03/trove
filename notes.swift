@@ -16,6 +16,7 @@ import SwiftUI
 import AppKit
 import Foundation
 import Combine
+import UniformTypeIdentifiers
 
 // ===========================================================================
 // MARK: - Tab color model
@@ -59,6 +60,7 @@ struct NoteTab: Codable, Identifiable, Equatable {
 struct NotePersisted: Codable {
     var tabs: [NoteTab]
     var version: Int = 1
+    static let currentVersion: Int = 1
 }
 
 // ===========================================================================
@@ -76,14 +78,19 @@ final class NoteStore: ObservableObject {
     /// Background-computed (word, char) per tab. Stays in sync with `tabs`.
     /// Updated off-main for large notes so typing latency never spikes.
     @Published var counts: [NoteColor: (words: Int, chars: Int)] = [:]
+    @Published var oversized: Set<NoteColor> = []
 
-    private static let appSupportDir: URL = {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory,
-                                             in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support")
-        return base.appendingPathComponent("Trove", isDirectory: true)
-    }()
+    // P1: cached rendered blocks per tab. `NoteMarkdown.render()` is O(n)
+    // and was previously called synchronously inside `NotePreviewPane.body`
+    // on every render frame. Now updated off-main on a throttled schedule and
+    // published back via @Published so the preview pane just reads the cache.
+    @Published var renderedBlocks: [NoteColor: [NoteRenderedBlock]] = [:]
+    private var renderWork: DispatchWorkItem?
+    private let renderQueue = DispatchQueue(label: "trove.notes.render", qos: .userInitiated)
+
+    // Power-user item #8: route through TrovePaths so notes follow the
+    // user's XDG opt-in alongside snippets / history / recipes.
+    private static var appSupportDir: URL { TrovePaths.appSupportDir }
     private static let storeURL = appSupportDir.appendingPathComponent("notes.json")
 
     /// Serial queue so two debounced writes can't interleave (red-team #3).
@@ -104,43 +111,18 @@ final class NoteStore: ObservableObject {
     private var terminateObserver: NSObjectProtocol?
 
     init() {
-        // Ensure all five tabs exist; rehydrate from disk if present.
-        var loaded: [NoteTab] = NoteColor.allCases.map(NoteTab.empty)
-        var recoveryMessage: String? = nil
-
-        try? FileManager.default.createDirectory(at: Self.appSupportDir,
-                                                 withIntermediateDirectories: true)
-
-        if FileManager.default.fileExists(atPath: Self.storeURL.path) {
-            do {
-                guard let data = boundedRead(Self.storeURL) else { throw CocoaError(.fileReadNoSuchFile) }
-                let decoded = try JSONDecoder().decode(NotePersisted.self, from: data)
-                // Replace defaults with any colors we recognize from disk.
-                for t in decoded.tabs {
-                    if let i = loaded.firstIndex(where: { $0.color == t.color }) {
-                        loaded[i] = t
-                    }
-                }
-            } catch {
-                // Red-team #2: corrupt JSON — rename so next save can't clobber it.
-                let ts = Int(Date().timeIntervalSince1970)
-                let corruptURL = Self.appSupportDir
-                    .appendingPathComponent("notes-corrupt-\(ts).json")
-                try? FileManager.default.moveItem(at: Self.storeURL, to: corruptURL)
-                recoveryMessage = "Notes file unreadable — backed up to \(corruptURL.lastPathComponent)"
-            }
-        }
-        self.tabs = loaded
-
-        // Initial count pass synchronously (small/empty at boot).
-        for t in tabs { counts[t.color] = Self.cheapCount(t.body) }
-
-        if let msg = recoveryMessage {
-            // Wait until app is up so the flash isn't lost during launch.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                SharedStore.stage.flash(msg)
-            }
-        }
+        // P1 fix (DEVELOP_RULES §1): seed @Published with the empty 5-color set
+        // SYNCHRONOUSLY so SwiftUI has a complete value to render with — but
+        // do NOT touch disk on the main thread during init. boundedRead can
+        // pull up to 16 MB and JSONDecoder.decode on a multi-MB note file
+        // pushed @StateObject construction past the AttributeGraph 50 ms
+        // watchdog on slow / cold storage, matching the pattern that triggered
+        // the AccountView SIGTRAP crash loop. Rehydration is now a Task.detached
+        // that publishes a full replacement payload back on @MainActor.
+        let seeded = NoteColor.allCases.map(NoteTab.empty)
+        self.tabs = seeded
+        for t in seeded { counts[t.color] = Self.cheapCount(t.body) }
+        for t in seeded { renderedBlocks[t.color] = NoteMarkdown.render(t.body) }
 
         // red-team: force-flush within the 200ms debounce window on quit.
         // Block observer registered AFTER stored properties are initialized so
@@ -150,6 +132,62 @@ final class NoteStore: ObservableObject {
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.flushSynchronously()
+            }
+        }
+
+        // Async-rehydrate the persisted store off-main. Builds a complete
+        // replacement (tabs + counts + rendered blocks) in one shot so the
+        // view only sees one publish transition rather than three.
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            try? FileManager.default.createDirectory(at: Self.appSupportDir,
+                                                     withIntermediateDirectories: true)
+            var loaded = seeded
+            var recoveryMessage: String? = nil
+            if FileManager.default.fileExists(atPath: Self.storeURL.path) {
+                do {
+                    guard let data = boundedRead(Self.storeURL) else { throw CocoaError(.fileReadNoSuchFile) }
+                    let decoded = try JSONDecoder().decode(NotePersisted.self, from: data)
+                    guard decoded.version <= NotePersisted.currentVersion else {
+                        let ts = Int(Date().timeIntervalSince1970)
+                        let futureURL = Self.appSupportDir
+                            .appendingPathComponent("notes-future-\(ts).json")
+                        try? FileManager.default.moveItem(at: Self.storeURL, to: futureURL)
+                        recoveryMessage = "Notes file was written by a newer version of Trove — backed up to \(futureURL.lastPathComponent)"
+                        throw CocoaError(.fileReadCorruptFile)
+                    }
+                    for t in decoded.tabs {
+                        if let i = loaded.firstIndex(where: { $0.color == t.color }) {
+                            loaded[i] = t
+                        }
+                    }
+                } catch {
+                    let ts = Int(Date().timeIntervalSince1970)
+                    let corruptURL = Self.appSupportDir
+                        .appendingPathComponent("notes-corrupt-\(ts).json")
+                    try? FileManager.default.moveItem(at: Self.storeURL, to: corruptURL)
+                    recoveryMessage = "Notes file unreadable — backed up to \(corruptURL.lastPathComponent)"
+                }
+            }
+            // Skip the patch if nothing changed (empty seed = empty load).
+            // The expensive render+count pass only runs when we actually have
+            // content to display.
+            let same = zip(loaded, seeded).allSatisfy { $0.body == $1.body }
+            if same && recoveryMessage == nil { return }
+
+            var newCounts: [NoteColor: (Int, Int)] = [:]
+            var newBlocks: [NoteColor: [NoteRenderedBlock]] = [:]
+            for t in loaded {
+                newCounts[t.color] = Self.cheapCount(t.body)
+                newBlocks[t.color] = NoteMarkdown.render(t.body)
+            }
+            await MainActor.run {
+                self.tabs = loaded
+                self.counts = newCounts
+                self.renderedBlocks = newBlocks
+                if let msg = recoveryMessage {
+                    SharedStore.stage.flash(msg)
+                }
             }
         }
     }
@@ -165,14 +203,34 @@ final class NoteStore: ObservableObject {
 
     // MARK: - Mutation entrypoints
 
+    // Fix 1: per-tab body size limits to prevent 50 MB note → quarantine → all-tabs-wiped.
+    static let warnBytes: Int = 4 * 1024 * 1024   // 4 MB — warn but allow
+    static let refuseBytes: Int = 10 * 1024 * 1024 // 10 MB — reject update
+
     /// Single source of truth for body edits. Updates state, schedules a
     /// debounced disk write, and throttles the word/char recount.
     func setBody(_ color: NoteColor, _ newValue: String) {
+        let byteCount = newValue.utf8.count
+        if byteCount > Self.refuseBytes {
+            SharedStore.stage.flash("Note too large (\(byteCount / 1_048_576) MB) — update rejected to protect your data.", kind: .warning)
+            return
+        }
         guard let i = tabs.firstIndex(where: { $0.color == color }) else { return }
         guard tabs[i].body != newValue else { return }
+        if byteCount > Self.warnBytes && tabs[i].body.utf8.count <= Self.warnBytes {
+            // Flash once when crossing the warn threshold (not on every keystroke).
+            SharedStore.stage.flash("Note is over 4 MB — consider splitting it into smaller notes.", kind: .warning)
+        }
         tabs[i].body = newValue
+        if byteCount > Self.warnBytes {
+            oversized.insert(color)
+        } else {
+            oversized.remove(color)
+        }
         scheduleSave()
         scheduleCount(color, newValue)
+        // P1: schedule off-main render update so preview pane reads the cache.
+        scheduleRender(color, newValue)
     }
 
     func setTitle(_ color: NoteColor, _ newValue: String) {
@@ -198,6 +256,119 @@ final class NoteStore: ObservableObject {
         }
         SharedStore.stage.addText(cur.body)
         SharedStore.stage.flash("Sent “\(cur.title)” note to Stage")
+    }
+
+    // MARK: - Find / Replace
+
+    /// Replace the next occurrence of `query` in `color`'s tab with `replacement`.
+    /// Returns true if a replacement was made.
+    @discardableResult
+    func replaceNext(query: String, with replacement: String, in color: NoteColor) -> Bool {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return false }
+        let opts: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+        guard let i = tabs.firstIndex(where: { $0.color == color }) else { return false }
+        let body = tabs[i].body
+        guard let r = body.range(of: q, options: opts) else { return false }
+        var newBody = body
+        newBody.replaceSubrange(r, with: replacement)
+        setBody(color, newBody)
+        return true
+    }
+
+    /// Replace all occurrences of `query` in `color`'s tab with `replacement`.
+    /// Applies replacements in reverse-index order to preserve indices.
+    func replaceAll(query: String, with replacement: String, in color: NoteColor) {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return }
+        let opts: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+        guard let i = tabs.firstIndex(where: { $0.color == color }) else { return }
+        var body = tabs[i].body
+        var ranges: [Range<String.Index>] = []
+        var cursor = body.startIndex
+        while let r = body.range(of: q, options: opts, range: cursor..<body.endIndex) {
+            ranges.append(r)
+            cursor = r.upperBound == r.lowerBound
+                ? body.index(after: r.upperBound)
+                : r.upperBound
+            if cursor > body.endIndex { break }
+        }
+        guard !ranges.isEmpty else { return }
+        for r in ranges.reversed() {
+            body.replaceSubrange(r, with: replacement)
+        }
+        setBody(color, body)
+        SharedStore.stage.flash("Replaced \(ranges.count) occurrence\(ranges.count == 1 ? "" : "s")")
+    }
+
+    // MARK: - Export
+
+    func exportCurrentTab() {
+        let cur = tab(selected)
+        let panel = NSSavePanel()
+        panel.title = "Export \"\(cur.title)\""
+        panel.nameFieldStringValue = cur.title
+        // P1: offer both .md and plain text export.
+        let mdType = UTType(filenameExtension: "md") ?? .plainText
+        panel.allowedContentTypes = [mdType, .plainText]
+        panel.canCreateDirectories = true
+        panel.begin { [weak self] resp in
+            guard resp == .OK, let url = panel.url, let self else { return }
+            let body = self.tab(self.selected).body
+            do {
+                try body.write(to: url, atomically: true, encoding: .utf8)
+                SharedStore.stage.flash("Exported \"\(cur.title)\" to \(url.lastPathComponent)")
+            } catch {
+                SharedStore.stage.flash("Export failed: \(error.localizedDescription)", kind: .warning)
+            }
+        }
+    }
+
+    /// P1: Copy current tab body to clipboard.
+    func copyCurrentTabToClipboard() {
+        let body = tab(selected).body
+        guard !body.isEmpty else {
+            SharedStore.stage.flash("Note is empty — nothing to copy")
+            return
+        }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(body, forType: .string)
+        NotificationCenter.default.post(name: .troveDidWritePasteboard, object: nil)
+        SharedStore.stage.flash("Copied \"\(tab(selected).title)\" to clipboard")
+    }
+
+    /// P1: Export all tabs to a single folder or as individual files.
+    func exportAllTabs() {
+        let panel = NSOpenPanel()
+        panel.title = "Export All Notes — choose a folder"
+        panel.prompt = "Export Here"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.begin { [weak self] resp in
+            guard resp == .OK, let dir = panel.url, let self else { return }
+            var saved = 0
+            var failed = 0
+            for t in self.tabs {
+                guard !t.body.isEmpty else { continue }
+                let filename = t.title.isEmpty ? t.color.rawValue : t.title
+                let safeFilename = filename
+                    .components(separatedBy: CharacterSet(charactersIn: "/\\:*?\"<>|"))
+                    .joined(separator: "_")
+                let fileURL = dir.appendingPathComponent("\(safeFilename).md")
+                do {
+                    try t.body.write(to: fileURL, atomically: true, encoding: .utf8)
+                    saved += 1
+                } catch {
+                    failed += 1
+                }
+            }
+            let msg = failed == 0
+                ? "Exported \(saved) note\(saved == 1 ? "" : "s") to \(dir.lastPathComponent)"
+                : "Exported \(saved), \(failed) failed"
+            SharedStore.stage.flash(msg)
+        }
     }
 
     // MARK: - Save scheduling (debounced, atomic, off-main)
@@ -264,7 +435,7 @@ final class NoteStore: ObservableObject {
     // MARK: - Word / char counting (throttled for huge bodies)
 
     /// Cheap counter used on small bodies and at boot.
-    private static func cheapCount(_ s: String) -> (Int, Int) {
+    nonisolated private static func cheapCount(_ s: String) -> (Int, Int) {
         // red-team: `String.count` walks the entire string to compose grapheme
         // clusters — O(n) over the body, on the main thread for any body
         // ≤100KB. For a 90KB markdown note that's a multi-ms hitch on every
@@ -308,6 +479,22 @@ final class NoteStore: ObservableObject {
                                                        execute: work)
     }
 
+    // P1: Off-main render schedule. Throttled at 150ms so rapid typing doesn't
+    // saturate the render queue. The preview pane reads renderedBlocks (cached)
+    // instead of calling NoteMarkdown.render() synchronously in .body.
+    private func scheduleRender(_ color: NoteColor, _ body: String) {
+        renderWork?.cancel()
+        let snap = body
+        let work = DispatchWorkItem { [weak self] in
+            let blocks = NoteMarkdown.render(snap)
+            DispatchQueue.main.async {
+                self?.renderedBlocks[color] = blocks
+            }
+        }
+        renderWork = work
+        renderQueue.asyncAfter(deadline: .now() + 0.15, execute: work)
+    }
+
     // MARK: - Cross-tab search
 
     struct SearchHit: Identifiable, Hashable {
@@ -323,12 +510,22 @@ final class NoteStore: ObservableObject {
     func search(_ query: String) -> [SearchHit] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard q.count >= 1 else { return [] }
+        let opts: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
         var out: [SearchHit] = []
         for t in tabs {
             let lines = t.body.split(separator: "\n", omittingEmptySubsequences: false)
             for (i, lineSub) in lines.enumerated() {
                 let line = String(lineSub)
-                if let r = line.range(of: q, options: .caseInsensitive) {
+                var cursor = line.startIndex
+                var firstRange: Range<String.Index>? = nil
+                while let r = line.range(of: q, options: opts, range: cursor..<line.endIndex) {
+                    if firstRange == nil { firstRange = r }
+                    cursor = r.upperBound == r.lowerBound
+                        ? line.index(after: r.upperBound)
+                        : r.upperBound
+                    if cursor > line.endIndex { break }
+                }
+                if let r = firstRange {
                     out.append(SearchHit(color: t.color,
                                          tabTitle: t.title,
                                          lineNumber: i + 1,
@@ -507,6 +704,7 @@ public struct NotesView: View {
                     title: store.tab(c).title,
                     isSelected: store.selected == c,
                     isRenaming: renaming == c,
+                    isOversized: store.oversized.contains(c),
                     renameText: $renameText,
                     onSelect: { store.selected = c },
                     onBeginRename: {
@@ -539,6 +737,17 @@ public struct NotesView: View {
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
                 .id(store.selected) // ensure cursor doesn't survive a tab switch incorrectly
+                .contextMenu {
+                    if AIBridge.shared.hasInstalledTarget() {
+                        Menu("Send to AI") {
+                            Button("Rewrite clearer")      { AIBridge.shared.send(store.tab(store.selected).body, kind: .rephrase) }
+                            Button("Translate to English") { AIBridge.shared.send(store.tab(store.selected).body, kind: .translate) }
+                            Button("Summarize")            { AIBridge.shared.send(store.tab(store.selected).body, kind: .summarize) }
+                            Divider()
+                            Button("Send raw")             { AIBridge.shared.send(store.tab(store.selected).body, kind: .paste) }
+                        }
+                    }
+                }
 
             if store.tab(store.selected).body.isEmpty {
                 Text(emptyHint)
@@ -578,8 +787,8 @@ public struct NotesView: View {
                 }
                 .labelStyle(.iconOnly)
                 .keyboardShortcut(KeyEquivalent(Character("\(idx + 1)")),
-                                  modifiers: .command)
-                .help("Switch to \(c.defaultTitle) (⌘\(idx + 1))")
+                                  modifiers: [.command, .option])
+                .help("Switch to \(c.defaultTitle) (⌘⌥\(idx + 1))")
                 .opacity(0)
                 .frame(width: 0, height: 0)
             }
@@ -591,6 +800,30 @@ public struct NotesView: View {
             }
             .help("Stage this note as a text item")
             .keyboardShortcut(.return, modifiers: [.command, .shift])
+
+            // P1: Copy current tab to clipboard.
+            Button {
+                store.copyCurrentTabToClipboard()
+            } label: {
+                Label("Copy Note", systemImage: "doc.on.doc")
+            }
+            .help("Copy this note to clipboard (⌘C shortcut handled by TextEditor)")
+
+            Button {
+                store.exportCurrentTab()
+            } label: {
+                Label("Export", systemImage: "arrow.down.doc")
+            }
+            .help("Export note as .md/.txt (⌘E)")
+            .keyboardShortcut("e", modifiers: .command)
+
+            // P1: Export all tabs at once.
+            Button {
+                store.exportAllTabs()
+            } label: {
+                Label("Export All", systemImage: "arrow.down.doc.fill")
+            }
+            .help("Export all tabs as .md files to a folder")
 
             Toggle(isOn: $store.showPreview) {
                 Label("Preview", systemImage: "doc.richtext")
@@ -627,6 +860,7 @@ private struct NoteTabChip: View {
     let title: String
     let isSelected: Bool
     let isRenaming: Bool
+    let isOversized: Bool
     @Binding var renameText: String
     let onSelect: () -> Void
     let onBeginRename: () -> Void
@@ -641,12 +875,22 @@ private struct NoteTabChip: View {
                 .fill(color.swiftUI)
                 .frame(width: 11, height: 11)
                 .overlay(
-                    Circle().strokeBorder(.white.opacity(0.35), lineWidth: 0.5)
+                    // P1: use troveCardStroke token instead of raw .white.opacity.
+                    Circle().strokeBorder(Color.troveCardStroke.opacity(0.35), lineWidth: 0.5)
                 )
+                .overlay(alignment: .topTrailing) {
+                    if isOversized {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 7, weight: .bold))
+                            .foregroundStyle(Color.orange.opacity(0.85))
+                            .offset(x: 5, y: -4)
+                    }
+                }
             if isRenaming {
-                TextField("", text: $renameText, onCommit: onCommitRename)
+                TextField("", text: $renameText)
                     .textFieldStyle(.plain)
                     .frame(minWidth: 60, maxWidth: 120)
+                    .onSubmit { onCommitRename() }
                     .onExitCommand(perform: onCancelRename)
             } else {
                 Text(title)
@@ -686,35 +930,66 @@ private struct NoteTabChip: View {
 private struct NoteSearchOverlay: View {
     @ObservedObject var store: NoteStore
     @FocusState private var focused: Bool
+    // P0: Reduce Transparency — solid fallback instead of .opacity().
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     // Fix 14: hits moved to @State, populated asynchronously with 80ms debounce
     // so the synchronous store.search() is not called on every body re-render.
     @State private var hits: [NoteStore.SearchHit] = []
     @State private var debounceTask: Task<Void, Never>? = nil
+    @State private var replaceQuery: String = ""
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("Search all notes", text: $store.searchQuery)
-                    .textFieldStyle(.plain)
-                    .focused($focused)
-                    .onSubmit { focused = false }
-                if !store.searchQuery.isEmpty {
-                    Button { store.searchQuery = "" } label: {
-                        Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+            VStack(spacing: 0) {
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    TextField("Search all notes", text: $store.searchQuery)
+                        .textFieldStyle(.plain)
+                        .focused($focused)
+                        .onSubmit { focused = false }
+                    if !store.searchQuery.isEmpty {
+                        Button { store.searchQuery = "" } label: {
+                            Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Clear search")
                     }
-                    .buttonStyle(.plain)
+                    Button {
+                        store.searchActive = false
+                        store.searchQuery = ""
+                        replaceQuery = ""
+                    } label: { Text("Done").font(.callout) }
+                    .buttonStyle(.borderless)
+                    .keyboardShortcut(.escape, modifiers: [])
                 }
-                Button {
-                    store.searchActive = false
-                    store.searchQuery = ""
-                } label: { Text("Done").font(.callout) }
-                .buttonStyle(.borderless)
-                .keyboardShortcut(.escape, modifiers: [])
+                .padding(.horizontal, 14).padding(.vertical, 8)
+
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.2.squarepath").foregroundStyle(.secondary)
+                    TextField("Replace", text: $replaceQuery)
+                        .textFieldStyle(.plain)
+                    Button("Replace") {
+                        store.replaceNext(query: store.searchQuery,
+                                          with: replaceQuery,
+                                          in: store.selected)
+                        hits = store.search(store.searchQuery)
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(store.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button("Replace All") {
+                        store.replaceAll(query: store.searchQuery,
+                                         with: replaceQuery,
+                                         in: store.selected)
+                        hits = store.search(store.searchQuery)
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(store.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                .padding(.horizontal, 14).padding(.vertical, 6)
             }
-            .padding(.horizontal, 14).padding(.vertical, 8)
-            .background(.background.secondary)
-            .onChange(of: store.searchQuery) { _, newValue in
+            // P0: honor Reduce Transparency — use solid token instead of .opacity().
+            .background(reduceTransparency ? Color.troveBgElev : Color.troveBgElev.opacity(0.8))
+            .onChange(of: store.searchQuery) { newValue in
                 debounceTask?.cancel()
                 debounceTask = Task { @MainActor in
                     try? await Task.sleep(nanoseconds: 80_000_000) // 80ms
@@ -729,8 +1004,9 @@ private struct NoteSearchOverlay: View {
                         Image(systemName: "magnifyingglass")
                             .font(.system(size: 28, weight: .light))
                             .foregroundStyle(.tertiary)
+                        // A11y sweep revert: empty-state title isn't a heading.
                         Text("No matches for \"\(store.searchQuery)\"")
-                            .headerText()
+                            .font(.headline)
                         Text("Searched the body and title of all five tabs. Try a different word, or clear the search.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
@@ -807,7 +1083,10 @@ private struct NotePreviewPane: View {
 
     var body: some View {
         let tab = store.tab(store.selected)
-        let blocks = NoteMarkdown.render(tab.body)
+        // P1: use cached rendered blocks from store to avoid synchronous
+        // O(n) render on every SwiftUI frame. Falls back to a live render
+        // only if the cache hasn't been populated yet (e.g. first load).
+        let blocks = store.renderedBlocks[store.selected] ?? NoteMarkdown.render(tab.body)
         return ScrollView {
             VStack(alignment: .leading, spacing: 4) {
                 if tab.body.isEmpty {
@@ -892,8 +1171,10 @@ private struct NotePreviewPane: View {
         guard existing == " " || existing == "x" || existing == "X" else { return }
 
         // Map back to absolute body index.
-        let absoluteIndex = body.index(lineRange.lowerBound, offsetBy: slotOffsetInLine)
-        guard absoluteIndex < body.endIndex else { return }
+        guard let absoluteIndex = body.index(lineRange.lowerBound,
+                                             offsetBy: slotOffsetInLine,
+                                             limitedBy: body.endIndex),
+              absoluteIndex < body.endIndex else { return }
 
         let replacement: Character = newChecked ? "x" : " "
         var newBody = body
