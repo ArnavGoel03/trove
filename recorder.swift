@@ -668,6 +668,21 @@ final class RecEngine: NSObject, ObservableObject {
     /// saturated at ±1.0; cleared per-tick by the HUD ticker.
     @Published var micClipping: Bool = false
 
+    /// Power-user item #18 — voice-activity auto-pause. Set by RecorderView
+    /// before start(). The mic delegate watches the rolling RMS and calls
+    /// pause()/resume() when audio drops below or rises above the threshold
+    /// for sustained periods. Cheap — one float compare per buffer.
+    var autoPauseEnabled: Bool = false
+    var autoPauseThresholdDB: Float = -45.0
+    var autoPauseSilenceSecs: Double = 2.5
+    private var silenceAccumSecs: Double = 0
+    private var lastSilenceTick: ContinuousClock.Instant?
+    /// Power-user item #14 — auto-trim leading + trailing silence at
+    /// finalize. Performed off-main after AVAssetWriter completes; we
+    /// re-encode the trimmed range via AVAssetExportSession and atomically
+    /// replace the original file.
+    var autoTrimSilenceEnabled: Bool = false
+
     /// Power-user item #1 — webcam PIP. When true, the engine starts a
     /// parallel RecWebcamCapture alongside the screen recording. The
     /// camera lands in `<stem>.webcam.mov`. Compositing into a single
@@ -1242,6 +1257,17 @@ final class RecEngine: NSObject, ObservableObject {
                             .appendingPathComponent("\(stem)-\(UUID().uuidString.prefix(4)).\(ext)")
                     }
                     try FileManager.default.moveItem(at: tmp, to: dest)
+                    // Power-user item #14 — auto-trim leading + trailing
+                    // silence. Performed off-main; if it succeeds we
+                    // replace `dest` in-place, otherwise the original
+                    // recording survives.
+                    if self.autoTrimSilenceEnabled, self.captureMic {
+                        if let trimmed = await RecSilenceTrim.run(
+                            input: dest, thresholdDB: -45.0) {
+                            try? FileManager.default.removeItem(at: dest)
+                            try? FileManager.default.moveItem(at: trimmed, to: dest)
+                        }
+                    }
                     self.lastOutputURL = dest
                     OutputsLibrary.shared.record(
                         url: dest,
@@ -1596,7 +1622,32 @@ extension RecEngine: AVCaptureAudioDataOutputSampleBufferDelegate {
             if mIn.append(bufferToAppend) {
                 self.lastMicPTS = pts
             }
-            self.micAudioLevel = max(self.micAudioLevel, RecAudioLevel.estimate(bufferToAppend))
+            let lvl = RecAudioLevel.estimate(bufferToAppend)
+            self.micAudioLevel = max(self.micAudioLevel, lvl)
+            // Power-user item #18 — voice activity auto-pause. We watch a
+            // dBFS-converted level; below threshold accumulates silence
+            // wall time. Past `autoPauseSilenceSecs` of continuous
+            // silence we pause; the first voice tick above threshold
+            // resumes. Cheap (one log + accumulate per buffer).
+            if self.autoPauseEnabled {
+                let now = ContinuousClock.now
+                if let last = self.lastSilenceTick {
+                    let dt = (now - last).timeInterval
+                    let dBFS: Float = lvl > 0.0001 ? 20 * log10f(lvl) : -120
+                    if dBFS < self.autoPauseThresholdDB {
+                        self.silenceAccumSecs += dt
+                        if self.silenceAccumSecs >= self.autoPauseSilenceSecs && !self.isPaused {
+                            self.pause()
+                        }
+                    } else {
+                        self.silenceAccumSecs = 0
+                        if self.isPaused {
+                            self.resume()
+                        }
+                    }
+                }
+                self.lastSilenceTick = now
+            }
         }
     }
 }
@@ -1834,6 +1885,12 @@ final class RecViewModel: ObservableObject {
     @AppStorage("rec.keystrokeOverlay")     var keystrokeOverlay: Bool = false
     // Power-user item #12 — software mic gain (0.0…3.0; 1.0 = unity).
     @AppStorage("rec.micGain")              var micGain: Double = 1.0
+    // Power-user item #18 — auto-pause when no voice detected.
+    @AppStorage("rec.autoPauseOnSilence")   var autoPauseOnSilence: Bool = false
+    @AppStorage("rec.autoPauseThresholdDB") var autoPauseThresholdDB: Double = -45.0
+    @AppStorage("rec.autoPauseSeconds")     var autoPauseSeconds: Double = 2.5
+    // Power-user item #14 — auto-trim silence from start/end at finalize.
+    @AppStorage("rec.autoTrimSilence")      var autoTrimSilence: Bool = false
     // Power-user item #1 — webcam PIP: record webcam alongside screen.
     @AppStorage("rec.webcamPIP")            var webcamPIP: Bool = false
     @AppStorage("rec.webcamCorner")         private var _webcamCorner: String = RecWebcamCorner.bottomTrailing.rawValue
@@ -2186,6 +2243,20 @@ struct RecView: View {
                             set: { vm.menuBarWhileRecording = $0 }
                         ))
                         .help("Display a pulsing record dot in the menu bar while recording — click to stop.")
+                        // Power-user item #18 — voice activity auto-pause.
+                        Toggle("Auto-pause during silence", isOn: Binding(
+                            get: { vm.autoPauseOnSilence },
+                            set: { vm.autoPauseOnSilence = $0 }
+                        ))
+                        .disabled(!vm.microphoneOn)
+                        .help("Pause the recording when no voice is detected for \(Int(vm.autoPauseSeconds))s+. Resumes on the first voice tick. Needs the microphone on; thresholds tunable.")
+                        // Power-user item #14 — auto-trim silence at finalize.
+                        Toggle("Auto-trim silence from start + end", isOn: Binding(
+                            get: { vm.autoTrimSilence },
+                            set: { vm.autoTrimSilence = $0 }
+                        ))
+                        .disabled(!vm.microphoneOn)
+                        .help("After stopping, scan the mic track and trim the leading + trailing silence (padded by 250 ms so the first syllable isn't clipped). Adds ~3-5 s to finalize on a 1 minute clip.")
                         // Power-user item #1 — webcam PIP toggle.
                         Toggle("Record webcam alongside (PIP)", isOn: Binding(
                             get: { vm.webcamPIP },
@@ -2489,6 +2560,10 @@ struct RecView: View {
                 vm.engine.micGain           = Float(vm.micGain)
                 vm.engine.webcamPIPEnabled  = vm.webcamPIP
                 vm.engine.webcamDeviceUID   = vm.selectedMicUID == "" ? nil : nil   // separate webcam UID picker is next batch
+                vm.engine.autoPauseEnabled  = vm.autoPauseOnSilence
+                vm.engine.autoPauseThresholdDB = Float(vm.autoPauseThresholdDB)
+                vm.engine.autoPauseSilenceSecs = vm.autoPauseSeconds
+                vm.engine.autoTrimSilenceEnabled = vm.autoTrimSilence
                 try await vm.engine.start(
                     source: vm.buildSource(),
                     outputFolder: vm.outputFolder,
