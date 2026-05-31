@@ -636,6 +636,67 @@ enum GPUPower {
 }
 
 // ===========================================================================
+// MARK: - Battery temperature (Apple Silicon-compatible, no root)
+// ===========================================================================
+//
+// On Apple Silicon (M1+) macOS 13+ blocks user-mode access to CPU/GPU/SoC
+// die temperatures via the SEP — every IOHIDEventSystemClient reading
+// returns 0.0 °C. Battery temperature, however, stays accessible via the
+// `AppleSmartBattery` IOService for MFi safety reasons (same justification
+// that lets `IOPSCopyPowerSourcesInfo` return battery state without
+// entitlements). It's the one honest real-data temperature reading Trove
+// can show on M-series laptops without shipping a privileged helper.
+
+enum BatteryTemp {
+    /// Returns battery temperature in degrees Celsius, or nil if
+    /// unavailable (Mac mini / Studio / Pro with no battery; macOS build
+    /// that renamed the key; or a transient IOReg lookup failure).
+    ///
+    /// Implementation notes:
+    /// * `AppleSmartBattery` is queried via `IOServiceGetMatchingServices`.
+    /// * The `Temperature` property has lived in macOS battery IOReg
+    ///   nodes for 15+ years; the units convention is "hundredths of
+    ///   degrees Kelvin" on most installs, but a handful of Mac models
+    ///   have historically reported "tenths of degrees Celsius" instead.
+    ///   We detect which by magnitude — battery temp is meaningful only
+    ///   in the 0-60 °C range, so the encoded value always lands in
+    ///   either the 100-600 band (tenths °C) or the 27000-33000 band
+    ///   (hundredths K). Anything outside both is rejected as junk.
+    static func read() -> Double? {
+        let matching = IOServiceMatching("AppleSmartBattery")
+        var iter: io_iterator_t = 0
+        let kr = IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iter)
+        guard kr == KERN_SUCCESS else { return nil }
+        defer { IOObjectRelease(iter) }
+
+        let svc = IOIteratorNext(iter)
+        guard svc != 0 else { return nil }
+        defer { IOObjectRelease(svc) }
+
+        guard let raw = IORegistryEntryCreateCFProperty(
+                svc, "Temperature" as CFString, kCFAllocatorDefault, 0)?
+                .takeRetainedValue() as? Int else {
+            return nil
+        }
+        // Decode by magnitude band — defensive against per-model unit
+        // differences that have shipped over the years.
+        let candidate: Double
+        if raw > 20_000 && raw < 35_000 {        // hundredths of K (most Macs)
+            candidate = Double(raw) / 100.0 - 273.15
+        } else if raw > 100 && raw < 700 {       // tenths of °C (older Intel laptops)
+            candidate = Double(raw) / 10.0
+        } else {
+            return nil                            // implausible — skip
+        }
+        // Sanity check: even a heat-soaked battery rarely exceeds 60 °C,
+        // and a freezing-cold one stays above -10 °C. Reject otherwise so
+        // a junk reading never paints a row green.
+        guard candidate > -10.0 && candidate < 80.0 else { return nil }
+        return candidate
+    }
+}
+
+// ===========================================================================
 // MARK: - Model / refresh loop
 // ===========================================================================
 
@@ -648,6 +709,10 @@ final class GPUMonitorModel: ObservableObject {
     // "unreadable" with "all fans silent at 0 RPM".
     @Published var fanRPMs: [Int]? = nil
     @Published var power: GPUPower.Reading = GPUPower.Reading(onAC: false, batteryPercent: nil, acWatts: nil, raw: "")
+    /// Battery die temperature in °C — accessible without root on Apple
+    /// Silicon, so it's the one real-data sensor row we can guarantee.
+    /// nil on desktops with no battery or when the IOReg lookup misses.
+    @Published var batteryTempC: Double? = nil
     @Published var samples: [GPUSample] = []          // rolling 60s
     @Published var paused: Bool = false
     @Published var interval: TimeInterval = 1.0
@@ -886,6 +951,7 @@ final class GPUMonitorModel: ObservableObject {
             let probed = GPUProbe.snapshot()
             let rpms: [Int]? = GPUSMC.fanRPMs()
             let power = GPUPower.read()
+            let battTemp = BatteryTemp.read()   // Apple-Silicon-friendly real-data sensor
             let thermal = ProcessInfo.processInfo.thermalState
 
             Task { @MainActor [weak self] in
@@ -894,6 +960,7 @@ final class GPUMonitorModel: ObservableObject {
                 self.gpus = probed
                 self.fanRPMs = rpms
                 self.power = power
+                self.batteryTempC = battTemp
                 self.thermal = thermal
                 self.refreshAlertIcon()
 
@@ -1483,6 +1550,17 @@ struct GPUTempCard: View {
         return vals.allSatisfy { abs($0) < 0.5 }
     }
 
+    /// Same color ramp `GPUTempRow.tint(for:)` uses — kept local so the
+    /// battery row doesn't have to reach back into the row helper.
+    private func batteryTempTint(_ c: Double) -> Color {
+        switch c {
+        case ..<35:      return .green
+        case 35..<42:    return .yellow
+        case 42..<48:    return .orange
+        default:         return .red
+        }
+    }
+
     var body: some View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
@@ -1512,14 +1590,35 @@ struct GPUTempCard: View {
                     // services match but their values are blocked by SEP —
                     // every reading lands at exactly 0.0 °C. Showing that
                     // ("Battery 0.0 °C, SoC 0.0 °C, …") makes the pane look
-                    // broken. Tell the truth instead.
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Sensors matched but every reading is 0.0 °C.")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                        Text("Apple Silicon (M1+) blocks user-mode access to die temperatures in macOS 13+. Reliable numbers require `powermetrics` with sudo, or a kernel extension — both intentionally out of scope for Trove. Stats and iStat Menus paper over this with private entitlements; Trove won't.")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
+                    // broken. Show the one sensor we *can* read (battery
+                    // temp via AppleSmartBattery, which is accessible
+                    // without root because MFi safety expects it) and
+                    // honestly explain why the rest are missing.
+                    VStack(alignment: .leading, spacing: 8) {
+                        if let bt = model.batteryTempC {
+                            HStack(spacing: 12) {
+                                Circle().fill(.green).frame(width: 8, height: 8)
+                                Text("Battery")
+                                    .font(.subheadline)
+                                    .frame(width: 90, alignment: .leading)
+                                    .foregroundStyle(.secondary)
+                                Text(model.formatTemp(bt))
+                                    .font(.system(.subheadline, design: .monospaced).weight(.semibold))
+                                    .foregroundStyle(batteryTempTint(bt))
+                                Spacer()
+                                Text("AppleSmartBattery")
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("CPU / GPU / SoC die temperatures unavailable")
+                                .font(.callout.weight(.medium))
+                                .foregroundStyle(.secondary)
+                            Text("Apple Silicon under macOS 13+ blocks user-mode reads of die temperatures via the SEP. Reliable numbers require `powermetrics` running as root (planned for v1.2 via an opt-in privileged helper) or a private entitlement Apple only grants to system apps. Stats and iStat Menus paper over this with private entitlements; Trove won't.")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                        }
                     }
                 } else {
                     ForEach(model.tempChartRows) { row in
