@@ -137,15 +137,8 @@ final class AccountStore: ObservableObject {
     // ---- file path -------------------------------------------------------
 
     var fileURL: URL {
-        let fm = FileManager.default
-        let base = (try? fm.url(for: .applicationSupportDirectory,
-                                in: .userDomainMask,
-                                appropriateFor: nil,
-                                create: true))
-            ?? URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support")
-        let dir = base.appendingPathComponent("Trove", isDirectory: true)
-        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("account.json")
+        // Power-user item #8: account.json follows the active TrovePaths dir.
+        TrovePaths.appSupportDir.appendingPathComponent("account.json")
     }
 
     // ---- load / save -----------------------------------------------------
@@ -825,16 +818,10 @@ private struct AccountAvatarView: View {
 
 private enum AccountDataManager {
 
-    /// Returns the canonical ~/Library/Application Support/Trove directory.
-    private static var appSupportDir: URL {
-        let fm = FileManager.default
-        let base = (try? fm.url(for: .applicationSupportDirectory,
-                                in: .userDomainMask,
-                                appropriateFor: nil,
-                                create: false))
-            ?? URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support")
-        return base.appendingPathComponent("Trove", isDirectory: true)
-    }
+    /// The Trove data directory — the historical
+    /// `~/Library/Application Support/Trove` unless the user has opted
+    /// into an XDG location via TrovePaths.
+    private static var appSupportDir: URL { TrovePaths.appSupportDir }
 
     /// Zips ~/Library/Application Support/Trove to a timestamped file in the
     /// user's Downloads folder. Returns the destination URL on success.

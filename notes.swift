@@ -88,13 +88,9 @@ final class NoteStore: ObservableObject {
     private var renderWork: DispatchWorkItem?
     private let renderQueue = DispatchQueue(label: "trove.notes.render", qos: .userInitiated)
 
-    private static let appSupportDir: URL = {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory,
-                                             in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support")
-        return base.appendingPathComponent("Trove", isDirectory: true)
-    }()
+    // Power-user item #8: route through TrovePaths so notes follow the
+    // user's XDG opt-in alongside snippets / history / recipes.
+    private static var appSupportDir: URL { TrovePaths.appSupportDir }
     private static let storeURL = appSupportDir.appendingPathComponent("notes.json")
 
     /// Serial queue so two debounced writes can't interleave (red-team #3).

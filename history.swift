@@ -51,11 +51,14 @@ private struct ClipEntryCodable: Codable, Identifiable {
     let kind: ClipEntryKindCodable
     let capturedAt: Date
     var pinned: Bool
+    var recurrenceCount: Int
 
-    enum CodingKeys: String, CodingKey { case id, kind, capturedAt, pinned }
+    enum CodingKeys: String, CodingKey { case id, kind, capturedAt, pinned, recurrenceCount }
 
-    init(id: UUID, kind: ClipEntryKindCodable, capturedAt: Date, pinned: Bool) {
-        self.id = id; self.kind = kind; self.capturedAt = capturedAt; self.pinned = pinned
+    init(id: UUID, kind: ClipEntryKindCodable, capturedAt: Date,
+         pinned: Bool, recurrenceCount: Int) {
+        self.id = id; self.kind = kind; self.capturedAt = capturedAt
+        self.pinned = pinned; self.recurrenceCount = recurrenceCount
     }
 
     init(from decoder: Decoder) throws {
@@ -64,6 +67,10 @@ private struct ClipEntryCodable: Codable, Identifiable {
         self.kind       = (try? c.decode(ClipEntryKindCodable.self, forKey: .kind)) ?? .text("")
         self.capturedAt = (try? c.decode(Date.self,   forKey: .capturedAt)) ?? Date()
         self.pinned     = (try? c.decode(Bool.self,   forKey: .pinned))     ?? false
+        // Tolerant: pre-beta.14 history.json had no recurrenceCount; fall
+        // back to 1 so existing entries upgrade without losing their row.
+        self.recurrenceCount =
+            (try? c.decodeIfPresent(Int.self, forKey: .recurrenceCount)) ?? 1
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -71,6 +78,7 @@ private struct ClipEntryCodable: Codable, Identifiable {
         try c.encode(kind, forKey: .kind)
         try c.encode(capturedAt, forKey: .capturedAt)
         try c.encode(pinned, forKey: .pinned)
+        try c.encode(recurrenceCount, forKey: .recurrenceCount)
     }
 }
 
@@ -79,14 +87,23 @@ private struct ClipEntryCodable: Codable, Identifiable {
 struct ClipEntry: Identifiable, Hashable {
     let id: UUID
     let kind: ItemKind
-    let capturedAt: Date
+    var capturedAt: Date
     var pinned: Bool
+    /// Power-user item #2 — how many times this payload has been copied
+    /// since the row was created. Initial copy = 1; subsequent identical
+    /// copies fold back into the original entry, increment this counter,
+    /// refresh `capturedAt`, and float the entry to the top of the list.
+    /// This collapses noisy "10 copies of the same URL while debugging"
+    /// situations into one row with a "×10" badge rather than 10 rows.
+    var recurrenceCount: Int
 
-    init(id: UUID = UUID(), kind: ItemKind, capturedAt: Date = Date(), pinned: Bool = false) {
+    init(id: UUID = UUID(), kind: ItemKind, capturedAt: Date = Date(),
+         pinned: Bool = false, recurrenceCount: Int = 1) {
         self.id = id
         self.kind = kind
         self.capturedAt = capturedAt
         self.pinned = pinned
+        self.recurrenceCount = recurrenceCount
     }
 
     /// Short, single-line summary used in the row UI.
@@ -154,14 +171,60 @@ final class ClipHistory: ObservableObject {
     @Published private(set) var visible: [ClipEntry] = []
     @Published private(set) var pinnedCount: Int = 0
 
+    /// User-facing search mode. `plain` is case-insensitive substring (the
+    /// default + what every other clipboard manager does). `regex` lets a
+    /// power user write `NSRegularExpression` patterns — guarded against
+    /// catastrophic backtracking by `rejectCatastrophicRegex` (the same
+    /// heuristic Text Tools uses) so a hostile or accidental `(a+)+$` pattern
+    /// can't pin the main thread.
+    enum SearchMode: String { case plain, regex }
+
+    private var searchModeRaw: String {
+        UserDefaults.standard.string(forKey: "trove.history.searchMode") ?? "plain"
+    }
+    var searchMode: SearchMode {
+        get { SearchMode(rawValue: searchModeRaw) ?? .plain }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: "trove.history.searchMode")
+            recomputeVisible()
+            objectWillChange.send()
+        }
+    }
+
+    /// Last-error from regex compile/run. Surfaces inline next to the search
+    /// field so a syntactically wrong pattern is visible (rather than just
+    /// returning an empty result set with no explanation).
+    @Published private(set) var regexError: String? = nil
+
     private func recomputeVisible() {
         let q = search.trimmingCharacters(in: .whitespacesAndNewlines)
         if q.isEmpty {
             visible = entries
+            regexError = nil
+        } else if searchMode == .regex {
+            do {
+                // ReDoS guard before compiling — same heuristic as Text Tools.
+                try rejectCatastrophicRegex(q, inputBytes: 1)
+                let re = try NSRegularExpression(pattern: q,
+                                                 options: [.caseInsensitive])
+                visible = entries.filter { entry in
+                    let s = entry.searchHaystack
+                    let range = NSRange(s.startIndex..<s.endIndex, in: s)
+                    return re.firstMatch(in: s, options: [], range: range) != nil
+                }
+                regexError = nil
+            } catch let e as XformError {
+                visible = []
+                regexError = e.errorDescription ?? "pattern rejected"
+            } catch let e as NSError {
+                visible = []
+                regexError = e.localizedDescription
+            }
         } else {
             visible = entries.filter { entry in
                 entry.searchHaystack.localizedCaseInsensitiveContains(q)
             }
+            regexError = nil
         }
         pinnedCount = entries.filter { $0.pinned }.count
     }
@@ -174,13 +237,9 @@ final class ClipHistory: ObservableObject {
 
     // MARK: - Persistence
 
-    private static let appSupportDir: URL = {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory,
-                                             in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support")
-        return base.appendingPathComponent("Trove", isDirectory: true)
-    }()
+    // Power-user item #8: route through TrovePaths so users can opt
+    // their clipboard history into `~/.config/trove/` via XDG.
+    private static var appSupportDir: URL { TrovePaths.appSupportDir }
     private static let storeURL = appSupportDir.appendingPathComponent("clipboard_history.json")
 
     /// Serial queue for disk I/O so multiple rapid saves don't race.
@@ -215,7 +274,8 @@ final class ClipHistory: ObservableObject {
                 return ClipEntryCodable(id: e.id,
                                         kind: ck,
                                         capturedAt: e.capturedAt,
-                                        pinned: e.pinned)
+                                        pinned: e.pinned,
+                                        recurrenceCount: e.recurrenceCount)
             }
             let enc = JSONEncoder()
             enc.dateEncodingStrategy = .iso8601
@@ -262,7 +322,8 @@ final class ClipHistory: ObservableObject {
                 loaded.append(ClipEntry(id: ce.id,
                                         kind: kind,
                                         capturedAt: ce.capturedAt,
-                                        pinned: ce.pinned))
+                                        pinned: ce.pinned,
+                                        recurrenceCount: ce.recurrenceCount))
             }
             return loaded.isEmpty ? nil : loaded
         } catch {
@@ -379,10 +440,29 @@ final class ClipHistory: ObservableObject {
         insert(ClipEntry(kind: kind))
     }
 
-    /// Prepend `entry` (most-recent first), dedup against the most-recent
-    /// non-pinned entry, then evict overflow non-pinned entries.
+    /// Prepend `entry` (most-recent first). Power-user item #2: if any
+    /// existing entry (pinned or not) matches the same payload, fold the
+    /// new copy into it — bump `recurrenceCount`, refresh `capturedAt`,
+    /// and float the entry to position 0 — instead of inserting a fresh
+    /// row. Collapses "copy the same URL 10× while debugging" into one
+    /// row with a "×10" badge.
     private func insert(_ entry: ClipEntry) {
-        if let prev = entries.first(where: { !$0.pinned }), isSamePayload(prev.kind, entry.kind) {
+        // Look back through ALL existing entries, not just the head. The
+        // previous "compare against entries.first" check missed the
+        // common A → B → A pattern, which then accumulated two rows.
+        // Cap the scan at the first 500 entries so a pathologically
+        // large history doesn't slow ingestion (the ring buffer is
+        // already capped well under this — defence in depth).
+        let scanLimit = min(entries.count, 500)
+        for i in 0..<scanLimit where isSamePayload(entries[i].kind, entry.kind) {
+            var existing = entries[i]
+            existing.recurrenceCount &+= 1     // overflow guard, but ×Int.max
+            existing.capturedAt = entry.capturedAt
+            // Remove from current position and reinsert at top so the
+            // refreshed entry floats up, matching user mental model
+            // ("the thing I just copied is at the top").
+            entries.remove(at: i)
+            entries.insert(existing, at: 0)
             return
         }
         entries.insert(entry, at: 0)
@@ -590,7 +670,36 @@ struct HistoryView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .searchable(text: $store.search, prompt: "Search clipboard history")
+        .searchable(text: $store.search,
+                    prompt: store.searchMode == .regex
+                            ? "Search clipboard history (regex)"
+                            : "Search clipboard history")
+        // Power-user item #1: regex toggle + error surface. The chord is ⌘⇧.
+        // (period) — picked because it doesn't clash with the existing ⌘F
+        // (system find) and is the same pattern devs use in many editors.
+        .background(
+            Button("") { store.searchMode = (store.searchMode == .regex ? .plain : .regex) }
+                .keyboardShortcut(".", modifiers: [.command, .shift])
+                .opacity(0).frame(width: 0, height: 0)
+                .accessibilityHidden(true)
+        )
+        .safeAreaInset(edge: .top) {
+            if let err = store.regexError {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(Color.troveWarning)
+                    Text("Regex error: \(err)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                    Button("Plain") { store.searchMode = .plain }
+                        .buttonStyle(.borderless)
+                        .controlSize(.small)
+                }
+                .padding(.horizontal, 12).padding(.vertical, 4)
+                .background(Color.troveBgElev)
+            }
+        }
         .navigationTitle("History")
         .navigationSubtitle(subtitle)
         .toolbar { historyToolbar }
@@ -625,6 +734,19 @@ struct HistoryView: View {
                 }
                 .help("Send all selected items to Stage")
             }
+
+            // Power-user item #1 — regex toggle, visible affordance for the
+            // ⌘⇧. shortcut. Renders the icon in the active accent when on so
+            // the user can spot at a glance that they're in regex mode.
+            Toggle(isOn: Binding(
+                get: { store.searchMode == .regex },
+                set: { store.searchMode = ($0 ? .regex : .plain) }
+            )) {
+                Label("Regex", systemImage: "chevron.left.forwardslash.chevron.right")
+            }
+            .help(store.searchMode == .regex
+                  ? "Regex mode (⌘⇧.) — case-insensitive NSRegularExpression. Catastrophic patterns like (a+)+ are rejected before they hang the UI."
+                  : "Switch search to regex mode (⌘⇧.)")
 
             Toggle(isOn: Binding(get: { store.watching },
                                  set: { store.setWatching($0) })) {
@@ -801,6 +923,21 @@ private struct HistoryRow: View {
                         Image(systemName: "pin.fill")
                             .font(.caption2)
                             .foregroundStyle(.tint)
+                    }
+                    // Power-user item #2 — recurrence badge. Surfaced as a
+                    // soft-tinted capsule rather than a hard color so it
+                    // doesn't compete with the .error / .pinned signals
+                    // already in the row.
+                    if entry.recurrenceCount > 1 {
+                        Text("×\(entry.recurrenceCount)")
+                            .font(.caption2.monospacedDigit().weight(.semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(Color.troveAccent.opacity(0.18),
+                                        in: Capsule())
+                            .foregroundStyle(Color.troveAccent)
+                            .accessibilityLabel("Copied \(entry.recurrenceCount) times")
+                            .help("This payload has been copied \(entry.recurrenceCount) times")
                     }
                 }
                 Text(Self.relFmt.localizedString(for: entry.capturedAt, relativeTo: Date()))

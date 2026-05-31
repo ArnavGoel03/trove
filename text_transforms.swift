@@ -883,6 +883,7 @@ final class XformModel: ObservableObject {
 
     init() {
         loadPipeline()  // P1: restore persisted pipeline on launch
+        loadRecipesFromDisk()  // power-user item #4: saved recipes
     }
 
     func setInput(_ s: String) {
@@ -946,16 +947,106 @@ final class XformModel: ObservableObject {
         return output
     }
 
+    // MARK: - Saved Recipes (power-user item #4)
+    //
+    // A named array of pipelines persisted alongside the active one. Lets the
+    // user keep their favourite chains ("JSON → minify → base64", "SHA-256 →
+    // hex → uppercase") and re-apply them with one click. Differentiates Trove
+    // over Boop / DevUtils / TextSoap permanently — none of them have
+    // pipelines, let alone saved ones.
+
+    struct SavedRecipe: Codable, Identifiable, Hashable {
+        var id: UUID
+        var name: String
+        var steps: [XformStep]
+        var createdAt: Date
+
+        // Tolerant Codable so future schema additions don't silently empty
+        // recipes.json on upgrade.
+        enum CodingKeys: String, CodingKey { case id, name, steps, createdAt }
+        init(id: UUID = UUID(), name: String, steps: [XformStep], createdAt: Date = Date()) {
+            self.id = id; self.name = name; self.steps = steps; self.createdAt = createdAt
+        }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.id        = (try? c.decodeIfPresent(UUID.self,  forKey: .id))   ?? UUID()
+            self.name      = (try? c.decodeIfPresent(String.self,forKey: .name)) ?? "Untitled"
+            self.steps     = (try? c.decodeIfPresent([XformStep].self, forKey: .steps)) ?? []
+            self.createdAt = (try? c.decodeIfPresent(Date.self,  forKey: .createdAt)) ?? Date()
+        }
+    }
+
+    @Published var recipes: [SavedRecipe] = []
+
+    // Power-user item #8: route through TrovePaths so Saved Recipes
+    // follow the user's XDG opt-in.
+    private static var recipesURL: URL {
+        TrovePaths.appSupportDir.appendingPathComponent("recipes.json")
+    }
+
+    /// Save the current pipeline as a new recipe.
+    func saveCurrentAsRecipe(name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard !steps.isEmpty else { return }
+        let r = SavedRecipe(name: trimmed, steps: steps)
+        recipes.append(r)
+        saveRecipesToDisk()
+    }
+
+    /// Load a saved recipe into the current pipeline, replacing whatever's
+    /// there. The active pipeline is auto-persisted to `xform-pipeline.json`
+    /// via the existing `savePipeline()` path; `recomputeSoon()` flows the
+    /// new chain through the off-main runner.
+    func loadRecipe(_ recipe: SavedRecipe) {
+        steps = recipe.steps
+        savePipeline()
+        recomputeSoon()
+    }
+
+    func deleteRecipe(_ recipe: SavedRecipe) {
+        recipes.removeAll { $0.id == recipe.id }
+        saveRecipesToDisk()
+    }
+
+    func renameRecipe(_ recipe: SavedRecipe, to newName: String) {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if let i = recipes.firstIndex(where: { $0.id == recipe.id }) {
+            recipes[i].name = trimmed
+            saveRecipesToDisk()
+        }
+    }
+
+    private func saveRecipesToDisk() {
+        let url = Self.recipesURL
+        guard let data = try? JSONEncoder().encode(recipes) else { return }
+        let tmp = url.deletingLastPathComponent()
+            .appendingPathComponent(".recipes-\(UUID().uuidString.prefix(8)).tmp")
+        do {
+            try data.write(to: tmp, options: .atomic)
+            if FileManager.default.fileExists(atPath: url.path) {
+                _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+            } else {
+                try FileManager.default.moveItem(at: tmp, to: url)
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: tmp)
+        }
+    }
+
+    private func loadRecipesFromDisk() {
+        guard let data = try? Data(contentsOf: Self.recipesURL),
+              let decoded = try? JSONDecoder().decode([SavedRecipe].self, from: data)
+        else { return }
+        recipes = decoded
+    }
+
     // MARK: - Pipeline persistence (P1)
 
-    private static let pipelinePersistenceURL: URL = {
-        let base = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
-            .first ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        let dir = base.appendingPathComponent("Trove", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("xform-pipeline.json")
-    }()
+    private static var pipelinePersistenceURL: URL {
+        TrovePaths.appSupportDir.appendingPathComponent("xform-pipeline.json")
+    }
 
     private func savePipeline() {
         guard let data = try? JSONEncoder().encode(steps) else { return }
@@ -1062,6 +1153,9 @@ public struct XformView: View {
 
     public init() {}
 
+    @State private var showSaveRecipeSheet = false
+    @State private var newRecipeName = ""
+
     public var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
@@ -1075,11 +1169,85 @@ public struct XformView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .navigationTitle("Text Transforms")
         .navigationSubtitle(subtitle)
+        // Power-user item #4 — Recipes toolbar menu. Save the current
+        // chain by name; replay any saved recipe with one click.
+        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                recipesMenu
+            }
+        }
+        .sheet(isPresented: $showSaveRecipeSheet) {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Save chain as recipe").font(.headline)
+                Text("Names the current \(model.steps.count) step\(model.steps.count == 1 ? "" : "s") so you can re-apply this chain with one click later.")
+                    .font(.caption).foregroundStyle(.secondary)
+                TextField("Recipe name (e.g. \"JSON minify + base64\")",
+                          text: $newRecipeName)
+                    .textFieldStyle(.roundedBorder)
+                HStack {
+                    Spacer()
+                    Button("Cancel") { showSaveRecipeSheet = false }
+                        .keyboardShortcut(.escape, modifiers: [])
+                    Button("Save") {
+                        model.saveCurrentAsRecipe(name: newRecipeName)
+                        showSaveRecipeSheet = false
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(newRecipeName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .padding(20)
+            .frame(width: 420)
+        }
         .onAppear {
             ingestSmartXformPayload(StageSmartActionQueue.shared.drain(.troveSmartOpenInXform))
         }
         .onReceive(NotificationCenter.default.publisher(for: .troveSmartOpenInXform)) { n in
             ingestSmartXformPayload(n.userInfo)
+        }
+    }
+
+    // Hoisted out of the toolbar Menu's ViewBuilder so the type-checker can
+    // resolve the body in reasonable time — inline string interpolation
+    // inside a deeply-nested Menu trips the 250 ms expression budget.
+    @ViewBuilder
+    private var recipesMenu: some View {
+        Menu {
+            recipesMenuContent
+        } label: {
+            Label("Recipes", systemImage: "list.star")
+        }
+        .help("Save the current transform chain by name; replay any saved recipe with one click.")
+    }
+
+    @ViewBuilder
+    private var recipesMenuContent: some View {
+        if model.recipes.isEmpty {
+            Text("No saved recipes yet").foregroundStyle(.secondary)
+        } else {
+            Section("Saved recipes") {
+                ForEach(model.recipes) { r in
+                    recipeMenuRow(r)
+                }
+            }
+        }
+        Divider()
+        Button("Save current chain as recipe…") {
+            newRecipeName = ""
+            showSaveRecipeSheet = true
+        }
+        .disabled(model.steps.isEmpty)
+    }
+
+    @ViewBuilder
+    private func recipeMenuRow(_ r: XformModel.SavedRecipe) -> some View {
+        let plural = r.steps.count == 1 ? "" : "s"
+        let label = "\(r.name) · \(r.steps.count) step\(plural)"
+        Menu {
+            Button("Load") { model.loadRecipe(r) }
+            Button("Delete", role: .destructive) { model.deleteRecipe(r) }
+        } label: {
+            Text(label)
         }
     }
 
@@ -1719,6 +1887,53 @@ struct XformChipRow: View {
             model: model,
             targetIndex: index
         ))
+        // Power-user item #1 — copy/send THIS step's result without
+        // having to first click the chip then drive the output card.
+        // Disabled (with explanatory label) when the step is .error or
+        // .skipped so the user understands why it's greyed out.
+        .contextMenu {
+            stepContextMenu
+        }
+    }
+
+    @ViewBuilder
+    private var stepContextMenu: some View {
+        switch outcome {
+        case .ok(let value):
+            Button {
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                pb.setString(value, forType: .string)
+                SharedStore.stage.flash("Copied step \(index + 1) result")
+            } label: { Label("Copy step \(index + 1) result", systemImage: "doc.on.doc") }
+            Button {
+                SharedStore.stage.addText(value)
+                SharedStore.stage.flash("Sent step \(index + 1) result to Stage")
+            } label: { Label("Send to Stage", systemImage: "tray.and.arrow.down") }
+            Divider()
+            Button {
+                model.inspectedStepIdx = (model.inspectedStepIdx == index) ? nil : index
+            } label: {
+                Label(model.inspectedStepIdx == index ? "Show final output" : "Inspect this step",
+                      systemImage: "eye")
+            }
+            Divider()
+            Button(role: .destructive) {
+                model.removeStep(id: step.id)
+            } label: { Label("Remove step", systemImage: "xmark.circle") }
+        case .error(let msg):
+            Text("Step errored: \(msg)").foregroundStyle(.secondary)
+            Divider()
+            Button(role: .destructive) {
+                model.removeStep(id: step.id)
+            } label: { Label("Remove step", systemImage: "xmark.circle") }
+        case .skipped:
+            Text("Step skipped — no output yet").foregroundStyle(.secondary)
+            Divider()
+            Button(role: .destructive) {
+                model.removeStep(id: step.id)
+            } label: { Label("Remove step", systemImage: "xmark.circle") }
+        }
     }
 
     private func paramSummary(_ s: XformStep) -> String {

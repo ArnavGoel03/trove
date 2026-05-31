@@ -773,15 +773,11 @@ final class BigScanCache {
     private var terminateObserver: NSObjectProtocol?
 
     private init() {
-        let appSup = FileManager.default.urls(for: .applicationSupportDirectory,
-                                              in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSHomeDirectory())
-                .appendingPathComponent("Library/Application Support")
-        let dir = appSup.appendingPathComponent("Trove", isDirectory: true)
+        // Power-user item #8: big-scan cache follows the active TrovePaths dir.
+        let dir = TrovePaths.appSupportDir
         self.dirURL = dir
         self.fileURL = dir.appendingPathComponent("storage-deep-cache.json")
         self.root = BigScanCacheRoot(version: schemaVersion, byRoot: [:])
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         loadOrQuarantine()
         // Fix 6: force-flush the cache on app quit — same pattern as NoteStore.
         terminateObserver = NotificationCenter.default.addObserver(

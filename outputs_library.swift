@@ -170,13 +170,10 @@ final class OutputsLibrary: ObservableObject {
     // Persistence locations -----------------------------------------------
     // red-team: nonisolated so the writeQueue closure (Sendable, nonisolated)
     // can reference them without hopping back to MainActor for a static URL.
-    nonisolated private static let appSupportDir: URL = {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory,
-                                            in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support")
-        return base.appendingPathComponent("Trove", isDirectory: true)
-    }()
+    //
+    // Power-user item #8: route through TrovePaths so outputs library
+    // honors the XDG opt-in.
+    nonisolated private static var appSupportDir: URL { TrovePaths.appSupportDir }
     nonisolated private static let storeURL = appSupportDir.appendingPathComponent("outputs-library.json")
 
     // Serial write queue so two debounced flushes can't interleave.

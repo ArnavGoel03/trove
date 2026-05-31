@@ -95,11 +95,8 @@ final class StorageCache {
     private let dirURL: URL
 
     private init() {
-        let appSup = FileManager.default.urls(for: .applicationSupportDirectory,
-                                              in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSHomeDirectory())
-                .appendingPathComponent("Library/Application Support")
-        let dir = appSup.appendingPathComponent("Trove", isDirectory: true)
+        // Power-user item #8: storage-cache follows the active TrovePaths dir.
+        let dir = TrovePaths.appSupportDir
         self.dirURL = dir
         self.fileURL = dir.appendingPathComponent("storage-cache.json")
         self.root = StorageCacheRoot(version: schemaVersion,

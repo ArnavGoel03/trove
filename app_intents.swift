@@ -585,9 +585,10 @@ enum TroveIntentError: Swift.Error, CustomLocalizedStringResourceConvertible {
 enum SnippetIndex {
 
     private static var jsonURL: URL? {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory,
-                                            in: .userDomainMask).first
-        return base?.appendingPathComponent("Trove/snippets.json")
+        // Power-user item #8: AppIntents reads must consult TrovePaths
+        // so a user who opted into XDG still gets the right snippet
+        // library inside Shortcuts.
+        TrovePaths.appSupportDir.appendingPathComponent("snippets.json")
     }
 
     /// Loads + decodes the persisted snippet library. Returns an empty
@@ -774,9 +775,7 @@ struct CountSnippetsIntent: AppIntent {
 enum ClipboardIndex {
 
     private static var jsonURL: URL? {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory,
-                                            in: .userDomainMask).first
-        return base?.appendingPathComponent("Trove/clipboard_history.json")
+        TrovePaths.appSupportDir.appendingPathComponent("clipboard_history.json")
     }
 
     struct Entry: Identifiable {

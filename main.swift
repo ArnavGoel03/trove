@@ -336,10 +336,14 @@ struct TroveApp: App {
             // ─── Help ──────────────────────────────────────────────────────
             // Replace the default search-only Help menu with branded links.
             CommandGroup(replacing: .help) {
+                // Power-user item #6: chord overlay. Bound to ⌘? (the macOS
+                // convention for "show shortcuts for the current view") —
+                // surfaces a pane-aware shortcut HUD that floats the
+                // current pane's chords to the top, then the app-wide list.
                 Button("Keyboard Shortcuts") {
                     NotificationCenter.default.post(name: .troveOpenKeyboardShortcuts, object: nil)
                 }
-                .keyboardShortcut("/", modifiers: .command)
+                .keyboardShortcut("?", modifiers: [.command, .shift])
                 Button("What's New in Trove…") {
                     if let url = URL(string: "https://github.com/\(UpdateChecker.repoOwner)/\(UpdateChecker.repoName)/releases") {
                         NSWorkspace.shared.open(url)
@@ -597,9 +601,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
 
             // Fix 8: remove stale .snippets-*.tmp files older than 60s.
-            let appSup = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-                ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
-            let troveDir = appSup.appendingPathComponent("Trove")
+            // Power-user item #8: scan the active TrovePaths dir so
+            // XDG-opted users get their tmp sweep too.
+            let troveDir = TrovePaths.appSupportDir
             if let contents = try? fm.contentsOfDirectory(at: troveDir,
                                                            includingPropertiesForKeys: [.creationDateKey],
                                                            options: []) {
@@ -1369,12 +1373,9 @@ final class PaneVisibilityStore: ObservableObject {
     @Published private(set) var hidden: Set<String> = []
 
     private static var fileURL: URL {
-        let base = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        let dir = base.appendingPathComponent("Trove", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("sidebar.json")
+        // Power-user item #8: sidebar visibility persists under the
+        // active TrovePaths dir.
+        TrovePaths.appSupportDir.appendingPathComponent("sidebar.json")
     }
 
     private init() {
@@ -1490,12 +1491,7 @@ final class ProfileSync: ObservableObject {
         "sidebar.json", "snippets.json", "notes.json", "account.json", "outputs-library.json"
     ]
 
-    private var appSupportDir: URL {
-        let base = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        return base.appendingPathComponent("Trove", isDirectory: true)
-    }
+    private var appSupportDir: URL { TrovePaths.appSupportDir }
 
     private var iCloudDir: URL {
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -3100,6 +3096,153 @@ struct RootView: View {
             } else if type == "file", let p = q["path"] {
                 Self.stageFileSafely(path: p)
             }
+
+        // ───────────────────────────────────────────────────────────────
+        // Power-user item #5 — URL scheme verb coverage. Unlocks KM /
+        // Alfred / cron / Hammerspoon automation. Every new verb mirrors
+        // a Tools-menu / AppIntents action so behaviour stays consistent
+        // across the three entry points.
+        // ───────────────────────────────────────────────────────────────
+
+        case "pane":
+            // trove://pane/open?pane=pdf
+            //   → switches to the named pane. Honors hidden-pane guard so
+            //     a drive-by URL can't bypass user-chosen sidebar layout.
+            guard let raw = q["pane"], let p = Pane(rawValue: raw) else {
+                stage.flash("Unknown pane in trove://pane URL", kind: .warning)
+                return
+            }
+            if PaneVisibilityStore.shared.isVisible(p) {
+                paneRaw = p.rawValue
+                NSApp.activate(ignoringOtherApps: true)
+            } else {
+                stage.flash("\(p.rawValue) is hidden — show it in Settings",
+                            kind: .warning)
+            }
+
+        case "calc":
+            // trove://calc?expr=100*1.09&copy=1
+            //   → evaluates the expression using the in-app calc engine and
+            //     flashes the result. `copy=1` writes the result to the
+            //     clipboard (gated on frontmost to prevent clipboard
+            //     hijack from a drive-by website).
+            guard let expr = q["expr"], !expr.isEmpty else {
+                stage.flash("trove://calc requires ?expr=…", kind: .warning)
+                return
+            }
+            let eval = CalcEvaluator()
+            let results = eval.evaluate(text: expr, angleUnit: .degrees)
+            let value = results.last?.display ?? "—"
+            if q["copy"] == "1" {
+                guard Self.isTroveFrontmost() else {
+                    stage.flash("Calc copy refused — Trove must be frontmost")
+                    return
+                }
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(value, forType: .string)
+                NotificationCenter.default.post(name: .troveDidWritePasteboard, object: nil)
+                stage.flash("Calc \(expr) = \(value) (copied)")
+            } else {
+                stage.flash("Calc \(expr) = \(value)")
+            }
+
+        case "snippet":
+            // trove://snippet/copy?name=signature
+            // trove://snippet/get?name=signature  (no clipboard write)
+            //   → matches the AppIntents Get/GetByName surface but URL-
+            //     scheme-driven so any non-Shortcuts caller can drive it.
+            let sub = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            guard let name = q["name"], !name.isEmpty else {
+                stage.flash("trove://snippet/\(sub) requires ?name=…", kind: .warning)
+                return
+            }
+            if #available(macOS 13.0, *) {
+                let snippets = SnippetIndex.read()
+                let lc = name.lowercased()
+                let found = snippets.first(where: { $0.name.lowercased() == lc })
+                    ?? snippets.first(where: { $0.name.lowercased().hasPrefix(lc) })
+                    ?? snippets.first(where: { $0.name.lowercased().contains(lc) })
+                guard let s = found else {
+                    stage.flash("No snippet named \"\(name)\"", kind: .warning)
+                    return
+                }
+                if sub == "copy" {
+                    guard Self.isTroveFrontmost() else {
+                        stage.flash("Snippet copy refused — Trove must be frontmost")
+                        return
+                    }
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(s.body, forType: .string)
+                    NotificationCenter.default.post(name: .troveDidWritePasteboard, object: nil)
+                    stage.flash("Copied snippet \"\(s.name)\"")
+                } else {
+                    // Default = stage the snippet body as text.
+                    stage.addText(s.body)
+                    stage.flash("Added snippet \"\(s.name)\" to Stage")
+                }
+            } else {
+                stage.flash("trove://snippet requires macOS 13+", kind: .warning)
+            }
+
+        case "history":
+            // trove://history/paste?index=0
+            // trove://history/copy?index=2
+            //   → reads the persisted clipboard history; copies/pastes
+            //     the N-th text entry (skipping non-text).
+            let sub = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let idx = Int(q["index"] ?? "0") ?? 0
+            if #available(macOS 13.0, *) {
+                let texts = ClipboardIndex.read().compactMap { $0.textBody }
+                guard idx >= 0, idx < texts.count else {
+                    stage.flash("History index \(idx) out of range (have \(texts.count))",
+                                kind: .warning)
+                    return
+                }
+                let body = texts[idx]
+                if sub == "paste" {
+                    stage.addText(body)
+                    stage.flash("Added history #\(idx) to Stage")
+                } else {
+                    guard Self.isTroveFrontmost() else {
+                        stage.flash("History copy refused — Trove must be frontmost")
+                        return
+                    }
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(body, forType: .string)
+                    NotificationCenter.default.post(name: .troveDidWritePasteboard, object: nil)
+                    stage.flash("Copied history #\(idx)")
+                }
+            } else {
+                stage.flash("trove://history requires macOS 13+", kind: .warning)
+            }
+
+        case "qr":
+            // trove://qr?text=https://example.com
+            //   → generates the QR, writes a temp PNG, adds it to Stage
+            //     so the user can drag it out / save it.
+            guard let text = q["text"], !text.isEmpty else {
+                stage.flash("trove://qr requires ?text=…", kind: .warning)
+                return
+            }
+            do {
+                let img = try QRGenerator.render(text,
+                                                  correction: .M,
+                                                  targetSize: 1024,
+                                                  fgColor: .black,
+                                                  bgColor: .white)
+                if let tiff = img.tiffRepresentation,
+                   let rep = NSBitmapImageRep(data: tiff),
+                   let data = rep.representation(using: .png, properties: [:]) {
+                    let tmp = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("trove-qr-\(UUID().uuidString.prefix(8)).png")
+                    try data.write(to: tmp, options: .atomic)
+                    stage.addFile(tmp)
+                    stage.flash("QR for \"\(text.prefix(40))\" added to Stage")
+                }
+            } catch {
+                stage.flash("QR failed: \(error.localizedDescription)", kind: .error)
+            }
+
         default:
             break
         }
@@ -3310,54 +3453,199 @@ private struct WelcomeHint: View {
 // MARK: - Keyboard Shortcuts sheet (Help menu)
 // ===========================================================================
 
+// ===========================================================================
+// MARK: - Chord registry (power-user item #6)
+// ===========================================================================
+//
+// `ChordRegistry` is the single source of truth for app-wide and per-pane
+// keyboard shortcuts. The Help → Keyboard Shortcuts (⌘?) overlay reads
+// from it so every chord we surface in the UI is documented in one place —
+// when a new pane adds a shortcut, the dev only has to update this struct,
+// not also chase down a separate help dialog to keep it in sync.
+
+struct ChordEntry: Identifiable {
+    var id: String { keys + label }
+    let keys: String     // pre-rendered glyph string, e.g. "⌘⇧V"
+    let label: String    // human action description
+}
+
+struct ChordSection: Identifiable {
+    var id: String { title }
+    let title: String
+    let entries: [ChordEntry]
+}
+
+enum ChordRegistry {
+
+    /// Always-visible app-wide shortcuts. These work in every pane.
+    static let global: [ChordEntry] = [
+        .init(keys: "⌘?",    label: "Show this overlay"),
+        .init(keys: "⌘K",    label: "Quick Switcher (jump to pane)"),
+        .init(keys: "⌘,",    label: "Settings"),
+        .init(keys: "⌘1",    label: "Stage pane"),
+        .init(keys: "⌘2",    label: "History pane"),
+        .init(keys: "⌘3",    label: "Snippets pane"),
+        .init(keys: "⌘4",    label: "Notes pane"),
+        .init(keys: "⌘⇧V",   label: "Paste into Stage"),
+        .init(keys: "⌘⇧N",   label: "Capture screenshot"),
+        .init(keys: "⌘⇧⌫",   label: "Clear Stage"),
+        .init(keys: "⌘⌥⇧T",  label: "Global screenshot to Stage"),
+        .init(keys: "⌃⇧⌘V",  label: "Open clipboard history HUD"),
+    ]
+
+    /// Per-pane chords. The current pane's chords float to the top of the
+    /// overlay so the user sees what's relevant for what they're doing,
+    /// rather than re-reading the same 30-item global list every time.
+    static func chords(for pane: Pane) -> [ChordEntry] {
+        switch pane {
+        case .stage:
+            return [
+                .init(keys: "Drag",   label: "Drop files / text onto Stage to collect them"),
+                .init(keys: "⌘⇧V",    label: "Paste current clipboard into Stage"),
+                .init(keys: "⌘⇧⌫",    label: "Clear all Stage items"),
+                .init(keys: "Space",  label: "Quick Look the focused Stage item"),
+                .init(keys: "⌫",      label: "Remove the focused Stage item"),
+            ]
+        case .history:
+            return [
+                .init(keys: "⌘F",     label: "Focus search field"),
+                .init(keys: "⌘⇧.",    label: "Toggle plain / regex search"),
+                .init(keys: "↑ / ↓",  label: "Navigate entries"),
+                .init(keys: "↩",      label: "Copy focused entry"),
+                .init(keys: "Space",  label: "Preview focused entry"),
+            ]
+        case .snippets:
+            return [
+                .init(keys: "⌘N",     label: "New snippet"),
+                .init(keys: "⌘F",     label: "Search snippets"),
+                .init(keys: "⌘E",     label: "Edit focused snippet"),
+                .init(keys: "↩",      label: "Copy focused snippet"),
+            ]
+        case .notes:
+            return [
+                .init(keys: "⌘N",     label: "New note"),
+                .init(keys: "⌘B",     label: "Bold selection"),
+                .init(keys: "⌘I",     label: "Italic selection"),
+                .init(keys: "⌘K",     label: "Insert link"),
+            ]
+        case .calc:
+            return [
+                .init(keys: "↑ / ↓",  label: "Recall previous expressions"),
+                .init(keys: "⌘C",     label: "Copy last result"),
+                .init(keys: "Tab",    label: "Insert `ans` (previous result)"),
+            ]
+        case .xform:
+            return [
+                .init(keys: "⌘V",     label: "Paste new input"),
+                .init(keys: "⌘⇧S",    label: "Save current chain as recipe"),
+                .init(keys: "⌘⌫",     label: "Remove last pipeline step"),
+            ]
+        case .fileHash:
+            return [
+                .init(keys: "Drag",   label: "Drop files to hash, or a SUMS file to verify"),
+                .init(keys: "⌘C",     label: "Copy focused row's SHA-256"),
+                .init(keys: "⌫",      label: "Remove focused row"),
+            ]
+        case .qr:
+            return [
+                .init(keys: "⌘C",     label: "Copy QR PNG"),
+                .init(keys: "⌘S",     label: "Save QR PNG…"),
+            ]
+        case .ocr:
+            return [
+                .init(keys: "⌘⇧N",    label: "Capture region and OCR"),
+                .init(keys: "⌘C",     label: "Copy recognized text"),
+            ]
+        default:
+            return []   // panes without bespoke chords fall through to global-only
+        }
+    }
+}
+
 struct KeyboardShortcutsSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @AppStorage("trove.selectedPane") private var paneRaw: String = Pane.stage.rawValue
 
-    private let shortcuts: [(String, String)] = [
-        ("⌘1", "Stage pane"),
-        ("⌘2", "History pane"),
-        ("⌘3", "Snippets pane"),
-        ("⌘4", "Notes pane"),
-        ("⌘K", "Quick Switcher"),
-        ("⌘⇧V", "Paste into Stage"),
-        ("⌘⇧N", "Capture screenshot"),
-        ("⌘⇧⌫", "Clear Stage"),
-        ("⌘,", "Settings"),
-        ("⌘⌥⇧T", "Global screenshot to Stage"),
-    ]
+    private var currentPane: Pane {
+        Pane(rawValue: paneRaw) ?? .stage
+    }
+
+    private var paneChords: [ChordEntry] {
+        ChordRegistry.chords(for: currentPane)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            Text("Keyboard Shortcuts")
-                .font(.system(.title2, design: .rounded).weight(.bold))
-                .padding(.top, 28)
-                .padding(.bottom, 20)
-
-            Card {
-                VStack(alignment: .leading, spacing: 10) {
-                    ForEach(shortcuts, id: \.0) { key, label in
-                        HStack {
-                            Text(label)
-                                .font(.callout)
-                                .foregroundStyle(.primary)
-                            Spacer()
-                            Text(key)
-                                .font(.system(.callout, design: .monospaced).weight(.medium))
-                                .foregroundStyle(.secondary)
-                        }
+            header
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    if !paneChords.isEmpty {
+                        chordCard(title: "In \(currentPane.rawValue)",
+                                  systemImage: currentPane.icon,
+                                  entries: paneChords)
                     }
+                    chordCard(title: "App-wide",
+                              systemImage: "command",
+                              entries: ChordRegistry.global)
+                    // Discovery footer — points the user at every other
+                    // entrypoint without bloating the table.
+                    Text("Tip: most panes expose more actions in the toolbar (top-right) and the right-click menu.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 20)
             }
-            .padding(.horizontal, 24)
 
             Button("Done") { dismiss() }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .keyboardShortcut(.escape, modifiers: [])
-                .padding(.top, 20)
-                .padding(.bottom, 28)
+                .padding(.bottom, 24)
         }
-        .frame(width: 380)
+        .frame(width: 520, height: 560)
+    }
+
+    private var header: some View {
+        VStack(spacing: 4) {
+            Text("Keyboard Shortcuts")
+                .font(.system(.title2, design: .rounded).weight(.bold))
+            Text("Press ⌘? from any pane to see this overlay")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.top, 24)
+        .padding(.bottom, 16)
+    }
+
+    private func chordCard(title: String, systemImage: String, entries: [ChordEntry]) -> some View {
+        Card {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Image(systemName: systemImage)
+                        .foregroundStyle(.tint)
+                        .accessibilityHidden(true)
+                    Text(title).headerText()
+                }
+                ForEach(entries) { e in
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(e.label)
+                            .font(.callout)
+                            .foregroundStyle(.primary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Text(e.keys)
+                            .font(.system(.callout, design: .monospaced).weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Color.troveCardStroke.opacity(0.35),
+                                        in: RoundedRectangle(cornerRadius: 6))
+                            .textSelection(.enabled)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -3913,13 +4201,10 @@ final class Stage: ObservableObject {
 
     // P0 persistence: debounced atomic writes to Application Support/Trove/stage.json.
     private var persistWork: DispatchWorkItem?
-    private static var stageJsonURL: URL = {
-        let sup = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
-            .first ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
-        let dir = sup.appendingPathComponent("Trove", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("stage.json")
-    }()
+    private static var stageJsonURL: URL {
+        // Power-user item #8: Stage state follows the active TrovePaths dir.
+        TrovePaths.appSupportDir.appendingPathComponent("stage.json")
+    }
 
     // red-team: one DispatchWorkItem per toast id so dismissing/extending one
     // toast doesn't affect siblings. The previous single-shot timer cancelled

@@ -186,12 +186,9 @@ final class SnippetStore: ObservableObject {
         if let u = fileURL {
             self.fileURL = u
         } else {
-            let appSupport = FileManager.default.urls(for: .applicationSupportDirectory,
-                                                      in: .userDomainMask).first
-                ?? URL(fileURLWithPath: NSHomeDirectory())
-                    .appendingPathComponent("Library/Application Support")
-            self.fileURL = appSupport
-                .appendingPathComponent("Trove", isDirectory: true)
+            // Power-user item #8: route through TrovePaths so snippets
+            // follow the user's XDG opt-in.
+            self.fileURL = TrovePaths.appSupportDir
                 .appendingPathComponent("snippets.json")
         }
         // P1 fix (DEVELOP_RULES §1): previously `load()` ran synchronously here —

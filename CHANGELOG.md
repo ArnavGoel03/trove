@@ -14,6 +14,72 @@ will surface whatever's newest on the chosen channel.
 
 ---
 
+## [1.1.0-beta.14] — Unreleased
+
+### Added
+
+- **Text Tools — copy any intermediate step's result** *(power-user
+  item #1)*. Right-click any pipeline chip to copy that step's output,
+  send it to Stage, or inspect it — without having to click the chip,
+  switch the output card, then copy. Errored / skipped steps surface a
+  short explanation in the same menu rather than failing silently.
+- **History — clipboard dedup with ×N badge** *(power-user item #2)*.
+  When you copy the same payload more than once, History now folds the
+  new copy back into the original entry, increments a counter, refreshes
+  the timestamp, and floats the entry to the top — instead of growing
+  N consecutive identical rows. The row shows a soft "×N" capsule next
+  to the pinned indicator (with VoiceOver label "Copied N times").
+  Dedup persists across launches via the new `recurrenceCount` field
+  in `clipboard_history.json` (tolerant Codable so pre-beta.14 entries
+  upgrade as N=1).
+- **XDG `~/.config/trove/` config home support** *(power-user item #8)*.
+  Set `$TROVE_CONFIG_HOME`, `$XDG_CONFIG_HOME`, or just `mkdir
+  ~/.config/trove` and Trove now stores snippets, clipboard history,
+  notes, recipes, outputs library, sidebar visibility, Stage state,
+  account, exchange-rate cache, storage caches, and big-scan caches
+  under the active dir — all 11 storage-touching panes now route
+  through `TrovePaths.appSupportDir` with one source of truth. Default
+  remains `~/Library/Application Support/Trove` so existing installs
+  keep working with no migration. Defence-in-depth: refuses
+  `XDG_CONFIG_HOME=/` and other obvious wrong-root values.
+
+---
+
+## [1.1.0-beta.13] — Unreleased
+
+### Added
+
+- **Hash pane — SHA256SUMS verification** *(power-user item #3)*. Drag a
+  `SHA256SUMS` / `.sha256` / `.md5sums` / `.sha512sum` file (or any sums
+  file recognized by extension or canonical basename) onto Hash alongside
+  its target files. Trove parses the sums file, hashes each target through
+  the existing 4-in-1 streaming pipeline, and renders a verification card
+  with per-line ✓ / ✗ / "file missing" status. Algorithm auto-detected by
+  hex length (MD5 / SHA-1 / SHA-256 / SHA-512); mixed-algorithm files
+  display the modal algorithm in the header. Path-traversal hardened —
+  refuses absolute paths and `..` components so a hostile sums file can't
+  hash `/etc/passwd` and leak its contents via the mismatch hex.
+- **Text Tools — Saved Recipes** *(power-user item #4)*. New "Recipes"
+  toolbar menu lets you save the current pipeline as a named recipe and
+  replay it with one click. Persisted to `recipes.json` in App Support
+  with tolerant `Codable` so future step additions don't silently empty
+  the file on upgrade. Differentiates Trove over Boop / DevUtils / TextSoap
+  — none of them have pipelines, let alone saved ones.
+- **Per-pane chord overlay** *(power-user item #6)*. ⌘? now opens a
+  pane-aware Keyboard Shortcuts HUD. The current pane's chords float to
+  the top, then app-wide chords. 9 panes ship bespoke chord lists (Stage,
+  History, Snippets, Notes, Calc, Text Tools, Hash, QR, OCR); every other
+  pane falls through to the global list. Backed by a single
+  `ChordRegistry` so adding a shortcut updates the discovery surface
+  automatically.
+
+### Changed
+
+- **Help menu** — Keyboard Shortcuts shortcut moved from ⌘/ to ⌘?, the
+  macOS convention for "show shortcuts for the current view".
+
+---
+
 ## [1.1.0-beta.12] — Unreleased
 
 ### Added

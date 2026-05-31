@@ -120,12 +120,9 @@ struct CalcRateCache: Codable {
     )
 
     static var fileURL: URL {
-        let base = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
-            .first ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        let dir = base.appendingPathComponent("Trove", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("exchange.json")
+        // Power-user item #8: route through TrovePaths so exchange-rate
+        // cache follows the user's XDG opt-in.
+        TrovePaths.appSupportDir.appendingPathComponent("exchange.json")
     }
 
     /// Load whatever's on disk. Returns nil if file missing or unreadable —
