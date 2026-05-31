@@ -239,8 +239,10 @@ final class ClipHistory: ObservableObject {
 
     // Power-user item #8: route through TrovePaths so users can opt
     // their clipboard history into `~/.config/trove/` via XDG.
-    private static var appSupportDir: URL { TrovePaths.appSupportDir }
-    private static let storeURL = appSupportDir.appendingPathComponent("clipboard_history.json")
+    // `nonisolated` so the off-main loader / debounced saver can read
+    // the URL without hopping back to MainActor.
+    nonisolated private static var appSupportDir: URL { TrovePaths.appSupportDir }
+    nonisolated private static var storeURL: URL { appSupportDir.appendingPathComponent("clipboard_history.json") }
 
     /// Serial queue for disk I/O so multiple rapid saves don't race.
     private let ioQueue = DispatchQueue(label: "trove.history.io", qos: .utility)

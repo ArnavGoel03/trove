@@ -90,8 +90,11 @@ final class NoteStore: ObservableObject {
 
     // Power-user item #8: route through TrovePaths so notes follow the
     // user's XDG opt-in alongside snippets / history / recipes.
-    private static var appSupportDir: URL { TrovePaths.appSupportDir }
-    private static let storeURL = appSupportDir.appendingPathComponent("notes.json")
+    // `nonisolated` so off-main file I/O closures (recoverable load,
+    // debounced save, terminate-time flush) can read this URL without
+    // hopping back to MainActor for what is a pure-function lookup.
+    nonisolated private static var appSupportDir: URL { TrovePaths.appSupportDir }
+    nonisolated private static var storeURL: URL { appSupportDir.appendingPathComponent("notes.json") }
 
     /// Serial queue so two debounced writes can't interleave (red-team #3).
     private let writeQueue = DispatchQueue(label: "trove.notes.write",
