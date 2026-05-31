@@ -1936,6 +1936,14 @@ final class RecViewModel: ObservableObject {
                 return .region(r, displayID: regionDisplayID)
             }
             return .display(selectedDisplayID)
+        case .webcam:
+            // Webcam-only mode (#19) bypasses SCStream entirely; this is
+            // a fallback for the rare moment the caller still asks
+            // buildSource() before the engine swaps to RecWebcamCapture.
+            // The next batch routes the start path past SCStream when
+            // mode == .webcam; until then we fall back to display so
+            // a partial UI state still produces a valid recording.
+            return .display(selectedDisplayID)
         }
     }
 }
@@ -2024,6 +2032,18 @@ struct RecView: View {
                                         }
                                     }
                                 }
+                            }
+                        case .webcam:
+                            // #19 webcam-only — the engine path lands in
+                            // the next batch; this row tells the user
+                            // what's coming so the picker case isn't
+                            // a dead end.
+                            HStack {
+                                Image(systemName: "video.circle")
+                                    .foregroundStyle(.secondary)
+                                Text("Webcam-only recording — full wiring lands in the next batch. For now, use Display / Window / Region + the Record webcam alongside (PIP) toggle to get a parallel webcam file.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
                         }
                     }
