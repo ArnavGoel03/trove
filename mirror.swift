@@ -137,6 +137,21 @@ final class MirrorViewModel: ObservableObject {
     private var statusItem: NSStatusItem?
     private var popover: NSPopover?
 
+    // ---- Horizontal flip ("real mirror" mode) ------------------------------
+    //
+    // The raw FaceTime camera feed is un-mirrored — when you move left,
+    // the image moves right (because the camera is the third party
+    // looking at you). Hand Mirror and Zoom default to a horizontally-
+    // flipped preview because it matches the cognitive model of a real
+    // mirror: move left, reflection moves left. We default to ON for the
+    // same reason; users who want the raw orientation can untoggle.
+    static let kFlipHorizontal = "mirror.flipHorizontal"
+    @Published var flipHorizontal: Bool = true {
+        didSet {
+            UserDefaults.standard.set(flipHorizontal, forKey: Self.kFlipHorizontal)
+        }
+    }
+
     init() {
         // Fix #7: observe AVCaptureSession runtime errors (e.g. USB unplug).
         runtimeErrorObserver = NotificationCenter.default.addObserver(
@@ -167,6 +182,13 @@ final class MirrorViewModel: ObservableObject {
         // Done last so the syncMenuBar() call sees a fully-initialized
         // observer set above.
         self.showInMenuBar = UserDefaults.standard.bool(forKey: Self.kShowInMenuBar)
+        // Restore horizontal-flip preference. Default to true (mirrored)
+        // on first launch — see the property comment for rationale.
+        if UserDefaults.standard.object(forKey: Self.kFlipHorizontal) == nil {
+            self.flipHorizontal = true
+        } else {
+            self.flipHorizontal = UserDefaults.standard.bool(forKey: Self.kFlipHorizontal)
+        }
         syncMenuBar()
     }
 
@@ -402,12 +424,36 @@ struct MirrorPreviewView: NSViewRepresentable {
         v.wantsLayer = true
         v.previewLayer.session = vm.session
         v.previewLayer.videoGravity = .resizeAspect
-        // Mirror horizontally — Hand Mirror's killer UX detail (selfie-style).
-        v.previewLayer.transform = CATransform3DMakeScale(-1, 1, 1)
+        applyMirroring(v.previewLayer)
         return v
     }
     func updateNSView(_ v: MirrorPreviewNSView, context: Context) {
         v.previewLayer.session = vm.session
+        applyMirroring(v.previewLayer)
+    }
+
+    /// Apply the horizontal-flip preference. Tries the proper AVFoundation
+    /// path first (`connection.isVideoMirrored`) and falls back to a layer
+    /// scale transform — needed because some macOS / camera-driver
+    /// combinations silently ignore the connection setting.
+    ///
+    /// red-team: `automaticallyAdjustsVideoMirroring` must be disabled
+    /// before mutating `isVideoMirrored`, otherwise our setter is a no-op.
+    /// `isVideoMirroringSupported` returns false for some virtual cameras
+    /// (OBS / Camo / Loopback) — in that case the layer-transform
+    /// fallback is the only thing that works.
+    private func applyMirroring(_ layer: AVCaptureVideoPreviewLayer) {
+        let flipped = vm.flipHorizontal
+        if let conn = layer.connection, conn.isVideoMirroringSupported {
+            conn.automaticallyAdjustsVideoMirroring = false
+            conn.isVideoMirrored = flipped
+        }
+        // Belt-and-suspenders: also flip the layer itself. Cheap (one
+        // matrix multiply per frame) and guarantees the visual effect
+        // regardless of whether the connection accepted our setting.
+        layer.transform = flipped
+            ? CATransform3DMakeScale(-1, 1, 1)
+            : CATransform3DIdentity
     }
 }
 
@@ -556,6 +602,19 @@ struct MirrorView: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
+            // Horizontal-flip toggle — "real mirror" mode vs raw camera POV.
+            Button {
+                vm.flipHorizontal.toggle()
+            } label: {
+                Label(vm.flipHorizontal ? "Don't Flip" : "Flip Horizontally",
+                      systemImage: vm.flipHorizontal
+                          ? "arrow.left.and.right.righttriangle.left.righttriangle.right.fill"
+                          : "arrow.left.and.right.righttriangle.left.righttriangle.right")
+            }
+            .help(vm.flipHorizontal
+                  ? "Showing mirrored — same orientation as a real mirror. Tap to switch to the raw camera view (the way others see you)."
+                  : "Showing raw camera — when you go left, the image goes right. Tap to flip horizontally so it matches a real mirror.")
+
             // Show-in-menu-bar toggle — surfaces a tiny camera status item
             // with a live-preview popover, same opt-in pattern as Keep Awake.
             Button {

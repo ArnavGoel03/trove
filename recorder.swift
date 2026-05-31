@@ -37,6 +37,8 @@ import ScreenCaptureKit
 import CoreMedia
 import Foundation
 import UniformTypeIdentifiers
+import IOKit.pwr_mgt
+import os
 
 // ===========================================================================
 // MARK: - Presets, sources, errors
@@ -260,56 +262,228 @@ final class RecSourceCatalog: ObservableObject {
 // MARK: - Region picker (one-shot rect using `screencapture -i`)
 // ===========================================================================
 
-/// We use `screencapture -i` purely as a free rect-picker — it gives the
-/// user the system-native crosshair + dimmed-screen UX, then we throw away
-/// the resulting PNG and keep only the rect. The actual recording is done
-/// via SCK against that rect.
+/// P0 fix: custom crosshair overlay that captures the TRUE origin of the drawn
+/// region, not just the PNG size. We cover every screen with a transparent
+/// NSWindow, track mouseDown/mouseDragged/mouseUp, and return the CGRect in
+/// display-point coordinates together with the CGDirectDisplayID of the screen
+/// the selection was drawn on.
+///
+/// This replaces the old `screencapture -i` round-trip which lost the origin
+/// and always returned .zero, causing every "region" recording to capture the
+/// top-left corner of the display instead of the actual drawn region.
 enum RecRegionPicker {
 
-    /// Returns the picked rect in *display points* on the display it was
-    /// drawn on, or nil if the user hit Esc. The rect comes from the PNG's
-    /// pixel size + window-list bounds lookup — there's no public API to
-    /// ask `screencapture` for "just the rect", so we do this roundtrip.
+    /// Returns the picked rect (in *display points*) and the display it was
+    /// drawn on.  Returns nil if the user hit Escape or didn't drag.
+    @MainActor
     static func pick() async -> (CGRect, CGDirectDisplayID)? {
-        // red-team: serialize with Stage screenshot + OCR capture — all three
-        // shell out to `screencapture -i`. Two crosshairs at once = ambiguous
-        // Esc routing. Acquire on main; release fires on every return path.
-        let acquired = await MainActor.run { InteractiveCaptureGate.tryAcquire() }
-        guard acquired else { return nil }
-        defer { Task { @MainActor in InteractiveCaptureGate.release() } }
+        // Serialize with Stage screenshot and OCR capture.
+        guard InteractiveCaptureGate.tryAcquire() else { return nil }
+        defer { InteractiveCaptureGate.release() }
 
-        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("trove-region-\(UUID().uuidString).png")
+        return await withCheckedContinuation { cont in
+            let overlay = RecRegionOverlay(continuation: cont)
+            overlay.show()
+        }
+    }
+}
 
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-        // -i interactive, -o no shadow, -x silent, -s selection only
-        // (suppresses window mode), -r no retina-scale doubling in metadata.
-        p.arguments = ["-i", "-o", "-x", "-s", "-r", tmp.path]
+// ---------------------------------------------------------------------------
+// MARK: - RecRegionOverlay (custom crosshair window, main-actor)
+// ---------------------------------------------------------------------------
 
-        do {
-            try p.run()
-            p.waitUntilExitOffMain()
-        } catch {
-            return nil
+/// One full-screen transparent window per display. The user drags a rubber-
+/// band selection; on mouseUp we record the rect in the coordinate system of
+/// that screen's display and dismiss all overlays.
+@MainActor
+private final class RecRegionOverlay: NSObject {
+
+    private var windows: [NSWindow] = []
+    private let cont: CheckedContinuation<(CGRect, CGDirectDisplayID)?, Never>
+    private var finished = false
+
+    init(continuation: CheckedContinuation<(CGRect, CGDirectDisplayID)?, Never>) {
+        self.cont = continuation
+    }
+
+    func show() {
+        // Cover every screen.
+        for screen in NSScreen.screens {
+            let win = RecRegionTrackingWindow(screen: screen) { [weak self] result in
+                guard let self = self, !self.finished else { return }
+                self.finished = true
+                self.dismissAll()
+                self.cont.resume(returning: result)
+            }
+            win.orderFrontRegardless()
+            windows.append(win)
+        }
+        // Focus the primary screen's window so key events (Esc) are received.
+        windows.first?.makeKey()
+    }
+
+    private func dismissAll() {
+        for w in windows { w.orderOut(nil) }
+        windows.removeAll()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MARK: - RecRegionTrackingWindow
+// ---------------------------------------------------------------------------
+
+/// A transparent, borderless, screen-filling window that draws a crosshair
+/// and a rubber-band rect while the user drags.
+@MainActor
+private final class RecRegionTrackingWindow: NSWindow {
+
+    // NB: NSWindow already has a `screen` property — we shadow it with
+    // `targetScreen` so subclassing doesn't trigger an override-of-stored-property
+    // error from the compiler.
+    private let targetScreen: NSScreen
+    private let onResult: ((CGRect, CGDirectDisplayID)?) -> Void
+    private var overlayView: RecRegionOverlayView!
+
+    init(screen: NSScreen,
+         onResult: @escaping ((CGRect, CGDirectDisplayID)?) -> Void) {
+        self.targetScreen = screen
+        self.onResult = onResult
+        // Frame the window to exactly cover this screen (in global AppKit coords).
+        super.init(contentRect: screen.frame,
+                   styleMask: [.borderless],
+                   backing: .buffered,
+                   defer: false)
+        self.level = .screenSaver           // above everything except menubar
+        self.isOpaque = false
+        self.backgroundColor = .clear
+        self.ignoresMouseEvents = false
+        self.acceptsMouseMovedEvents = true
+        self.hasShadow = false
+        self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        overlayView = RecRegionOverlayView()
+        overlayView.frame = self.contentView?.bounds ?? targetScreen.frame
+        overlayView.autoresizingMask = [.width, .height]
+        self.contentView = overlayView
+        NSCursor.crosshair.set()
+    }
+
+    override var canBecomeKey: Bool { true }
+
+    override func keyDown(with event: NSEvent) {
+        // Esc cancels.
+        if event.keyCode == 53 {
+            onResult(nil)
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let loc = event.locationInWindow  // in window coords = screen coords (borderless)
+        overlayView.startPoint = loc
+        overlayView.currentPoint = loc
+        overlayView.isDragging = true
+        overlayView.needsDisplay = true
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard overlayView.isDragging else { return }
+        overlayView.currentPoint = event.locationInWindow
+        overlayView.needsDisplay = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard overlayView.isDragging,
+              let start = overlayView.startPoint
+        else {
+            onResult(nil)
+            return
+        }
+        overlayView.isDragging = false
+        let end = event.locationInWindow
+
+        // Build the rect in screen coords (window coords == screen coords for borderless).
+        let minX = min(start.x, end.x)
+        let minY = min(start.y, end.y)
+        let width  = abs(end.x - start.x)
+        let height = abs(end.y - start.y)
+
+        // Require a minimum drag of 10 pt so a stray click doesn't start a recording.
+        guard width >= 10, height >= 10 else {
+            onResult(nil)
+            return
         }
 
-        defer { try? FileManager.default.removeItem(at: tmp) }
-        guard FileManager.default.fileExists(atPath: tmp.path),
-              let img = NSImage(contentsOf: tmp),
-              let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil)
-        else { return nil }
+        let rectInScreen = CGRect(x: minX, y: minY, width: width, height: height)
 
-        // We don't have the rect's *position* — only its size from the PNG.
-        // For now we record the full primary display and crop via SCK's
-        // sourceRect using (origin: .zero, size: pngSize). That's the
-        // honest behavior for a v1; the alternative is reading the
-        // user's last screencapture annotation, which is fragile.
-        // A future improvement would be a custom NSWindow region picker.
-        let w = CGFloat(cg.width)
-        let h = CGFloat(cg.height)
-        let rect = CGRect(x: 0, y: 0, width: w, height: h)
-        return (rect, CGMainDisplayID())
+        // Translate from AppKit screen coords (origin bottom-left) to
+        // CGDisplay coords (origin top-left) for SCK's sourceRect.
+        // SCK sourceRect uses CG display coordinates (Quartz / CoreGraphics),
+        // where Y=0 is the top of the display.
+        let displayID = self.displayID(for: targetScreen)
+        let displayH = CGFloat(CGDisplayPixelsHigh(displayID)) / targetScreen.backingScaleFactor
+        // AppKit Y: measures from bottom of screen
+        // CG Y: measures from top of screen
+        let cgY = displayH - (rectInScreen.origin.y + rectInScreen.height)
+        let rectInCG = CGRect(x: rectInScreen.origin.x,
+                              y: cgY,
+                              width: rectInScreen.width,
+                              height: rectInScreen.height)
+        onResult((rectInCG, displayID))
+    }
+
+    /// Extract CGDirectDisplayID from an NSScreen.
+    private func displayID(for s: NSScreen) -> CGDirectDisplayID {
+        (s.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID)
+            ?? CGMainDisplayID()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MARK: - RecRegionOverlayView
+// ---------------------------------------------------------------------------
+
+/// Draws the dimmed overlay + rubber-band selection rectangle.
+@MainActor
+private final class RecRegionOverlayView: NSView {
+    var startPoint: CGPoint?
+    var currentPoint: CGPoint = .zero
+    var isDragging = false
+
+    override var isOpaque: Bool { false }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+
+        // Dim the whole screen.
+        ctx.setFillColor(CGColor(gray: 0, alpha: 0.45))
+        ctx.fill(bounds)
+
+        guard isDragging, let start = startPoint else { return }
+
+        let minX = min(start.x, currentPoint.x)
+        let minY = min(start.y, currentPoint.y)
+        let w = abs(currentPoint.x - start.x)
+        let h = abs(currentPoint.y - start.y)
+        let selRect = CGRect(x: minX, y: minY, width: w, height: h)
+
+        // Punch out the selection (clear the dim).
+        ctx.clear(selRect)
+
+        // Draw border.
+        ctx.setStrokeColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.85))
+        ctx.setLineWidth(1.5)
+        ctx.stroke(selRect)
+
+        // Size label.
+        let label = "\(Int(w)) × \(Int(h))"
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: NSColor.white,
+        ]
+        let size = (label as NSString).size(withAttributes: attrs)
+        let labelX = max(selRect.midX - size.width / 2, 4)
+        let labelY = selRect.maxY + 4
+        (label as NSString).draw(at: CGPoint(x: labelX, y: labelY), withAttributes: attrs)
     }
 }
 
@@ -334,6 +508,10 @@ final class RecEngine: NSObject, ObservableObject {
     // ---- UI-observable state -------------------------------------------------
 
     @Published var isRecording = false
+    /// P0 fix: takes the reentry gate synchronously at the start of `start()`,
+    /// before any await, so a double-tap during the 300ms+ SCK content fetch
+    /// can't get past the guard twice. Cleared via defer on early-throw paths.
+    fileprivate var isStarting = false
     @Published var isPaused    = false
 
     /// Wall-clock seconds the user perceives as "elapsed recording time".
@@ -359,6 +537,48 @@ final class RecEngine: NSObject, ObservableObject {
     private var captureSystemAudio = false
     private var captureMic         = false
     private var showsCursor        = true
+
+    // ---- Mid-recording live toggles (pro-user customizability) -------------
+    //
+    // These mirror `captureSystemAudio` / `captureMic` / `showsCursor` but
+    // are mutable during the recording. The audio delegates check them on
+    // every buffer and silence-drop when the corresponding toggle is off;
+    // the cursor toggle pushes through SCStream.updateConfiguration so
+    // hover hot-spots disappear within one frame of the user flipping it.
+    //
+    // The HUD binds directly to these — flipping a toggle in the UI is
+    // an immediate effect, no recording restart required. This is the
+    // single biggest gap between Trove's recorder and a pro tool: until
+    // now you had to stop, change a checkbox, and re-record.
+    @Published var liveSystemAudioOn: Bool = false {
+        didSet { /* picked up by SCStream audio delegate on next buffer */ }
+    }
+    @Published var liveMicOn: Bool = false {
+        didSet { /* picked up by AVCapture audio delegate on next buffer */ }
+    }
+    @Published var liveShowsCursor: Bool = true {
+        didSet { pushLiveCursorChange() }
+    }
+
+    /// Max-duration safety cap (seconds). 0 = no cap. Recording auto-stops
+    /// past this — prevents the classic "left it running overnight, woke
+    /// up to a 200 GB MP4" disaster.
+    var maxDurationSeconds: TimeInterval = 0
+    private var maxDurationTimer: Timer?
+
+    /// Update SCStream configuration to reflect the live cursor toggle.
+    /// Falls back silently when the stream isn't running (e.g. during
+    /// initial countdown) — the start() path picks up `showsCursor` from
+    /// the config it builds.
+    private func pushLiveCursorChange() {
+        guard isRecording, let stream = self.stream else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            let cfg = SCStreamConfiguration()
+            cfg.showsCursor = self.liveShowsCursor
+            try? await stream.updateConfiguration(cfg)
+        }
+    }
 
     // ---- ScreenCaptureKit ----------------------------------------------------
 
@@ -407,9 +627,36 @@ final class RecEngine: NSObject, ObservableObject {
 
     // ---- Pause/resume + timer -----------------------------------------------
 
-    private var startWall: Date?
+    private var startWall: ContinuousClock.Instant?
     private var accumulated: TimeInterval = 0
     private var tickTimer: Timer?
+
+    // ---- IOPMAssertion (prevent system sleep during recording) --------------
+    private var pmAssertionID: IOPMAssertionID = IOPMAssertionID(0)
+
+    // Fix 24: atexit shadow so a graceful exit(0) path (outside willTerminate)
+    // releases the assertion without leaking it. Pattern mirrors KeepAwakeAssertion.
+    nonisolated(unsafe) private static var exitLock = os_unfair_lock_s()
+    nonisolated(unsafe) private static var exitAssertionID: IOPMAssertionID = IOPMAssertionID(0)
+    nonisolated(unsafe) private static var exitHookRegistered = false
+
+    private static func registerExitHookOnce() {
+        os_unfair_lock_lock(&exitLock); defer { os_unfair_lock_unlock(&exitLock) }
+        if exitHookRegistered { return }
+        exitHookRegistered = true
+        atexit {
+            os_unfair_lock_lock(&RecEngine.exitLock)
+            let id = RecEngine.exitAssertionID
+            RecEngine.exitAssertionID = IOPMAssertionID(0)
+            os_unfair_lock_unlock(&RecEngine.exitLock)
+            if id != IOPMAssertionID(0) { IOPMAssertionRelease(id) }
+        }
+    }
+
+    nonisolated private func writePMShadow(id: IOPMAssertionID) {
+        os_unfair_lock_lock(&RecEngine.exitLock); defer { os_unfair_lock_unlock(&RecEngine.exitLock) }
+        RecEngine.exitAssertionID = id
+    }
 
     // red-team: tokens for willTerminate / willSleep / screens-changed.
     // willTerminate: finalize a recording in progress so the user gets a
@@ -422,6 +669,7 @@ final class RecEngine: NSObject, ObservableObject {
 
     override init() {
         super.init()
+        Self.registerExitHookOnce()
         let terminate = NotificationCenter.default.addObserver(
             forName: .troveWillTerminate, object: nil, queue: nil
         ) { [weak self] _ in
@@ -472,6 +720,9 @@ final class RecEngine: NSObject, ObservableObject {
         micOutput  = nil
         stream?.stopCapture(completionHandler: { _ in })
         stream = nil
+        // IOPMAssertion is released in stop() before we reach deinit under
+        // normal operation; the atexit shadow covers the edge case where stop()
+        // didn't run. Avoid accessing main-actor property pmAssertionID from deinit.
     }
 
     // =========================================================================
@@ -485,12 +736,30 @@ final class RecEngine: NSObject, ObservableObject {
                outputFolder: URL,
                systemAudio: Bool,
                microphone: Bool,
+               micUID: String? = nil,
                showsCursor: Bool,
+               codec: RecCodec = .hevc,
+               fps: RecFrameRate = .fps60,
                excludeBundleID: String?) async throws {
 
         // red-team: reentry guard — rapid double-clicks or hotkey bursts would
         // otherwise race two concurrent recordings to the same .tmp.mp4 path.
-        guard !isRecording, !isFinalizing else { return }
+        // P0 fix: the gate must close BEFORE the first await. Previously
+        // `isRecording = true` ran at line 922 — after SCK content fetch + writer
+        // setup (300ms+). A double-tap during that window passed the guard twice
+        // and built two AVAssetWriters against the same path. We now take the gate
+        // synchronously via a startingGen counter and only flip the public
+        // `isRecording` flag once the writer is up; an early throw resets the gate
+        // in a defer so a failed start doesn't lock the user out.
+        guard !isRecording, !isFinalizing, !isStarting else { return }
+        isStarting = true
+        var startedSuccessfully = false
+        defer {
+            // Either we transition into the running state (startedSuccessfully = true,
+            // isStarting → false and isRecording was set true at the success point),
+            // or we bail / throw and need to clear isStarting so the user can retry.
+            if !startedSuccessfully { self.isStarting = false }
+        }
 
         // Red-team #2: SCK audio capture (capturesAudio) only exists on 13+.
         guard #available(macOS 13.0, *) else {
@@ -507,6 +776,12 @@ final class RecEngine: NSObject, ObservableObject {
         self.captureSystemAudio = systemAudio
         self.captureMic         = microphone
         self.showsCursor        = showsCursor
+        // Initialize the live toggles to match the captured values. The HUD
+        // binds directly to these — flipping them mid-recording immediately
+        // affects the next audio buffer / cursor frame, no restart needed.
+        self.liveSystemAudioOn  = systemAudio
+        self.liveMicOn          = microphone
+        self.liveShowsCursor    = showsCursor
         self.lastError          = nil
         self.estimatedBytes     = 0
         self.elapsed            = 0
@@ -579,7 +854,7 @@ final class RecEngine: NSObject, ObservableObject {
         cfg.height = pxHeight
         cfg.scalesToFit = true
         cfg.showsCursor = showsCursor
-        cfg.minimumFrameInterval = CMTime(value: 1, timescale: 60) // 60fps
+        cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps.rawValue))
         cfg.pixelFormat = kCVPixelFormatType_32BGRA
         cfg.queueDepth  = 6 // small queue → frames drop rather than buffer
 
@@ -627,17 +902,29 @@ final class RecEngine: NSObject, ObservableObject {
         // Video input. Compression settings tuned for screen content:
         // High profile, bitrate scaled with pixel count, key frame every
         // 2 seconds so seek/scrub stays snappy in Finder Quick Look.
-        let bitrate = max(8_000_000, pxWidth * pxHeight * 4)
+        // P1: support HEVC (H.265) — default on Apple Silicon for better
+        // quality-per-bit; H.264 still available for compatibility.
+        // P0 fix: cap bitrate. The naive `pxW * pxH * 4` for a 5K Retina display
+        // (10240×5760) is ~59 Gbps — meaningless, and AVAssetWriter will clamp
+        // internally but the intent is broken. 200 Mbps is well above what
+        // HEVC/H.264 need for visually-lossless screen content at any resolution
+        // we'll realistically encode; floor of 8 Mbps preserves quality at lower
+        // resolutions.
+        let bitrateCap = 200_000_000
+        let bitrate = min(bitrateCap, max(8_000_000, pxWidth * pxHeight * 4))
+        var compressionProps: [String: Any] = [
+            AVVideoAverageBitRateKey: bitrate,
+            AVVideoMaxKeyFrameIntervalKey: fps.rawValue * 2,  // 2-sec key frame
+            AVVideoAllowFrameReorderingKey: false,
+        ]
+        if codec == .h264 {
+            compressionProps[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel
+        }
         let videoSettings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoCodecKey: codec.codecType,
             AVVideoWidthKey:  cfg.width,
             AVVideoHeightKey: cfg.height,
-            AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: bitrate,
-                AVVideoProfileLevelKey:   AVVideoProfileLevelH264HighAutoLevel,
-                AVVideoMaxKeyFrameIntervalKey: 120,
-                AVVideoAllowFrameReorderingKey: false,
-            ],
+            AVVideoCompressionPropertiesKey: compressionProps,
         ]
         let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
         vIn.expectsMediaDataInRealTime = true
@@ -685,7 +972,7 @@ final class RecEngine: NSObject, ObservableObject {
         // --- Microphone capture session ------------------------------------
 
         if microphone {
-            try await setupMicrophoneSession()
+            try await setupMicrophoneSession(uid: micUID)
         }
 
         // --- SCStream ------------------------------------------------------
@@ -708,8 +995,25 @@ final class RecEngine: NSObject, ObservableObject {
 
         self.isRecording = true
         self.isPaused    = false
-        self.startWall   = Date()
+        self.startWall   = ContinuousClock.now
+        // Hand off from isStarting → isRecording. The defer at the top of start()
+        // checks startedSuccessfully and leaves isStarting=true here untouched
+        // (it's cleared on the next line). The result: a second tap arriving
+        // between the await and this point still finds isStarting=true and bails.
+        startedSuccessfully = true
+        self.isStarting = false
+        RecEngineActivityTracker.setActive(true)
         startTickTimer()
+        // Prevent system sleep during recording — SCStream and AVAssetWriter
+        // don't survive a multi-hour suspend reliably (red-team #8).
+        if pmAssertionID == IOPMAssertionID(0) {
+            IOPMAssertionCreateWithName(
+                kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
+                IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                "Trove recording in progress" as CFString,
+                &pmAssertionID)
+            writePMShadow(id: pmAssertionID)
+        }
     }
 
     /// Pause. SCStream stays alive but we stop appending samples to the
@@ -721,14 +1025,14 @@ final class RecEngine: NSObject, ObservableObject {
     func pause() {
         guard isRecording, !isPaused else { return }
         isPaused = true
-        if let started = startWall { accumulated += Date().timeIntervalSince(started) }
+        if let started = startWall { accumulated += (ContinuousClock.now - started).timeInterval }  // uses Duration.timeInterval from main.swift
         startWall = nil
     }
 
     func resume() {
         guard isRecording, isPaused else { return }
         isPaused = false
-        startWall = Date()
+        startWall = ContinuousClock.now
     }
 
     /// Stop and finalize. Always renames .tmp.mp4 → final.mp4 on success;
@@ -742,6 +1046,10 @@ final class RecEngine: NSObject, ObservableObject {
         guard isRecording, !isFinalizing else { return }
         isFinalizing = true
         isRecording = false
+        // Fix 9: accumulate the live (non-paused) segment before clearing startWall.
+        if !isPaused, let s = startWall {
+            accumulated += (ContinuousClock.now - s).timeInterval
+        }
         isPaused    = false
 
         stopTickTimer()
@@ -755,6 +1063,14 @@ final class RecEngine: NSObject, ObservableObject {
         videoInput?.markAsFinished()
         systemAudioIn?.markAsFinished()
         micAudioIn?.markAsFinished()
+
+        // Fix #24: release the sleep-prevention assertion before finishWriting()
+        // so it isn't held during potentially-long file finalization.
+        if pmAssertionID != IOPMAssertionID(0) {
+            IOPMAssertionRelease(pmAssertionID)
+            pmAssertionID = IOPMAssertionID(0)
+            writePMShadow(id: IOPMAssertionID(0))
+        }
 
         if let writer = writer {
             await writer.finishWriting()
@@ -774,6 +1090,12 @@ final class RecEngine: NSObject, ObservableObject {
                     }
                     try FileManager.default.moveItem(at: tmp, to: dest)
                     self.lastOutputURL = dest
+                    OutputsLibrary.shared.record(
+                        url: dest,
+                        producer: "recorder",
+                        sourceLabel: dest.lastPathComponent,
+                        kind: "video"
+                    )
                 } catch {
                     self.lastError = .other("Finalize failed: \(error.localizedDescription)")
                     self.lastOutputURL = tempURL
@@ -798,6 +1120,28 @@ final class RecEngine: NSObject, ObservableObject {
         teardownMicrophoneSession()
         // red-team: clear finalize latch so a future start/stop cycle works
         self.isFinalizing = false
+        // IOPMAssertion already released above (before finishWriting).
+        RecEngineActivityTracker.setActive(false)
+        // If applicationShouldTerminate returned .terminateLater, now signal.
+        if !RecEngineActivityTracker.isActive {
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+    }
+
+    /// Stop recording and delete the in-progress temp file. `lastOutputURL` is
+    /// NOT set so callers can distinguish a discard from a normal stop.
+    func discard() async {
+        let urlToDelete = tempURL
+        await stop()
+        // stop() sets lastOutputURL = dest on success; clear it since this is a discard.
+        self.lastOutputURL = nil
+        if let url = urlToDelete {
+            try? FileManager.default.removeItem(at: url)
+        }
+        // Also remove the renamed final file if stop() managed to finalize in time.
+        if let final = finalURL {
+            try? FileManager.default.removeItem(at: final)
+        }
     }
 
     // =========================================================================
@@ -831,8 +1175,16 @@ final class RecEngine: NSObject, ObservableObject {
     // MARK: Internal — microphone
     // =========================================================================
 
-    private func setupMicrophoneSession() async throws {
-        guard let device = AVCaptureDevice.default(for: .audio) else {
+    private func setupMicrophoneSession(uid: String? = nil) async throws {
+        // Fix #3: honour the user's mic selection. Resolve via uniqueID first;
+        // fall back to system default if uid is nil or the device has gone away.
+        let device: AVCaptureDevice?
+        if let uid = uid {
+            device = AVCaptureDevice(uniqueID: uid) ?? AVCaptureDevice.default(for: .audio)
+        } else {
+            device = AVCaptureDevice.default(for: .audio)
+        }
+        guard let device = device else {
             // Red-team #4: no mic connected. Record video-only, surface
             // a warning, do not crash.
             self.lastError = .noMicrophone
@@ -902,14 +1254,32 @@ final class RecEngine: NSObject, ObservableObject {
             guard let self = self else { return }
             Task { @MainActor in
                 if !self.isPaused, let s = self.startWall {
-                    self.elapsed = self.accumulated + Date().timeIntervalSince(s)
+                    self.elapsed = self.accumulated + (ContinuousClock.now - s).timeInterval
                 } else {
                     self.elapsed = self.accumulated
+                }
+                // Pro-user max-duration safety. Triggered once when the
+                // elapsed wall time crosses the configured cap. We invoke
+                // stop() directly here on the same MainActor task that
+                // already runs the tick; the engine's idempotency latch
+                // (`isFinalizing`) makes the call safe to enter at most
+                // once per recording.
+                if self.maxDurationSeconds > 0,
+                   self.elapsed >= self.maxDurationSeconds,
+                   self.isRecording, !self.isFinalizing {
+                    let cap = Int(self.maxDurationSeconds)
+                    Task { @MainActor in
+                        await self.stop()
+                        SharedStore.stage.flash(
+                            "Recording auto-stopped at the \(cap)-second cap",
+                            kind: .warning)
+                    }
                 }
                 // File-size estimate from the writer's current output. We
                 // stat the file on a background task rather than blocking the
                 // main thread with attributesOfItem at 4 Hz.
-                if let url = self.tempURL {
+                // Fix #23: skip the stat when paused — file isn't growing.
+                if !self.isPaused, let url = self.tempURL {
                     let filePath = url.path
                     Task.detached(priority: .utility) { [weak self] in
                         if let attrs = try? FileManager.default.attributesOfItem(atPath: filePath),
@@ -956,11 +1326,16 @@ extension RecEngine: SCStreamDelegate, SCStreamOutput {
         guard CMSampleBufferIsValid(sampleBuffer),
               CMSampleBufferDataIsReady(sampleBuffer) else { return }
 
-        // Hop into a synchronous main-actor read of paused/writer; it's a
-        // tiny critical section and SCK callbacks are infrequent enough
-        // that the overhead is invisible.
-        Task { @MainActor in
-            guard let writer = self.writer, writer.status == .writing else { return }
+        // P0 fix: previously captured `self` strongly. At 60fps + ~100Hz audio
+        // each callback spawned `Task { @MainActor in self.writer… }` with a
+        // strong RecEngine retain; during `finishWriting()` (which holds the
+        // main actor) those Tasks queued up — hundreds of pending hops on stop,
+        // each retaining the engine + associated encoder state until they drained.
+        // [weak self] caps the queue depth: pending Tasks become no-ops the
+        // instant the engine releases.
+        Task { @MainActor [weak self] in
+            guard let self,
+                  let writer = self.writer, writer.status == .writing else { return }
             if self.isPaused { return }
 
             switch type {
@@ -1004,6 +1379,15 @@ extension RecEngine: SCStreamDelegate, SCStreamOutput {
         // Audio can arrive before the first video frame; the writer hasn't
         // started its session yet, so drop those early samples.
         guard sessionStarted, let aIn = systemAudioIn, aIn.isReadyForMoreMediaData else { return }
+        // Pro-user live toggle: when the user has flipped system audio
+        // OFF mid-recording, drop the buffer instead of appending. The
+        // writer still gets a continuous video track; just a silent gap
+        // for the duration the toggle was off — no track-discontinuity
+        // artifacts on resume.
+        if !liveSystemAudioOn {
+            systemAudioLevel = 0
+            return
+        }
         let pts = CMSampleBufferGetPresentationTimeStamp(sb)
         guard pts.isValid else { return }
         // red-team: drop out-of-order audio samples to avoid writer failure
@@ -1028,6 +1412,13 @@ extension RecEngine: AVCaptureAudioDataOutputSampleBufferDelegate {
         Task { @MainActor in
             guard self.sessionStarted, !self.isPaused else { return }
             guard let mIn = self.micAudioIn, mIn.isReadyForMoreMediaData else { return }
+            // Pro-user live toggle: mid-recording mic off → buffer dropped,
+            // level meter zeroed. Re-enabling later resumes seamlessly on
+            // the next buffer that arrives.
+            if !self.liveMicOn {
+                self.micAudioLevel = 0
+                return
+            }
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
             guard pts.isValid else { return }
             // red-team: monotonic PTS guard on mic track too
@@ -1097,6 +1488,29 @@ enum RecAudioLevel {
 // MARK: - View model
 // ===========================================================================
 
+/// P1: codec choices surfaced in the Output card.
+enum RecCodec: String, CaseIterable, Identifiable {
+    case h264 = "H.264"
+    case hevc = "HEVC (H.265)"
+    var id: String { rawValue }
+    /// AVVideoCodecType to pass into the writer settings.
+    var codecType: AVVideoCodecType {
+        switch self {
+        case .h264: return .h264
+        case .hevc: return .hevc
+        }
+    }
+}
+
+/// P1: frame rate choices.
+enum RecFrameRate: Int, CaseIterable, Identifiable, Codable {
+    case fps24 = 24
+    case fps30 = 30
+    case fps60 = 60
+    var id: Int { rawValue }
+    var label: String { "\(rawValue) fps" }
+}
+
 @MainActor
 final class RecViewModel: ObservableObject {
 
@@ -1108,15 +1522,39 @@ final class RecViewModel: ObservableObject {
     @Published var regionRect: CGRect? = nil
     @Published var regionDisplayID: CGDirectDisplayID = CGMainDisplayID()
 
-    // Audio toggles
-    @Published var systemAudioOn = true
-    @Published var microphoneOn  = true
-    @Published var selectedMicUID: String? = nil
+    // P1: audio toggles — persisted via @AppStorage
+    @AppStorage("rec.systemAudioOn")   var systemAudioOn: Bool = true
+    @AppStorage("rec.microphoneOn")    var microphoneOn:  Bool = true
+    @AppStorage("rec.selectedMicUID")  private var _selectedMicUID: String = ""
+    var selectedMicUID: String? {
+        get { _selectedMicUID.isEmpty ? nil : _selectedMicUID }
+        set { _selectedMicUID = newValue ?? "" }
+    }
 
-    // Misc
-    @Published var highlightCursor = true
-    @Published var outputFolder: URL = RecPaths.defaultFolder
-    @Published var sendToStageOnStop = false
+    // P1: misc prefs — persisted
+    @AppStorage("rec.highlightCursor")    var highlightCursor:    Bool   = true
+    @AppStorage("rec.sendToStageOnStop")  var sendToStageOnStop: Bool   = false
+    @AppStorage("rec.codec")             private var _codec: String = RecCodec.hevc.rawValue
+    var codec: RecCodec {
+        get { RecCodec(rawValue: _codec) ?? .hevc }
+        set { _codec = newValue.rawValue }
+    }
+    @AppStorage("rec.fps")               private var _fps: Int  = RecFrameRate.fps60.rawValue
+    var fps: RecFrameRate {
+        get { RecFrameRate(rawValue: _fps) ?? .fps60 }
+        set { _fps = newValue.rawValue }
+    }
+    @AppStorage("rec.outputFolderPath")  private var _outputFolderPath: String = ""
+    var outputFolder: URL {
+        get {
+            let p = _outputFolderPath
+            guard !p.isEmpty, FileManager.default.fileExists(atPath: p) else {
+                return RecPaths.defaultFolder
+            }
+            return URL(fileURLWithPath: p, isDirectory: true)
+        }
+        set { _outputFolderPath = newValue.path }
+    }
 
     @Published var preset: RecPreset? = .tutorial
 
@@ -1124,7 +1562,10 @@ final class RecViewModel: ObservableObject {
     let engine  = RecEngine()
 
     init() {
-        applyPreset(.tutorial)
+        // Only apply preset on first launch (when AppStorage values are defaults).
+        if UserDefaults.standard.object(forKey: "rec.systemAudioOn") == nil {
+            applyPreset(.tutorial)
+        }
     }
 
     /// Apply a preset by snapping the relevant toggles. We don't mutate
@@ -1204,7 +1645,7 @@ struct RecView: View {
                 // Preset chips ---------------------------------------------
                 Card {
                     VStack(alignment: .leading, spacing: 12) {
-                        Text("Presets").font(.headline)
+                        Text("Presets").headerText()
                         HStack(spacing: 10) {
                             ForEach(RecPreset.allCases) { p in
                                 RecPresetChip(preset: p,
@@ -1224,7 +1665,7 @@ struct RecView: View {
                 // Source ---------------------------------------------------
                 Card {
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("Source").font(.headline)
+                        Text("Source").headerText()
                         Picker("", selection: $vm.mode) {
                             ForEach(RecViewModel.SourceMode.allCases, id: \.self) { m in
                                 Text(m.rawValue).tag(m)
@@ -1278,7 +1719,7 @@ struct RecView: View {
                 // Audio ----------------------------------------------------
                 Card {
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("Audio").font(.headline)
+                        Text("Audio").headerText()
 
                         // Red-team #2: disable system audio toggle on < 13.
                         if #available(macOS 13.0, *) {
@@ -1290,7 +1731,10 @@ struct RecView: View {
 
                         Toggle("Microphone", isOn: $vm.microphoneOn)
                         if vm.microphoneOn {
-                            Picker("Input", selection: $vm.selectedMicUID) {
+                            Picker("Input", selection: Binding(
+                                get: { vm.selectedMicUID },
+                                set: { vm.selectedMicUID = $0 }
+                            )) {
                                 Text("System default").tag(String?.none)
                                 ForEach(vm.availableMicrophones, id: \.uniqueID) { dev in
                                     Text(dev.localizedName).tag(Optional(dev.uniqueID))
@@ -1303,18 +1747,46 @@ struct RecView: View {
                 // Output + options ----------------------------------------
                 Card {
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("Output").font(.headline)
+                        Text("Output").headerText()
                         HStack {
                             Text(vm.outputFolder.path)
                                 .font(.system(.body, design: .monospaced))
                                 .lineLimit(1)
                                 .truncationMode(.middle)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(Color.troveFgDim)
                             Spacer()
                             Button("Choose…") { chooseFolder() }
                         }
-                        Toggle("Highlight cursor clicks", isOn: $vm.highlightCursor)
-                        Toggle("Send to Stage when stopped", isOn: $vm.sendToStageOnStop)
+                        // P1: codec picker — default HEVC on Apple Silicon
+                        Picker("Codec", selection: Binding(
+                            get: { vm.codec },
+                            set: { vm.codec = $0 }
+                        )) {
+                            ForEach(RecCodec.allCases) { c in
+                                Text(c.rawValue).tag(c)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+
+                        // P1: frame rate picker
+                        Picker("Frame rate", selection: Binding(
+                            get: { vm.fps },
+                            set: { vm.fps = $0 }
+                        )) {
+                            ForEach(RecFrameRate.allCases) { r in
+                                Text(r.label).tag(r)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+
+                        Toggle("Show cursor", isOn: Binding(
+                            get: { vm.highlightCursor },
+                            set: { vm.highlightCursor = $0 }
+                        ))
+                        Toggle("Send to Stage when stopped", isOn: Binding(
+                            get: { vm.sendToStageOnStop },
+                            set: { vm.sendToStageOnStop = $0 }
+                        ))
                     }
                 }
 
@@ -1391,6 +1863,24 @@ struct RecView: View {
                 _ = RecPaths.sweepStaleTmp(folder)
             }.value
         }
+        // Listen for menu-bar Record submenu triggers. userInfo carries
+        // mix-and-match audio config: keys "mic" and "sys", both Bool.
+        // Falls back to system+mic if userInfo is missing (legacy callers).
+        .onReceive(NotificationCenter.default.publisher(for: .troveStartRecordingNow)) { note in
+            guard !vm.engine.isRecording else { return }
+            let mic = (note.userInfo?["mic"] as? Bool) ?? true
+            let sys = (note.userInfo?["sys"] as? Bool) ?? true
+            // Pick preset by audio combo so the UI subtitle reflects it.
+            switch (mic, sys) {
+            case (false, false): vm.applyPreset(.quiet)
+            case (true,  true):  vm.applyPreset(.tutorial)
+            case (false, true):  vm.applyPreset(.demo)
+            case (true,  false): vm.applyPreset(.tutorial)  // no mic-only preset; tutorial then disable sys
+            }
+            vm.systemAudioOn = sys
+            vm.microphoneOn  = mic
+            startRecording()
+        }
     }
 
     // ---- Actions -------------------------------------------------------
@@ -1398,27 +1888,33 @@ struct RecView: View {
     private func startRecording() {
         Task {
             do {
+                // Fix #1: Request mic permission BEFORE starting the engine
+                // so the OS dialog appears before recording begins and we can
+                // gate the mic track accurately rather than starting it and
+                // then discovering it was denied.
+                var micGranted = vm.microphoneOn
+                if vm.microphoneOn {
+                    let granted = await withCheckedContinuation { cont in
+                        RecPermissions.requestMicrophone { ok in cont.resume(returning: ok) }
+                    }
+                    if !granted {
+                        vm.microphoneOn = false
+                        micGranted = false
+                        SharedStore.stage.flash("Microphone permission denied", kind: .warning)
+                        return
+                    }
+                }
                 try await vm.engine.start(
                     source: vm.buildSource(),
                     outputFolder: vm.outputFolder,
                     systemAudio: vm.systemAudioOn,
-                    microphone: vm.microphoneOn,
+                    microphone: micGranted,
+                    micUID: vm.selectedMicUID,
                     showsCursor: vm.highlightCursor,
+                    codec: vm.codec,
+                    fps: vm.fps,
                     excludeBundleID: Bundle.main.bundleIdentifier
                 )
-                // Mic permission prompt happens on first sample-buffer
-                // delegate dispatch; we proactively prompt here too so the
-                // OS dialog appears before the user wonders why mic meter
-                // is flat.
-                if vm.microphoneOn {
-                    RecPermissions.requestMicrophone { ok in
-                        if !ok {
-                            Task { @MainActor in
-                                vm.engine.lastError = .needsMicrophonePermission
-                            }
-                        }
-                    }
-                }
             } catch {
                 // Engine already set lastError; nothing else to do.
             }
@@ -1638,16 +2134,17 @@ struct RecPresetChip: View {
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
+            // P2: raw colors → tokens
             .background(
                 RoundedRectangle(cornerRadius: 8)
-                    .fill(selected ? Color.accentColor.opacity(0.18) : Color.gray.opacity(0.08))
+                    .fill(selected ? Color.troveAccent.opacity(0.18) : Color.troveCardFill)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
-                    .strokeBorder(selected ? Color.accentColor : Color.gray.opacity(0.5),
+                    .strokeBorder(selected ? Color.troveAccent : Color.troveCardStroke,
                                   lineWidth: selected ? 1.2 : 0.5)
             )
-            .foregroundStyle(selected ? Color.accentColor : .primary)
+            .foregroundStyle(selected ? Color.troveAccent : Color.troveFg)
         }
         .buttonStyle(.plain)
     }
@@ -1661,6 +2158,9 @@ struct RecHUD: View {
     @ObservedObject var engine: RecEngine
     @ObservedObject var vm: RecViewModel
     let onStop: (URL?) -> Void
+
+    /// P0: confirmation state for Discard — must preview before hard-stop.
+    @State private var showDiscardConfirm = false
 
     var body: some View {
         Card {
@@ -1688,6 +2188,10 @@ struct RecHUD: View {
                         }
                         .accessibilityLabel(engine.isPaused ? "Recording paused" : "Recording in progress")
                     Text(engine.isPaused ? "Paused" : "Recording")
+                        // P1 a11y fix: sweep regression — this is a live
+                        // status string that mutates during recording, not
+                        // a structural section heading. .isHeader trait
+                        // pollutes the VoiceOver heading rotor.
                         .font(.headline)
                         .monospacedDigit()
                     Spacer()
@@ -1755,6 +2259,34 @@ struct RecHUD: View {
                     .accessibilityHidden(true)
 
                     Spacer()
+
+                    // P0 fix: Discard button — show confirmationDialog before
+                    // calling engine.discard() so the user sees elapsed time +
+                    // estimated size before potentially trashing a multi-GB file.
+                    Button {
+                        showDiscardConfirm = true
+                    } label: {
+                        Label("Discard", systemImage: "trash")
+                    }
+                    .controlSize(.large)
+                    .foregroundStyle(Color.troveError)
+                    .help("Stop recording and delete this clip (asks for confirmation)")
+                    .confirmationDialog(
+                        "Discard this recording?",
+                        isPresented: $showDiscardConfirm,
+                        titleVisibility: .visible
+                    ) {
+                        Button("Discard Recording", role: .destructive) {
+                            Task { await engine.discard() }
+                        }
+                        Button("Keep Recording", role: .cancel) {}
+                    } message: {
+                        let elapsed = engine.elapsed
+                        let s = Int(elapsed)
+                        let timeStr = String(format: "%02d:%02d", s / 60, s % 60)
+                        let sizeStr = engine.estimatedBytes.human
+                        Text("\(timeStr) recorded (\(sizeStr) so far) will be permanently deleted.")
+                    }
                 }
             }
         }
@@ -1807,7 +2339,7 @@ struct RecErrorBanner: View {
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: icon)
-                .foregroundStyle(.orange)
+                .foregroundStyle(Color.troveWarning)
             VStack(alignment: .leading, spacing: 6) {
                 Text(error.errorDescription ?? "Error")
                 if let action = actionLabel {
@@ -1829,7 +2361,8 @@ struct RecErrorBanner: View {
             Spacer()
         }
         .padding(10)
-        .background(Color.orange.opacity(0.10),
+        // P2: raw color → token
+        .background(Color.troveWarning.opacity(0.10),
                     in: RoundedRectangle(cornerRadius: 8))
     }
 
