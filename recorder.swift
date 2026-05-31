@@ -668,6 +668,21 @@ final class RecEngine: NSObject, ObservableObject {
     /// saturated at ±1.0; cleared per-tick by the HUD ticker.
     @Published var micClipping: Bool = false
 
+    /// Power-user item #1 — webcam PIP. When true, the engine starts a
+    /// parallel RecWebcamCapture alongside the screen recording. The
+    /// camera lands in `<stem>.webcam.mov`. Compositing into a single
+    /// PIP MP4 is intentionally deferred to a later batch — pro users
+    /// can drag both files into Final Cut / DaVinci / iMovie + overlay
+    /// in 30 seconds, and shipping the recording pipeline first means
+    /// the workflow unlocks today.
+    var webcamPIPEnabled: Bool = false
+    var webcamDeviceUID: String? = nil
+    /// The parallel webcam writer. Created lazily on first record.
+    private var webcamCapture: RecWebcamCapture?
+    /// Last webcam output URL — surfaced in the last-recording row when
+    /// PIP was enabled.
+    @Published var lastWebcamURL: URL? = nil
+
     /// Update SCStream configuration to reflect the live cursor toggle.
     /// Falls back silently when the stream isn't running (e.g. during
     /// initial countdown) — the start() path picks up `showsCursor` from
@@ -1111,6 +1126,21 @@ final class RecEngine: NSObject, ObservableObject {
         self.isRecording = true
         self.isPaused    = false
         self.startWall   = ContinuousClock.now
+
+        // Power-user item #1 — start the parallel webcam writer if PIP
+        // is enabled. The webcam lands in `<stem>.webcam.mov` alongside
+        // the main file so the user gets two synced takes for post-edit
+        // PIP composition. We don't fail the whole start if the webcam
+        // capture errors — a screen recording without webcam still has
+        // value (the toast surfaces the issue).
+        if webcamPIPEnabled, let tempURL = self.tempURL {
+            let webcamURL = tempURL.deletingPathExtension()
+                .deletingPathExtension()
+                .appendingPathExtension("webcam.mov")
+            let wc = self.webcamCapture ?? RecWebcamCapture()
+            self.webcamCapture = wc
+            wc.start(to: webcamURL, deviceUID: webcamDeviceUID)
+        }
         // Hand off from isStarting → isRecording. The defer at the top of start()
         // checks startedSuccessfully and leaves isStarting=true here untouched
         // (it's cleared on the next line). The result: a second tap arriving
@@ -1174,6 +1204,14 @@ final class RecEngine: NSObject, ObservableObject {
             try? await s.stopCapture()
         }
         self.stream = nil
+
+        // Power-user item #1 — stop the parallel webcam writer so its
+        // .mov is finalized at roughly the same wall-clock moment as
+        // the main file. Result URL is surfaced via lastWebcamURL so
+        // the last-recording row can show it next to the screen file.
+        if let wc = self.webcamCapture {
+            self.lastWebcamURL = await wc.stop()
+        }
 
         videoInput?.markAsFinished()
         systemAudioIn?.markAsFinished()
@@ -1735,7 +1773,12 @@ enum RecFrameRate: Int, CaseIterable, Identifiable, Codable {
 final class RecViewModel: ObservableObject {
 
     // Source picking
-    enum SourceMode: String, CaseIterable { case display = "Display", window = "Window", region = "Region" }
+    enum SourceMode: String, CaseIterable {
+        case display = "Display"
+        case window  = "Window"
+        case region  = "Region"
+        case webcam  = "Webcam"  // Power-user item #19 — record just the camera, no screen
+    }
     @Published var mode: SourceMode = .display
     @Published var selectedDisplayID: CGDirectDisplayID = CGMainDisplayID()
     @Published var selectedWindowID:  CGWindowID = 0
@@ -1791,6 +1834,18 @@ final class RecViewModel: ObservableObject {
     @AppStorage("rec.keystrokeOverlay")     var keystrokeOverlay: Bool = false
     // Power-user item #12 — software mic gain (0.0…3.0; 1.0 = unity).
     @AppStorage("rec.micGain")              var micGain: Double = 1.0
+    // Power-user item #1 — webcam PIP: record webcam alongside screen.
+    @AppStorage("rec.webcamPIP")            var webcamPIP: Bool = false
+    @AppStorage("rec.webcamCorner")         private var _webcamCorner: String = RecWebcamCorner.bottomTrailing.rawValue
+    var webcamCorner: RecWebcamCorner {
+        get { RecWebcamCorner(rawValue: _webcamCorner) ?? .bottomTrailing }
+        set { _webcamCorner = newValue.rawValue }
+    }
+    @AppStorage("rec.webcamSize")           private var _webcamSize: String = RecWebcamSize.medium.rawValue
+    var webcamSize: RecWebcamSize {
+        get { RecWebcamSize(rawValue: _webcamSize) ?? .medium }
+        set { _webcamSize = newValue.rawValue }
+    }
 
     @AppStorage("rec.codec")             private var _codec: String = RecCodec.hevc.rawValue
     var codec: RecCodec {
@@ -2111,6 +2166,39 @@ struct RecView: View {
                             set: { vm.menuBarWhileRecording = $0 }
                         ))
                         .help("Display a pulsing record dot in the menu bar while recording — click to stop.")
+                        // Power-user item #1 — webcam PIP toggle.
+                        Toggle("Record webcam alongside (PIP)", isOn: Binding(
+                            get: { vm.webcamPIP },
+                            set: { vm.webcamPIP = $0 }
+                        ))
+                        .help("Records a parallel <stem>.webcam.mov so you can overlay the camera onto the screen recording in post. Future batch will add automatic PIP composition.")
+                        if vm.webcamPIP {
+                            HStack(spacing: 10) {
+                                Text("Corner")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 70, alignment: .leading)
+                                Picker("", selection: Binding(
+                                    get: { vm.webcamCorner },
+                                    set: { vm.webcamCorner = $0 }
+                                )) {
+                                    ForEach(RecWebcamCorner.allCases) { c in
+                                        Text(c.label).tag(c)
+                                    }
+                                }
+                                .labelsHidden()
+                                Picker("", selection: Binding(
+                                    get: { vm.webcamSize },
+                                    set: { vm.webcamSize = $0 }
+                                )) {
+                                    ForEach(RecWebcamSize.allCases) { s in
+                                        Text(s.label).tag(s)
+                                    }
+                                }
+                                .labelsHidden()
+                            }
+                            .help("Corner + size are baked into the eventual auto-PIP composite. For now they're recorded as metadata for the post-edit step.")
+                        }
                         // Power-user item #5 — click ripple overlay.
                         Toggle("Show click ripples", isOn: Binding(
                             get: { vm.clickRipple },
@@ -2379,6 +2467,8 @@ struct RecView: View {
                 vm.engine.qualityMultiplier = vm.quality.bitrateMultiplier
                 vm.engine.filenameTemplate  = vm.filenameTemplate
                 vm.engine.micGain           = Float(vm.micGain)
+                vm.engine.webcamPIPEnabled  = vm.webcamPIP
+                vm.engine.webcamDeviceUID   = vm.selectedMicUID == "" ? nil : nil   // separate webcam UID picker is next batch
                 try await vm.engine.start(
                     source: vm.buildSource(),
                     outputFolder: vm.outputFolder,
