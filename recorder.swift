@@ -1778,6 +1778,13 @@ final class RecViewModel: ObservableObject {
     @AppStorage("rec.menuBarWhileRecording") var menuBarWhileRecording: Bool = false {
         didSet { RecMenuBarController.shared.prefDidChange() }
     }
+    // Power-user item #17 — preview sheet after stop (default on).
+    @AppStorage("rec.previewSheetOnStop")   var previewSheetOnStop: Bool = true
+    /// Set transiently by RecorderView after the engine stops so the
+    /// sheet auto-presents. Cleared on dismiss.
+    @Published var pendingPreviewURL: URL? = nil
+    @Published var pendingPreviewSentToStage: Bool = false
+    @Published var pendingPreviewDuration: TimeInterval = 0
     // Power-user item #5 — click ripple overlay during recording.
     @AppStorage("rec.clickRipple")          var clickRipple: Bool = false
     // Power-user item #4 — keystroke overlay during recording.
@@ -2173,7 +2180,8 @@ struct RecView: View {
                     }
                 } else if vm.engine.isRecording {
                     RecHUD(engine: vm.engine, vm: vm) { url in
-                        if vm.sendToStageOnStop, let url = url {
+                        let routedToStage = vm.sendToStageOnStop && (url != nil)
+                        if routedToStage, let url = url {
                             stage.addFile(url)
                             // Power-user item #3 — rich auto-route message
                             // with duration + sources + codec + fps so the
@@ -2185,6 +2193,12 @@ struct RecView: View {
                             let codec = vm.codec.rawValue
                             let fps = vm.fps.rawValue
                             stage.flash("\(dur) · \(audio) · \(codec) \(fps)fps → Stage")
+                        }
+                        // Power-user item #17 — preview sheet auto-pop.
+                        if vm.previewSheetOnStop, let url = url {
+                            vm.pendingPreviewDuration = vm.engine.elapsed
+                            vm.pendingPreviewSentToStage = routedToStage
+                            vm.pendingPreviewURL = url
                         }
                     }
                 } else {
@@ -2220,6 +2234,26 @@ struct RecView: View {
         .navigationSubtitle(vm.engine.isRecording
                             ? (vm.engine.isPaused ? "Paused" : "Recording…")
                             : "ScreenCaptureKit · system + mic")
+        // Power-user item #17 — preview sheet auto-popped after stop.
+        .sheet(isPresented: Binding(
+            get: { vm.pendingPreviewURL != nil },
+            set: { if !$0 { vm.pendingPreviewURL = nil } }
+        )) {
+            if let url = vm.pendingPreviewURL {
+                RecPreviewSheet(
+                    url: url,
+                    durationHint: vm.pendingPreviewDuration,
+                    sentToStage: vm.pendingPreviewSentToStage,
+                    onClose: { vm.pendingPreviewURL = nil },
+                    onReRecord: {
+                        // Move to Trash, dismiss, restart with current settings.
+                        let target = url
+                        vm.pendingPreviewURL = nil
+                        try? FileManager.default.trashItem(at: target, resultingItemURL: nil)
+                        startRecording()
+                    })
+            }
+        }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 ForEach(RecPreset.allCases) { p in
