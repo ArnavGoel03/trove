@@ -658,6 +658,16 @@ final class RecEngine: NSObject, ObservableObject {
     /// pick output filenames. Empty = `Trove-yyyyMMdd-HHmmss.mp4`.
     var filenameTemplate: String = ""
 
+    /// Power-user item #12 — software mic gain (0.0…3.0). 1.0 = unity
+    /// (the existing behavior). Applied as a per-sample float multiply
+    /// inside the mic delegate before appending to the writer. Values
+    /// above 1.0 amplify but also risk clipping — the HUD shows a
+    /// clipping indicator when sustained samples saturate.
+    var micGain: Float = 1.0
+    /// Set by the mic delegate when any sample in the last buffer
+    /// saturated at ±1.0; cleared per-tick by the HUD ticker.
+    @Published var micClipping: Bool = false
+
     /// Update SCStream configuration to reflect the live cursor toggle.
     /// Falls back silently when the stream isn't running (e.g. during
     /// initial countdown) — the start() path picks up `showsCursor` from
@@ -1528,10 +1538,27 @@ extension RecEngine: AVCaptureAudioDataOutputSampleBufferDelegate {
             guard pts.isValid else { return }
             // red-team: monotonic PTS guard on mic track too
             if self.lastMicPTS.isValid && CMTimeCompare(pts, self.lastMicPTS) <= 0 { return }
-            if mIn.append(sampleBuffer) {
+            // Power-user item #12 — software mic gain. When != 1.0 we
+            // apply the gain in-place on the sample buffer's audio data,
+            // clamping to [-1, 1] to prevent floating-point wrap. A
+            // clipped sample is reported as clipping to the HUD so the
+            // user can dial the gain back.
+            let gain = self.micGain
+            let bufferToAppend: CMSampleBuffer
+            if abs(gain - 1.0) > 0.001 {
+                if let amped = RecAudioGain.applyGain(sampleBuffer, gain: gain,
+                                                       clippingOut: &self.micClipping) {
+                    bufferToAppend = amped
+                } else {
+                    bufferToAppend = sampleBuffer
+                }
+            } else {
+                bufferToAppend = sampleBuffer
+            }
+            if mIn.append(bufferToAppend) {
                 self.lastMicPTS = pts
             }
-            self.micAudioLevel = max(self.micAudioLevel, RecAudioLevel.estimate(sampleBuffer))
+            self.micAudioLevel = max(self.micAudioLevel, RecAudioLevel.estimate(bufferToAppend))
         }
     }
 }
@@ -1543,6 +1570,94 @@ extension RecEngine: AVCaptureAudioDataOutputSampleBufferDelegate {
 /// Peak-amplitude estimator for the HUD meters. Reads the raw float/int16
 /// bytes off the sample buffer and returns a 0...1 value. Intentionally
 /// approximate — this is a UI vibes meter, not a calibrated VU.
+/// Power-user item #12 — software mic gain. Multiplies each Float32 PCM
+/// sample by `gain` and clamps to [-1, 1] in-place on a copy of the
+/// buffer (the original is a read-only AudioToolbox-allocated block).
+/// Returns nil when the format isn't recognized; the caller falls back
+/// to the un-amplified buffer in that case.
+enum RecAudioGain {
+    /// `clippingOut` is set to true when any sample saturated. The
+    /// caller pulls this onto its `@Published` clipping property so the
+    /// HUD can light up a clipping warning.
+    static func applyGain(_ sb: CMSampleBuffer, gain: Float,
+                          clippingOut: inout Bool) -> CMSampleBuffer? {
+        guard let format = CMSampleBufferGetFormatDescription(sb),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee
+        else { return nil }
+        // Only handle the common case: native Float32 PCM. Anything else
+        // (compressed, Int16, multi-track interleaved) falls through to
+        // the un-amplified buffer. Most macOS mic capture pipelines use
+        // Float32, so this covers the realistic input.
+        let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+        let bitsPerChannel = Int(asbd.mBitsPerChannel)
+        guard isFloat, bitsPerChannel == 32 else { return nil }
+        guard let block = CMSampleBufferGetDataBuffer(sb) else { return nil }
+        var totalLength = 0
+        var dataPtr: UnsafeMutablePointer<Int8>?
+        CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil,
+                                    totalLengthOut: &totalLength, dataPointerOut: &dataPtr)
+        guard let src = dataPtr, totalLength > 0 else { return nil }
+        // Make a writable copy so we don't mutate the AudioToolbox block.
+        var bufferOut = Data(count: totalLength)
+        var localClipping = false
+        bufferOut.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
+            guard let dst = raw.baseAddress?.assumingMemoryBound(to: Float.self) else { return }
+            let srcF = UnsafePointer<Float>(OpaquePointer(src))
+            let count = totalLength / MemoryLayout<Float>.size
+            for i in 0..<count {
+                let amped = srcF[i] * gain
+                if amped > 1.0 { dst[i] = 1.0; localClipping = true }
+                else if amped < -1.0 { dst[i] = -1.0; localClipping = true }
+                else { dst[i] = amped }
+            }
+        }
+        clippingOut = localClipping
+        // Reconstruct a CMSampleBuffer pointing at the new data.
+        var newBlock: CMBlockBuffer?
+        let createStatus = bufferOut.withUnsafeBytes { raw -> OSStatus in
+            CMBlockBufferCreateWithMemoryBlock(
+                allocator: kCFAllocatorDefault,
+                memoryBlock: nil,
+                blockLength: totalLength,
+                blockAllocator: kCFAllocatorDefault,
+                customBlockSource: nil,
+                offsetToData: 0,
+                dataLength: totalLength,
+                flags: 0,
+                blockBufferOut: &newBlock)
+        }
+        guard createStatus == kCMBlockBufferNoErr, let bb = newBlock else { return nil }
+        let replaceStatus = bufferOut.withUnsafeBytes { raw -> OSStatus in
+            guard let base = raw.baseAddress else { return -1 }
+            return CMBlockBufferReplaceDataBytes(
+                with: base,
+                blockBuffer: bb,
+                offsetIntoDestination: 0,
+                dataLength: totalLength)
+        }
+        guard replaceStatus == kCMBlockBufferNoErr else { return nil }
+        var newSB: CMSampleBuffer?
+        var timing = CMSampleTimingInfo()
+        CMSampleBufferGetSampleTimingInfo(sb, at: 0, timingInfoOut: &timing)
+        let numSamples = CMSampleBufferGetNumSamples(sb)
+        let createSBStatus = CMSampleBufferCreate(
+            allocator: kCFAllocatorDefault,
+            dataBuffer: bb,
+            dataReady: true,
+            makeDataReadyCallback: nil,
+            refcon: nil,
+            formatDescription: format,
+            sampleCount: numSamples,
+            sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing,
+            sampleSizeEntryCount: 0,
+            sampleSizeArray: nil,
+            sampleBufferOut: &newSB)
+        guard createSBStatus == noErr else { return nil }
+        return newSB
+    }
+}
+
 enum RecAudioLevel {
     static func estimate(_ sb: CMSampleBuffer) -> Float {
         guard let bb = CMSampleBufferGetDataBuffer(sb) else { return 0 }
@@ -1667,6 +1782,8 @@ final class RecViewModel: ObservableObject {
     @AppStorage("rec.clickRipple")          var clickRipple: Bool = false
     // Power-user item #4 — keystroke overlay during recording.
     @AppStorage("rec.keystrokeOverlay")     var keystrokeOverlay: Bool = false
+    // Power-user item #12 — software mic gain (0.0…3.0; 1.0 = unity).
+    @AppStorage("rec.micGain")              var micGain: Double = 1.0
 
     @AppStorage("rec.codec")             private var _codec: String = RecCodec.hevc.rawValue
     var codec: RecCodec {
@@ -1999,6 +2116,32 @@ struct RecView: View {
                             set: { vm.keystrokeOverlay = $0 }
                         ))
                         .help("Display a HUD with the last chord pressed (⌘⇧K etc.) bottom-center of the screen. Secure input fields are filtered out automatically.")
+                        // Power-user item #12 — mic gain slider.
+                        HStack(spacing: 10) {
+                            Text("Mic gain")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .frame(width: 70, alignment: .leading)
+                            Slider(value: Binding(
+                                get: { vm.micGain },
+                                set: { vm.micGain = $0 }
+                            ), in: 0.0...3.0, step: 0.1)
+                                .disabled(!vm.microphoneOn)
+                            Text(String(format: "%.1f×", vm.micGain))
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(vm.micGain > 2.0 ? Color.troveError
+                                                  : (vm.micGain > 1.5 ? .orange : .secondary))
+                                .frame(width: 40, alignment: .trailing)
+                            Button {
+                                vm.micGain = 1.0
+                            } label: {
+                                Image(systemName: "arrow.uturn.backward.circle")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Reset to unity gain (1.0×)")
+                            .disabled(abs(vm.micGain - 1.0) < 0.05)
+                        }
+                        .help("Software gain applied to the mic before encoding. 1.0× is unity (current behavior); >1.0 amplifies; gains above 2.0 will frequently clip. Watch the clipping indicator in the HUD during recording.")
                     }
                 }
 
@@ -2201,6 +2344,7 @@ struct RecView: View {
                 // of the signature stays stable.
                 vm.engine.qualityMultiplier = vm.quality.bitrateMultiplier
                 vm.engine.filenameTemplate  = vm.filenameTemplate
+                vm.engine.micGain           = Float(vm.micGain)
                 try await vm.engine.start(
                     source: vm.buildSource(),
                     outputFolder: vm.outputFolder,
