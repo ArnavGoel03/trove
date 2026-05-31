@@ -683,6 +683,15 @@ final class RecEngine: NSObject, ObservableObject {
     /// replace the original file.
     var autoTrimSilenceEnabled: Bool = false
 
+    /// Power-user item #25 — export as MOV with separate audio tracks
+    /// (system + mic as distinct tracks rather than the default mixed
+    /// MP4 output). Set by RecorderView before start(); writer init
+    /// reads this to pick file type + extension. The writer already
+    /// adds the audio inputs as separate AVAssetWriterInput instances,
+    /// so the resulting MOV preserves them per-track ready for
+    /// post-edit re-mix in Premiere / DaVinci / Final Cut.
+    var exportSeparateTracks: Bool = false
+
     /// Power-user item #1 — webcam PIP. When true, the engine starts a
     /// parallel RecWebcamCapture alongside the screen recording. The
     /// camera lands in `<stem>.webcam.mov`. Compositing into a single
@@ -697,6 +706,51 @@ final class RecEngine: NSObject, ObservableObject {
     /// Last webcam output URL — surfaced in the last-recording row when
     /// PIP was enabled.
     @Published var lastWebcamURL: URL? = nil
+
+    /// Power-user item #19 — webcam-only recording (no screen at all).
+    /// Routes around the SCStream + AVAssetWriter pipeline entirely.
+    /// Uses the same RecWebcamCapture class as the PIP feature; the
+    /// file naming + tick timer + outputs library record path mirror
+    /// the screen-recording flow so the HUD, last-recording row, and
+    /// stage routing all work the same.
+    ///
+    /// Returns nothing on success (state flows through `isRecording`);
+    /// throws if the webcam couldn't be opened (caller surfaces it).
+    func startWebcamOnly(outputFolder: URL,
+                         filenameTemplate: String,
+                         deviceUID: String? = nil,
+                         fps: RecFrameRate) async throws {
+        guard !isRecording, !isStarting else { return }
+        isStarting = true
+        defer { isStarting = false }
+        try RecPaths.ensureFolder(outputFolder)
+        let baseName = RecPaths.name(
+            template: filenameTemplate,
+            counter: 1,
+            codec: "webcam",
+            fps: fps.rawValue,
+            source: "webcam")
+        // .mov for the webcam-only path — AVCaptureMovieFileOutput emits
+        // .mov natively and the QuickTime container is universally
+        // editable.
+        let movName = (baseName as NSString).deletingPathExtension + ".mov"
+        let outURL = outputFolder.appendingPathComponent(movName)
+        let wc = self.webcamCapture ?? RecWebcamCapture()
+        self.webcamCapture = wc
+        self.webcamDeviceUID = deviceUID
+        self.webcamPIPEnabled = false   // not "PIP" mode; primary recording
+        wc.start(to: outURL, deviceUID: deviceUID)
+        // Flip the engine state so the HUD and outputs library treat
+        // the webcam recording the same as a screen recording.
+        self.isRecording = true
+        self.isPaused = false
+        self.accumulated = 0
+        self.startWall = ContinuousClock.now
+        self.tempURL = outURL
+        self.finalURL = outURL
+        self.lastWebcamURL = outURL
+        startTickTimer()
+    }
 
     /// Update SCStream configuration to reflect the live cursor toggle.
     /// Falls back silently when the stream isn't running (e.g. during
@@ -1020,21 +1074,29 @@ final class RecEngine: NSObject, ObservableObject {
             codec: codec.rawValue.replacingOccurrences(of: " ", with: "_"),
             fps: fps.rawValue,
             source: "")
-        var finalURL  = outputFolder.appendingPathComponent(baseName)
-        var tempURL   = outputFolder.appendingPathComponent(baseName + ".tmp.mp4")
+        // Power-user item #25 — when exportSeparateTracks is on, use
+        // .mov container instead of .mp4. MP4 supports multi-track
+        // audio fine, but MOV is the de facto multi-track interchange
+        // format for FCP / Premiere / DaVinci — using it makes the
+        // per-track audio routing obvious in those NLE timelines.
+        let containerExt = exportSeparateTracks ? "mov" : "mp4"
+        let containerType: AVFileType = exportSeparateTracks ? .mov : .mp4
+        let baseRenamed = (baseName as NSString).deletingPathExtension + "." + containerExt
+        var finalURL  = outputFolder.appendingPathComponent(baseRenamed)
+        var tempURL   = outputFolder.appendingPathComponent(baseRenamed + ".tmp." + containerExt)
         var bump = 1
         while FileManager.default.fileExists(atPath: finalURL.path)
             || FileManager.default.fileExists(atPath: tempURL.path) {
-            let stem = (baseName as NSString).deletingPathExtension
-            let ext  = (baseName as NSString).pathExtension
+            let stem = (baseRenamed as NSString).deletingPathExtension
+            let ext  = (baseRenamed as NSString).pathExtension
             let nm   = "\(stem)-\(bump).\(ext)"
             finalURL = outputFolder.appendingPathComponent(nm)
-            tempURL  = outputFolder.appendingPathComponent(nm + ".tmp.mp4")
+            tempURL  = outputFolder.appendingPathComponent(nm + ".tmp." + containerExt)
             bump += 1
             if bump > 999 { break } // sanity bail
         }
 
-        let writer = try AVAssetWriter(outputURL: tempURL, fileType: .mp4)
+        let writer = try AVAssetWriter(outputURL: tempURL, fileType: containerType)
         self.writer   = writer
         self.tempURL  = tempURL
         self.finalURL = finalURL
@@ -1891,6 +1953,8 @@ final class RecViewModel: ObservableObject {
     @AppStorage("rec.autoPauseSeconds")     var autoPauseSeconds: Double = 2.5
     // Power-user item #14 — auto-trim silence from start/end at finalize.
     @AppStorage("rec.autoTrimSilence")      var autoTrimSilence: Bool = false
+    // Power-user item #25 — export as MOV with separate audio tracks.
+    @AppStorage("rec.exportSeparateTracks") var exportSeparateTracks: Bool = false
     // Power-user item #1 — webcam PIP: record webcam alongside screen.
     @AppStorage("rec.webcamPIP")            var webcamPIP: Bool = false
     @AppStorage("rec.webcamCorner")         private var _webcamCorner: String = RecWebcamCorner.bottomTrailing.rawValue
@@ -2256,6 +2320,12 @@ struct RecView: View {
                             set: { vm.autoTrimSilence = $0 }
                         ))
                         .disabled(!vm.microphoneOn)
+                        // Power-user item #25 — MOV export with separate audio tracks.
+                        Toggle("Export as MOV (separate audio tracks)", isOn: Binding(
+                            get: { vm.exportSeparateTracks },
+                            set: { vm.exportSeparateTracks = $0 }
+                        ))
+                        .help("Use a .mov container so system audio + mic stay as distinct tracks. Premiere / DaVinci / Final Cut all show the two streams separately in the timeline — useful for ducking the system audio under your voice in post.")
                         .help("After stopping, scan the mic track and trim the leading + trailing silence (padded by 250 ms so the first syllable isn't clipped). Adds ~3-5 s to finalize on a 1 minute clip.")
                         // Power-user item #1 — webcam PIP toggle.
                         Toggle("Record webcam alongside (PIP)", isOn: Binding(
@@ -2580,6 +2650,16 @@ struct RecView: View {
                 vm.engine.autoPauseThresholdDB = Float(vm.autoPauseThresholdDB)
                 vm.engine.autoPauseSilenceSecs = vm.autoPauseSeconds
                 vm.engine.autoTrimSilenceEnabled = vm.autoTrimSilence
+                vm.engine.exportSeparateTracks   = vm.exportSeparateTracks
+
+                // Power-user item #19 — webcam-only mode bypasses SCStream.
+                if vm.mode == .webcam {
+                    try await vm.engine.startWebcamOnly(
+                        outputFolder: vm.outputFolder,
+                        filenameTemplate: vm.filenameTemplate,
+                        fps: vm.fps)
+                    return
+                }
                 try await vm.engine.start(
                     source: vm.buildSource(),
                     outputFolder: vm.outputFolder,
